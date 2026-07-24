@@ -64,4 +64,4 @@ Independent cross-agent review is the first post-MVP candidate: one agent implem
 
 ## Immediate Next Steps
 
-Begin Phase 0 with one Tauri tray process, one fake task, one Codex task, one Claude task, one isolated worktree, normalized live events, and reliable cancellation.
+Phase 1 Foundation is complete: the workspace, Tauri shell, React frontend, local validation scripts, and non-interactive CI are verified. Preserve Phase 0 evidence and complete the documented manual macOS checks before advancing deliberately to Phase 2.

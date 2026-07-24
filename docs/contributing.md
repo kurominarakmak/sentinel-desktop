@@ -2,11 +2,47 @@
 
 ## Prerequisites And Layout
 
-Development requires Rust, Node.js, the selected package manager, Git, and macOS tooling for the first platform. Codex and Claude Code are optional for real-adapter work; never expect contributors to install them silently. Planned layout is `apps/desktop` for the React/Tauri app, `crates` for Rust core crates, `fixtures` for test repositories, `migrations`, `scripts`, and `.github/workflows`.
+Development requires Rust (including `rustfmt` and Clippy), Node.js 22 or later with npm, Git, and macOS tooling required by Tauri 2 for desktop development. Codex and Claude Code are optional for real-adapter work; normal development, tests, and CI never expect them to be installed or authenticated.
+
+The workspace root contains reusable Rust crates in `crates/`, the Tauri/React desktop application in `apps/desktop`, Foundation scripts in `scripts/`, and GitHub Actions checks in `.github/workflows`. Reusable crates must not depend on Tauri; `scripts/verify-core-boundaries.sh` enforces that manifest boundary.
 
 ## Running And Testing
 
-Exact workspace commands are not available until scaffolding exists. Use the documented package scripts to run the desktop app, Rust test command to run core tests, and frontend test command to run UI tests; contributors should update this document with exact reviewed commands when Phase 1 establishes them.
+Install frontend dependencies from the committed lockfile, then run the complete Foundation suite from the repository root:
+
+```sh
+./scripts/validate-foundation.sh
+```
+
+The equivalent individual commands are:
+
+```sh
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+./scripts/verify-core-boundaries.sh
+
+cd apps/desktop
+npm ci
+npm test
+npm run build
+```
+
+To launch the desktop application locally on macOS:
+
+```sh
+cd apps/desktop
+npm run tauri dev
+```
+
+To validate the macOS Tauri build without signing, notarization, or distribution packaging:
+
+```sh
+cd apps/desktop
+npm run tauri build -- --no-bundle
+```
+
+GitHub Actions runs only the non-interactive Rust and frontend checks on Linux. The macOS Tauri build and tray/shortcut/focus behavior remain manual checks because they require a macOS desktop environment; they are not claimed as CI coverage.
 
 ## Extension Work
 

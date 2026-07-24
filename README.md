@@ -22,7 +22,19 @@ macOS is implemented and validated first; Windows and Linux are planned. Support
 
 ## Installation And Development
 
-No installation package is available yet. Development setup and placeholder commands are documented in [contributing](docs/contributing.md).
+Prerequisites are a current Rust toolchain (including `rustfmt` and Clippy), Node.js 22 or later with npm, and Git. macOS desktop development additionally requires the system tooling required by Tauri 2. Agent CLIs are optional; normal development and CI never make a real Codex or Claude request.
+
+```sh
+# Run the complete non-interactive Foundation validation suite.
+./scripts/validate-foundation.sh
+
+# Launch the desktop application during development (macOS-first).
+cd apps/desktop
+npm ci
+npm run tauri dev
+```
+
+The desktop bundle build is a macOS manual validation step and intentionally is not performed in Linux CI. See [contributing](docs/contributing.md) for the complete command list and limitations.
 
 ## Documentation
 

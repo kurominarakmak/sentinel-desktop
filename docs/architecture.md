@@ -24,7 +24,7 @@ React, TypeScript, Vite, Tailwind CSS, Radix UI or shadcn/ui, and Zustand own th
 
 ## Crate Boundaries
 
-Planned crates are `sentinel-core`, `sentinel-protocol`, `sentinel-storage`, `sentinel-agent-api`, `sentinel-codex`, `sentinel-claude`, `sentinel-git`, `sentinel-policy`, `sentinel-drift`, `sentinel-evidence`, `sentinel-environment`, and `sentinel-fake-agent`. Core crates must not depend on Tauri. The desktop app contains React features and the thin Tauri command, tray, and window layer.
+Planned crates are `sentinel-core`, `sentinel-protocol`, `sentinel-storage`, `sentinel-agent-api`, `sentinel-codex`, `sentinel-claude`, `sentinel-git`, `sentinel-policy`, `sentinel-drift`, `sentinel-evidence`, `sentinel-environment`, and `sentinel-fake-agent`. Core crates must not depend on Tauri. The desktop app contains React features and the thin Tauri command, tray, and window layer. Foundation CI verifies this manifest boundary with `scripts/verify-core-boundaries.sh`.
 
 ## Event, Storage, And Worktree Flow
 

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Verify reusable crates stay independent from Tauri
+        run: ./scripts/verify-core-boundaries.sh
+      - name: Rust format
+        run: cargo fmt --all --check
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Frontend tests
+        working-directory: apps/desktop
+        run: npm test
+      - name: Frontend production build
+        working-directory: apps/desktop
+        run: npm run build

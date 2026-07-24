@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 0 — Complete for the currently available agent environment**
+**Current phase: Phase 1 — Foundation complete**
 
 ## Documentation Navigation
 
@@ -18,6 +18,6 @@ Dedicated files under `docs/` are authoritative for their technical domains.
 
 ## Immediate Next Action
 
-Phase 0 validated the available Codex path: structured events, session capture and resume, exact output and unexpected-file validation, and cancellation. Claude Code is **deferred, not failed**, because no active authenticated Claude session is currently available. Cross-agent validation is therefore not complete.
+Phase 1 establishes the verified Rust workspace, Tauri 2 desktop shell, React/TypeScript/Vite frontend, local validation scripts, non-interactive CI, and a manifest-level dependency-boundary check that keeps reusable crates independent from Tauri. The macOS no-bundle Tauri build succeeds.
 
-See the current [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md). This status assumes the existing documented macOS interactive checklist remains the required verification record; no Phase 1 implementation has begun.
+Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md). Interactive macOS tray, shortcut, focus, and close-to-hide checks remain manual and are not claimed as completed. Phase 2 has not begun.
