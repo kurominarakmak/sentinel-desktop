@@ -1,0 +1,18 @@
+[package]
+name = "agent-sentinel-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.0", features = ["image-png", "tray-icon"] }
+tauri-plugin-global-shortcut = "2.0"
+sentinel-agent-api = { path = "../../../crates/sentinel-agent-api" }
+sentinel-fake-agent = { path = "../../../crates/sentinel-fake-agent" }
+sentinel-process = { path = "../../../crates/sentinel-process" }
+tokio.workspace = true

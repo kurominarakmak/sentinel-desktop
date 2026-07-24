@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Phase 0 desktop window permissions",
+  "windows": ["prompt"],
+  "permissions": ["core:default", "core:window:allow-hide"]
+}
