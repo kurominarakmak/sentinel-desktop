@@ -77,13 +77,32 @@ pub struct EventSummary {
 
 #[derive(Debug, Serialize)]
 struct ProbeSummary<'a> {
+    run_id: &'a str,
     agent: &'a str,
     test: &'a str,
     fixture_path: String,
     artifact_root: String,
+    stdout_log: String,
+    stderr_log: String,
+    summary_path: String,
     event_summary: &'a EventSummary,
     validation_failures: &'a [String],
     cancellation_latency_ms: Option<u128>,
+    cancellation_validation: Option<&'a CancellationValidation>,
+}
+
+#[derive(Debug, Serialize)]
+struct CancellationValidation {
+    cancellation_requested: bool,
+    agent_process_terminated: bool,
+    process_group_terminated: bool,
+    completion_file_absent: bool,
+}
+
+struct SummaryDetails<'a> {
+    failures: &'a [String],
+    cancellation_latency_ms: Option<u128>,
+    cancellation_validation: Option<&'a CancellationValidation>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<ProbeCommand> {
@@ -261,6 +280,14 @@ fn print_environment() {
     print_tool("jq", &["--version"], None);
 }
 
+fn print_run_paths(fixture: &Path, artifacts: &ArtifactPaths) {
+    println!("fixture path: {}", fixture.display());
+    println!("artifact directory: {}", artifacts.root.display());
+    println!("stdout log path: {}", artifacts.stdout.display());
+    println!("stderr log path: {}", artifacts.stderr.display());
+    println!("summary path: {}", artifacts.summary.display());
+}
+
 fn print_tool(name: &str, version_args: &[&str], auth_args: Option<&[&str]>) {
     let path = executable_path(name)
         .map(|value| value.display().to_string())
@@ -282,7 +309,7 @@ async fn run_agent_probe(
 ) -> std::result::Result<(), ProbeError> {
     let artifacts = ArtifactPaths::create(agent, test).map_err(ProbeError::UnsafeSetup)?;
     let fixture = create_fixture(test).map_err(ProbeError::UnsafeSetup)?;
-    println!("fixture: {}", fixture.display());
+    print_run_paths(&fixture, &artifacts);
     fs::write(
         artifacts.root.join("fixture-path.txt"),
         fixture.display().to_string(),
@@ -314,6 +341,18 @@ async fn run_agent_probe(
             fixture.display()
         );
     }
+    if success {
+        println!(
+            "sentinel-probe: {} {} PASS (run_id={})",
+            agent.name(),
+            if test == ProbeTest::Normal {
+                "normal/resume"
+            } else {
+                "cancellation"
+            },
+            artifacts.run_id
+        );
+    }
     result.map_err(ProbeError::Validation)
 }
 
@@ -341,8 +380,11 @@ async fn run_normal_probe(agent: Agent, fixture: &Path, artifacts: &ArtifactPath
         fixture,
         artifacts,
         &first.summary,
-        &failures,
-        None,
+        SummaryDetails {
+            failures: &failures,
+            cancellation_latency_ms: None,
+            cancellation_validation: None,
+        },
     )?;
     println!(
         "normalized event summary: {} event type(s), {} raw JSON event(s), session={}",
@@ -366,13 +408,14 @@ async fn run_cancellation_probe(
     fixture: &Path,
     artifacts: &ArtifactPaths,
 ) -> Result<()> {
-    let args = agent_args(agent, fixture, cancellation_prompt(agent), None, true);
+    let args = initial_agent_args(agent, fixture, cancellation_prompt(agent), true);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (mut process, mut output) =
         SupervisedProcess::start_in(agent.name(), &refs, Some(fixture)).await?;
     let started = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut active_observed = false;
+    let mut summary = EventSummary::default();
     while Instant::now() < deadline {
         if let Some(exit) = process.try_wait()? {
             bail!("agent exited before cancellation could be tested: {exit:?}");
@@ -380,7 +423,7 @@ async fn run_cancellation_probe(
         if let Ok(Some(event)) =
             tokio::time::timeout(Duration::from_millis(250), output.recv()).await
         {
-            record_process_event(&event, artifacts, &mut EventSummary::default())?;
+            record_process_event(&event, artifacts, &mut summary)?;
             if event_text(&event).contains("wait.sh") {
                 active_observed = true;
                 break;
@@ -395,25 +438,46 @@ async fn run_cancellation_probe(
     let latency = started.elapsed().as_millis();
     let mut failures = Vec::new();
     #[cfg(unix)]
-    if process.process_group_is_alive() {
+    let process_group_terminated = !process.process_group_is_alive();
+    #[cfg(not(unix))]
+    let process_group_terminated = true;
+    if !process_group_terminated {
         failures.push("probe process group remained alive after cancellation".into());
     }
-    if fixture.join("completion.txt").exists() {
+    let completion_file_absent = !fixture.join("completion.txt").exists();
+    if !completion_file_absent {
         failures.push("completion.txt was created before cancellation".into());
+    }
+    let cancellation_validation = CancellationValidation {
+        cancellation_requested: true,
+        agent_process_terminated: exit.is_some(),
+        process_group_terminated,
+        completion_file_absent,
+    };
+    if !cancellation_validation.agent_process_terminated {
+        failures.push("agent process did not report termination after cancellation".into());
     }
     fs::write(
         artifacts.root.join("cancellation-result.txt"),
-        format!("exit_code={exit:?}\nlatency_ms={latency}\n"),
+        format!(
+            "exit_code={exit:?}\nlatency_ms={latency}\ncancellation_requested={}\nagent_process_terminated={}\nprocess_group_terminated={}\ncompletion_file_absent={}\n",
+            cancellation_validation.cancellation_requested,
+            cancellation_validation.agent_process_terminated,
+            cancellation_validation.process_group_terminated,
+            cancellation_validation.completion_file_absent,
+        ),
     )?;
-    let summary = EventSummary::default();
     write_summary(
         agent,
         ProbeTest::Cancellation,
         fixture,
         artifacts,
         &summary,
-        &failures,
-        Some(latency),
+        SummaryDetails {
+            failures: &failures,
+            cancellation_latency_ms: Some(latency),
+            cancellation_validation: Some(&cancellation_validation),
+        },
     )?;
     if failures.is_empty() {
         Ok(())
@@ -428,7 +492,13 @@ async fn execute_agent(
     prompt: String,
     artifacts: &ArtifactPaths,
 ) -> Result<Capture> {
-    execute(agent, fixture, prompt, None, artifacts).await
+    execute(
+        agent,
+        fixture,
+        initial_agent_args(agent, fixture, prompt, false),
+        artifacts,
+    )
+    .await
 }
 
 async fn execute_resume(
@@ -438,17 +508,21 @@ async fn execute_resume(
     prompt: String,
     artifacts: &ArtifactPaths,
 ) -> Result<Capture> {
-    execute(agent, fixture, prompt, Some(session), artifacts).await
+    execute(
+        agent,
+        fixture,
+        resume_agent_args(agent, session, prompt),
+        artifacts,
+    )
+    .await
 }
 
 async fn execute(
     agent: Agent,
     fixture: &Path,
-    prompt: String,
-    resume: Option<&str>,
+    args: Vec<String>,
     artifacts: &ArtifactPaths,
 ) -> Result<Capture> {
-    let args = agent_args(agent, fixture, prompt, resume, false);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (mut process, mut output) =
         SupervisedProcess::start_in(agent.name(), &refs, Some(fixture)).await?;
@@ -463,16 +537,15 @@ async fn execute(
     Ok(Capture { summary })
 }
 
-fn agent_args(
+fn initial_agent_args(
     agent: Agent,
     fixture: &Path,
     prompt: String,
-    resume: Option<&str>,
     cancellation: bool,
 ) -> Vec<String> {
     let directory = fixture.display().to_string();
-    match (agent, resume) {
-        (Agent::Codex, None) => vec![
+    match agent {
+        Agent::Codex => vec![
             "exec",
             "--json",
             "--sandbox",
@@ -481,18 +554,7 @@ fn agent_args(
             &directory,
             &prompt,
         ],
-        (Agent::Codex, Some(session)) => vec![
-            "exec",
-            "resume",
-            "--json",
-            "--sandbox",
-            "workspace-write",
-            "-C",
-            &directory,
-            session,
-            &prompt,
-        ],
-        (Agent::Claude, None) => vec![
+        Agent::Claude => vec![
             "--print",
             "--output-format",
             "stream-json",
@@ -506,7 +568,16 @@ fn agent_args(
             },
             &prompt,
         ],
-        (Agent::Claude, Some(session)) => vec![
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn resume_agent_args(agent: Agent, session: &str, prompt: String) -> Vec<String> {
+    match agent {
+        Agent::Codex => vec!["exec", "resume", "--json", session, &prompt],
+        Agent::Claude => vec![
             "--resume",
             session,
             "--print",
@@ -525,10 +596,16 @@ fn agent_args(
 }
 
 fn first_prompt(agent: Agent) -> String {
-    format!("Read README.md. Create result.txt containing exactly one line: Agent Sentinel {} probe passed. Do not change any other file. Do not use network, dependencies, credentials, git push, merge, or files outside this repository.", if agent == Agent::Codex { "Codex" } else { "Claude" })
+    match agent {
+        Agent::Codex => "Read README.md. In this disposable fixture repository only, create result.txt by executing exactly: `printf '%s\\n' 'Agent Sentinel Codex probe passed' > result.txt`. The logical content must be exactly `Agent Sentinel Codex probe passed`: no period, no quotes, no markdown, no leading or trailing spaces, no blank lines, and no additional text. A single final newline is allowed. Do not change any other file. Do not use network, dependencies, credentials, git push, merge, or files outside this repository.".into(),
+        Agent::Claude => "Read README.md. Create result.txt containing exactly one line: Agent Sentinel Claude probe passed. Do not change any other file. Do not use network, dependencies, credentials, git push, merge, or files outside this repository.".into(),
+    }
 }
 fn resume_prompt(agent: Agent) -> String {
-    format!("Append exactly this second line to result.txt: {} resume passed. Do not change any other file.", if agent == Agent::Codex { "Codex" } else { "Claude" })
+    match agent {
+        Agent::Codex => "In this disposable fixture repository only, append the second logical line to result.txt by executing exactly: `printf '%s\\n' 'Codex resume passed' >> result.txt`. The final logical content must be exactly two lines: `Agent Sentinel Codex probe passed` followed by `Codex resume passed`. Do not add a period, quotes, markdown, leading or trailing spaces, blank lines, or any additional text. A single final newline is allowed. Do not change any other file.".into(),
+        Agent::Claude => "Append exactly this second line to result.txt: Claude resume passed. Do not change any other file.".into(),
+    }
 }
 fn cancellation_prompt(agent: Agent) -> String {
     format!("Run `sh wait.sh` before doing anything else. It is intentionally slow. After it exits, create completion.txt with {} cancellation probe passed. Do not change any other file.", agent.name())
@@ -568,7 +645,7 @@ fn validate_first(agent: Agent, fixture: &Path, summary: &EventSummary) -> Vec<S
         failures.push("Claude tool or command event was not observed".into());
     }
     let expected = format!(
-        "Agent Sentinel {} probe passed\n",
+        "Agent Sentinel {} probe passed",
         if agent == Agent::Codex {
             "Codex"
         } else {
@@ -581,7 +658,7 @@ fn validate_first(agent: Agent, fixture: &Path, summary: &EventSummary) -> Vec<S
 
 fn validate_resume(agent: Agent, fixture: &Path, summary: &EventSummary) -> Vec<String> {
     let expected = format!(
-        "Agent Sentinel {} probe passed\n{} resume passed\n",
+        "Agent Sentinel {} probe passed\n{} resume passed",
         if agent == Agent::Codex {
             "Codex"
         } else {
@@ -607,7 +684,7 @@ pub fn validate_fixture(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     match fs::read_to_string(fixture.join("result.txt")) {
-        Ok(actual) if actual == expected_result => {}
+        Ok(actual) if matches_logical_content(&actual, expected_result) => {}
         Ok(_) => failures.push("result.txt content did not match exactly".into()),
         Err(_) => failures.push("result.txt was not created".into()),
     }
@@ -624,6 +701,10 @@ pub fn validate_fixture(
         Err(error) => failures.push(format!("could not inspect fixture changes: {error}")),
     }
     failures
+}
+
+fn matches_logical_content(actual: &str, expected: &str) -> bool {
+    actual == expected || actual.strip_suffix('\n') == Some(expected)
 }
 
 fn create_fixture(test: ProbeTest) -> Result<PathBuf> {
@@ -751,10 +832,10 @@ fn write_summary(
     fixture: &Path,
     artifacts: &ArtifactPaths,
     summary: &EventSummary,
-    failures: &[String],
-    cancellation_latency_ms: Option<u128>,
+    details: SummaryDetails<'_>,
 ) -> Result<()> {
     let value = ProbeSummary {
+        run_id: &artifacts.run_id,
         agent: agent.name(),
         test: if test == ProbeTest::Normal {
             "normal"
@@ -763,20 +844,21 @@ fn write_summary(
         },
         fixture_path: fixture.display().to_string(),
         artifact_root: artifacts.root.display().to_string(),
+        stdout_log: artifacts.stdout.display().to_string(),
+        stderr_log: artifacts.stderr.display().to_string(),
+        summary_path: artifacts.summary.display().to_string(),
         event_summary: summary,
-        validation_failures: failures,
-        cancellation_latency_ms,
+        validation_failures: details.failures,
+        cancellation_latency_ms: details.cancellation_latency_ms,
+        cancellation_validation: details.cancellation_validation,
     };
-    fs::write(
-        artifacts.root.join("probe-summary.json"),
-        serde_json::to_vec_pretty(&value)?,
-    )?;
+    fs::write(&artifacts.summary, serde_json::to_vec_pretty(&value)?)?;
     fs::write(
         artifacts.root.join("validation-failures.txt"),
-        if failures.is_empty() {
+        if details.failures.is_empty() {
             "none\n".to_owned()
         } else {
-            format!("{}\n", failures.join("\n"))
+            format!("{}\n", details.failures.join("\n"))
         },
     )?;
     Ok(())
@@ -834,32 +916,45 @@ enum ProbeError {
     Validation(anyhow::Error),
 }
 struct ArtifactPaths {
+    run_id: String,
     root: PathBuf,
     raw: PathBuf,
     normalized: PathBuf,
     stdout: PathBuf,
     stderr: PathBuf,
+    summary: PathBuf,
 }
 impl ArtifactPaths {
     fn create(agent: Agent, test: ProbeTest) -> Result<Self> {
-        let root = std::env::current_dir()?
-            .join("target/agent-sentinel-probes")
-            .join(format!(
-                "{}-{}-{}",
-                unique_suffix(),
-                agent.name(),
-                if test == ProbeTest::Normal {
-                    "normal"
-                } else {
-                    "cancellation"
-                }
-            ));
+        Self::create_in(
+            &std::env::current_dir()?.join("target/agent-sentinel-probes"),
+            format!("run-{}", unique_suffix()),
+            agent,
+            test,
+        )
+    }
+
+    fn create_in(base: &Path, run_id: String, agent: Agent, test: ProbeTest) -> Result<Self> {
+        let root = base.join(format!(
+            "{}-{}-{}",
+            run_id,
+            agent.name(),
+            if test == ProbeTest::Normal {
+                "normal"
+            } else {
+                "cancellation"
+            }
+        ));
         fs::create_dir_all(&root)?;
+        fs::File::create(root.join("stdout.log"))?;
+        fs::File::create(root.join("stderr.log"))?;
         Ok(Self {
+            run_id,
             raw: root.join("raw-agent-events.jsonl"),
             normalized: root.join("normalized-events.jsonl"),
             stdout: root.join("stdout.log"),
             stderr: root.join("stderr.log"),
+            summary: root.join("probe-summary.json"),
             root,
         })
     }
@@ -933,6 +1028,119 @@ mod tests {
         fs::write(fixture.path().join("extra.txt"), "no\n").unwrap();
         let failures = validate_fixture(fixture.path(), "ok\n", &["result.txt"]);
         assert!(failures.iter().any(|failure| failure.contains("extra.txt")));
+    }
+    #[test]
+    fn accepts_exact_content_with_one_final_newline() {
+        let expected = "Agent Sentinel Codex probe passed";
+        assert!(matches_logical_content(expected, expected));
+        assert!(matches_logical_content(
+            "Agent Sentinel Codex probe passed\n",
+            expected
+        ));
+        assert!(!matches_logical_content(
+            " Agent Sentinel Codex probe passed",
+            expected
+        ));
+        assert!(!matches_logical_content(
+            "Agent Sentinel Codex probe passed ",
+            expected
+        ));
+    }
+    #[test]
+    fn rejects_an_added_period_or_other_punctuation() {
+        let expected = "Agent Sentinel Codex probe passed";
+        assert!(!matches_logical_content(
+            "Agent Sentinel Codex probe passed.\n",
+            expected
+        ));
+        assert!(!matches_logical_content(
+            "Agent Sentinel Codex probe passed!\n",
+            expected
+        ));
+    }
+    #[test]
+    fn rejects_extra_lines() {
+        let expected = "Agent Sentinel Codex probe passed";
+        assert!(!matches_logical_content(
+            "Agent Sentinel Codex probe passed\nextra\n",
+            expected
+        ));
+    }
+    #[test]
+    fn accepts_exact_two_line_resume_output() {
+        let expected = "Agent Sentinel Codex probe passed\nCodex resume passed";
+        assert!(matches_logical_content(
+            "Agent Sentinel Codex probe passed\nCodex resume passed\n",
+            expected
+        ));
+    }
+    #[test]
+    fn codex_initial_command_uses_the_configured_fixture_sandbox() {
+        let fixture = Path::new("/tmp/disposable-fixture");
+        let args = initial_agent_args(Agent::Codex, fixture, "first prompt".into(), false);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+        assert_eq!(args.last(), Some(&"first prompt".to_owned()));
+    }
+    #[test]
+    fn codex_resume_command_has_verified_argument_order() {
+        let prompt = "follow up with spaces, apostrophe: it's safe; printf '%s\\n'\nand newline";
+        let args = resume_agent_args(Agent::Codex, "thread-123", prompt.into());
+        assert_eq!(&args[..3], ["exec", "resume", "--json"]);
+        assert!(!args.iter().any(|argument| argument == "--sandbox"));
+        assert_eq!(args[3], "thread-123");
+        assert_eq!(args[4], prompt);
+        assert_eq!(args.len(), 5);
+    }
+    #[test]
+    fn artifact_paths_are_scoped_to_one_run_identifier() {
+        let base = tempdir().unwrap();
+        let initial = ArtifactPaths::create_in(
+            base.path(),
+            "run-initial".into(),
+            Agent::Codex,
+            ProbeTest::Normal,
+        )
+        .unwrap();
+        let resume = ArtifactPaths::create_in(
+            base.path(),
+            "run-resume".into(),
+            Agent::Codex,
+            ProbeTest::Normal,
+        )
+        .unwrap();
+        assert_ne!(initial.root, resume.root);
+        assert!(initial.summary.starts_with(&initial.root));
+        assert!(resume.summary.starts_with(&resume.root));
+        assert!(!initial.summary.starts_with(&resume.root));
+        assert!(initial.stdout.is_file());
+        assert!(initial.stderr.is_file());
+        assert_eq!(fs::read_to_string(&initial.stdout).unwrap(), "");
+        assert_eq!(fs::read_to_string(&initial.stderr).unwrap(), "");
+    }
+    #[test]
+    fn captures_cancellation_events_in_the_summary() {
+        let base = tempdir().unwrap();
+        let artifacts = ArtifactPaths::create_in(
+            base.path(),
+            "run-events".into(),
+            Agent::Codex,
+            ProbeTest::Cancellation,
+        )
+        .unwrap();
+        let mut summary = EventSummary::default();
+        record_process_event(
+            &ProcessEvent::Stdout(
+                r#"{"type":"thread.started","thread_id":"thread-cancellation"}"#.into(),
+            ),
+            &artifacts,
+            &mut summary,
+        )
+        .unwrap();
+        assert_eq!(summary.raw_event_count, 1);
+        assert!(summary.event_types.contains("thread.started"));
+        assert_eq!(summary.session_id.as_deref(), Some("thread-cancellation"));
     }
     #[test]
     fn creates_a_disposable_git_fixture() {

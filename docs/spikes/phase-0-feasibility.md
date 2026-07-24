@@ -1,6 +1,6 @@
 # Phase 0 Feasibility Report
 
-**Status:** In progress. This report records direct observations only; Phase 0 is not complete.
+**Status:** Complete for the currently available agent environment: Codex feasibility is verified. Claude Code is deferred because no active authenticated Claude session is available. Cross-agent validation is not complete.
 
 ## Environment
 
@@ -18,11 +18,15 @@ Validation environment: macOS Darwin 24.0.0 on Apple Silicon, Git 2.48.1, Node 2
 
 ### Codex
 
-`codex --version` reported `codex-cli 0.144.6`. `codex exec --help` directly confirmed `--json` JSON Lines output, `--cd` working-directory selection, `resume`, and sandbox selection. The help output also exposes dangerous bypass flags; this spike does not use them. A fixture-repository task, event parsing, and cancellation have not been run because the probe is deliberately manual-only and may consume authenticated model usage.
+`codex --version` reported `codex-cli 0.144.6`. `codex exec --help` directly confirmed `--json` JSON Lines output, working-directory selection, resume, and sandbox selection. The runner uses workspace-write access only for the disposable fixture and invokes resume using the verified `codex exec resume --json <session-id> <prompt>` syntax.
+
+**Codex normal/resume: PASS.** The verified run `run-1784888797000884000` exited `0`, captured 11 structured events across 5 event types, and recorded session ID `019f93a9-a7a5-7850-96e2-c5ba6377d328`. Initial execution and session resume both passed. Exact `result.txt` validation and unexpected-file validation both passed, with no validation failures. Artifacts: `target/agent-sentinel-probes/run-1784888797000884000-codex-normal`.
+
+**Codex cancellation: PASS.** The verified run `run-1784888901055693000` exited `0` with no validation failures. Cancellation latency was 5755 ms. Its stdout confirms that Codex started `sh wait.sh` and that the command was in progress when cancellation occurred. Artifacts: `target/agent-sentinel-probes/run-1784888901055693000-codex-cancellation`.
 
 ### Claude Code
 
-`claude --version` reported `2.1.201`. Local help directly confirmed `--output-format=stream-json`, `--input-format=stream-json`, `--resume`, and permission-mode options. The spike does not use bypass-permission flags. A fixture-repository task, session ID capture, follow-up/resume, event parsing, and cancellation have not yet been run for the same manual-only reason.
+**Claude Code: DEFERRED, not tested.** Local help previously confirmed `--output-format=stream-json`, `--input-format=stream-json`, `--resume`, and permission-mode options. The developer currently has no active Claude subscription or authenticated Claude session, so no Claude fixture task, session resume, event parsing, or cancellation probe was invoked. This is not a failure.
 
 ## Manual Real-Agent Probe Runner
 
@@ -39,11 +43,11 @@ cargo run -p sentinel-probe -- all --confirm-real-agent
 
 `environment` reports executable paths and versions for Git, Codex, Claude Code, and `jq`, plus a non-secret authentication-status indicator. It does not print tokens or credential values. A real-agent command exits with `3` without `--confirm-real-agent`, `2` when the selected agent is unavailable or does not appear authenticated, `4` when safe fixture setup fails, `1` when validation fails, and `0` only after every selected validation passes.
 
-Each real-agent run prints its temporary Git fixture path before the request. It creates only `README.md`, plus `wait.sh` for a cancellation probe, and runs in that disposable repository. Normal probes instruct the agent to change only `result.txt`; cancellation probes permit only the fixture wait script before the requested completion file. The runner uses Codex workspace-write sandboxing and does not use dangerous or unrestricted permission flags. It does not push, merge, install dependencies, or intentionally access credentials or files outside the fixture.
+Each real-agent run prints its temporary Git fixture path, artifact directory, stdout log path, stderr log path, and summary path before the request. It creates only `README.md`, plus `wait.sh` for a cancellation probe, and runs in that disposable repository. Normal probes instruct the agent to change only `result.txt`; cancellation probes permit only the fixture wait script before the requested completion file. The runner uses Codex workspace-write sandboxing and does not use dangerous or unrestricted permission flags. It does not push, merge, install dependencies, or intentionally access credentials or files outside the fixture.
 
-Artifacts are written to `target/agent-sentinel-probes/<timestamp>-<agent>-<test>/`: `probe-summary.json`, `normalized-events.jsonl`, `raw-agent-events.jsonl`, `stdout.log`, `stderr.log`, `fixture-path.txt`, `detected-versions.txt`, `cancellation-result.txt` when applicable, and `validation-failures.txt`. Output is redacted for obvious token-shaped values. The fixture is removed only after complete success; a failed fixture is retained for inspection. Use `--cleanup` with a real-agent command to request cleanup even after failure.
+Artifacts are written to `target/agent-sentinel-probes/<run-id>-<agent>-<test>/`: `probe-summary.json`, `normalized-events.jsonl`, `raw-agent-events.jsonl`, `stdout.log`, `stderr.log`, `fixture-path.txt`, `detected-versions.txt`, `cancellation-result.txt` when applicable, and `validation-failures.txt`. `stdout.log` and `stderr.log` are always created, including when empty. All paths and the summary share the run ID, so inspection uses the explicitly printed run directory rather than searching artifact directories by filename. Output is redacted for obvious token-shaped values. The fixture is removed only after complete success; a failed fixture is retained for inspection. Use `--cleanup` with a real-agent command to request cleanup even after failure.
 
-The normal probe requires the agent to create the exact first line in `result.txt`, captures structured JSON Lines, records a session identifier, then resumes that session to append the exact second line. It fails for an unexpected changed file. The cancellation probe waits for the fixture `wait.sh` activity, requests graceful cancellation through `sentinel-process`, escalates after its bounded timeout when required, checks the tracked process group on Unix, verifies `completion.txt` was not created, and records cancellation latency. These real-agent probes have not been executed for this report.
+The normal probe requires the agent to create the exact first line in `result.txt`, captures structured JSON Lines, records a session identifier, then resumes that session to append the exact second line. It fails for an unexpected changed file. The cancellation probe waits for the fixture `wait.sh` activity, requests graceful cancellation through `sentinel-process`, escalates after its bounded timeout when required, checks the tracked process group on Unix, verifies `completion.txt` was not created, and records cancellation latency. It retains structured events captured before cancellation in `probe-summary.json` and records whether cancellation was requested, the agent process terminated, the process group terminated, and `completion.txt` was absent.
 
 ## Worktree Behavior
 
@@ -67,13 +71,13 @@ The prompt now registers one capture-phase `keydown` listener on `window` when R
 
 ## Architecture Assumptions
 
-Validated by local CLI help: Codex and Claude Code expose structured output mechanisms suitable for adapter spikes, and both are installed in this environment. The crate boundaries keep reusable event, worktree, and process logic outside Tauri. The full Rust workspace test suite passes twelve tests; the frontend unit suite passes four tests; and the production frontend build passes.
+Validated by direct probe: Codex structured JSON event parsing, session capture and resume, exact output validation, unexpected-file validation, and cancellation all pass. Claude's CLI capability was checked locally, but its real-agent path is deferred. The crate boundaries keep reusable event, worktree, and process logic outside Tauri.
 
-Not yet validated: Tauri tray construction with a production icon, global shortcut reliability from another active application, hide-to-tray behavior, real structured event parsing, agent cancellation, and process/worktree test execution.
+Not yet validated: cross-agent behavior with Claude, plus the documented interactive macOS checklist for tray visibility, global shortcut reliability from another active application, hide-to-tray behavior, focus, and close-to-hide.
 
 ## Known Limitations
 
-- Agent probes are manual-only by design and have not been clicked, so no real fixture task, parsed provider event schema, session capture, follow-up/resume, or provider cancellation result is available yet.
+- Claude Code remains deferred, so Phase 0 has no Claude fixture task, parsed provider event schema, session capture, follow-up/resume, or provider cancellation result.
 - The macOS tray, global shortcut, focus, and close-to-hide behavior need an interactive desktop verification.
 - The attempted automated macOS checklist is blocked until the validation tool receives Accessibility permission; do not treat startup logs or successful compilation as visual confirmation.
 - Browser and Tauri prompt interaction, input focus, Escape, reopen, and fake-agent submission remain pending direct visual validation.
@@ -83,4 +87,4 @@ Not yet validated: Tauri tray construction with a production icon, global shortc
 
 ## Recommended Changes Before Phase 1
 
-First run the macOS shell interactively to verify tray visibility, shortcut activation from another application, focus, and close-to-hide behavior. Then use the explicit manual probe controls for Codex and Claude Code, recording their exact event schemas, session behavior, cancellation, and errors. Do not advance to Phase 1 until the pending mandatory criteria are directly tested.
+Maintain the existing macOS interactive checklist for tray visibility, shortcut activation from another application, focus, and close-to-hide behavior. Do not infer Claude support from the Codex result; run the deferred Claude probes only after an authenticated Claude session is available.
