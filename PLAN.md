@@ -64,4 +64,4 @@ Independent cross-agent review is the first post-MVP candidate: one agent implem
 
 ## Immediate Next Steps
 
-Phase 1 Foundation is complete: the workspace, Tauri shell, React frontend, local validation scripts, and non-interactive CI are verified. Preserve Phase 0 evidence and complete the documented manual macOS checks before advancing deliberately to Phase 2.
+Phase 1 Foundation is complete: the workspace, Tauri shell, React frontend, local validation scripts, and non-interactive CI are verified. Phase 2 is in progress: Phase 2A establishes the Tauri-independent typed run domain, SQLite persistence, and migration coverage. Complete the fake-agent orchestration and basic run UI slices before advancing beyond Phase 2.

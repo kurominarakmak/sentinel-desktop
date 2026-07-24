@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/sentinel-core",
   "crates/sentinel-agent-api",
   "crates/sentinel-fake-agent",
   "crates/sentinel-git",
@@ -20,3 +21,5 @@ serde_json = "1.0"
 tempfile = "3.14"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
+uuid = { version = "1.12", features = ["v4", "serde"] }

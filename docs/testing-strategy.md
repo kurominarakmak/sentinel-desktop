@@ -6,6 +6,8 @@ Rust unit tests cover state transitions, event normalization, command classifica
 
 Integration tests use temporary repositories for worktree creation, branch collisions, file changes, cancellation, approval blocking, test failures, restart recovery, and cleanup failures. Every adapter passes contract tests for detection, task start, session/command/file events, follow-up, cancellation, failure, and recovery metadata.
 
+Phase 2A additionally uses temporary filesystem SQLite databases outside the repository. Its persistence integration suite opens an empty database and checks migrations, schema indexes, foreign-key enforcement, busy timeout, and WAL where supported. It round-trips runs/events and safe JSON, checks sequence ordering and duplicate rejection, verifies state-transition timestamps and invalid-transition rollback, and proves that transition-plus-event commits or rolls back as one transaction. Boundary and redaction cases confirm oversized data never reaches storage and likely credentials are not retained.
+
 ## Fixtures And End To End
 
 Maintain Rust, Node/TypeScript, and Python fixture repositories with passing baselines, safe and failing tasks, protected files, dependency manifests, and deterministic evidence commands. The fake agent simulates normal completion, changes, test failure, approval, drift, crash, and cancellation.

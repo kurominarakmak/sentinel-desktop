@@ -2,6 +2,33 @@
 
 SQLite, accessed through SQLx migrations, stores application state while TOML stores user and project policy. Do not expand this model beyond current task supervision needs.
 
+## Phase 2A: Run Persistence Slice
+
+Phase 2A implements only the persistence foundation for the fake-agent slice. `sentinel-core` is Tauri-independent and defines a UUID-backed `RunId`, `TaskRequest`, `Run`, `RunStatus`, `SafeRunError`, and `NormalizedAgentEvent`. A newly created run uses the `fake` agent kind, schema version 1, and `queued` status. Future project, repository, worktree, approval, drift, and evidence entities remain out of this migration.
+
+The initial SQLite migration contains:
+
+| Table | Purpose and constraints |
+| --- | --- |
+| `runs` | UUID text primary key; bounded application input; checked agent/status values; schema version and millisecond timestamps. `runs_recent_order` supports `created_at_ms DESC, id DESC` listing. |
+| `run_events` | Event payload JSON tied to a run by a foreign key; `(run_id, sequence_number)` primary key prevents duplicate sequences. `run_events_order` supports ordered replay. |
+
+The repository enables foreign keys, configures a five-second busy timeout, requests WAL for filesystem databases, and applies migrations at open. SQLite may validly report `memory` journal mode for in-memory databases; configuration tests account for that difference.
+
+Run transitions are validated before they are stored:
+
+| From | Allowed next states |
+| --- | --- |
+| `queued` | `preparing`, `cancelled` |
+| `preparing` | `running`, `failed`, `cancelled` |
+| `running` | `cancelling`, `completed`, `failed` |
+| `cancelling` | `cancelled`, `failed` |
+| terminal (`cancelled`, `completed`, `failed`) | none |
+
+Entering `running` sets `started_at_ms` once. Entering any terminal state sets `finished_at_ms`. `transition_with_event` validates the transition, writes the status/timestamps and event in one SQL transaction, and commits only if both writes succeed. Duplicate events or any write failure roll back the status update too.
+
+Task text is limited to 8,000 UTF-8 bytes and serialized event payloads to 16,000 bytes; over-limit inputs are rejected before a database write. Storage failures use the opaque `CoreError::Storage` rather than returning raw SQLite diagnostics. `SafeRunError` redacts likely bearer tokens, `sk-` keys, API keys, passwords, and secrets while preserving ordinary diagnostic text where possible.
+
 | Entity | Main fields |
 | --- | --- |
 | Project | id, name, repository path, base branch, default agent, autonomy profile, protected paths, evidence config |
