@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/sentinel-core",
+  "crates/sentinel-runtime",
   "crates/sentinel-agent-api",
   "crates/sentinel-fake-agent",
   "crates/sentinel-git",

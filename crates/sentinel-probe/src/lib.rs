@@ -754,6 +754,7 @@ fn record_process_event(
             }
         }
         ProcessEvent::Stderr(line) => append(&artifacts.stderr, &redact(line))?,
+        ProcessEvent::OutputError => append(&artifacts.stderr, "process output stream error")?,
         ProcessEvent::Exited(_) => {}
     }
     Ok(())
@@ -822,7 +823,7 @@ fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
 fn event_text(event: &ProcessEvent) -> &str {
     match event {
         ProcessEvent::Stdout(line) | ProcessEvent::Stderr(line) => line,
-        ProcessEvent::Exited(_) => "",
+        ProcessEvent::OutputError | ProcessEvent::Exited(_) => "",
     }
 }
 

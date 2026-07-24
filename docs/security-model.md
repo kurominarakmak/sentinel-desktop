@@ -10,7 +10,7 @@ Every implementation task uses a task branch and registered Git worktree. The pr
 
 ## Secrets, Logs, Files, And Network
 
-Agent Sentinel does not store Codex or Claude passwords and uses their CLI-owned authentication. It must not log API keys, bearer tokens, passwords, cookies, SSH keys, or secret environment variables, nor read `.env` contents for telemetry. Redact logs, cap output, and restrict file access and writes outside registered worktrees through policy. Network access is policy-controlled; dependency installation and external network use require the applicable approval.
+Agent Sentinel does not store Codex or Claude passwords and uses their CLI-owned authentication. It must not log API keys, bearer tokens, passwords, cookies, SSH keys, or secret environment variables, nor read `.env` contents for telemetry. Redact logs, cap output, and restrict file access and writes outside registered worktrees through policy. Phase 2B captures at most 4 KiB of redacted process stderr in memory; the reusable SQLite repository independently re-redacts and caps each persisted safe-error category/message at 512 UTF-8 bytes. Network access is policy-controlled; dependency installation and external network use require the applicable approval.
 
 ## Prohibited Automation And Assumptions
 

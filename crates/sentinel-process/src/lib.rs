@@ -13,6 +13,7 @@ use tokio::{
 pub enum ProcessEvent {
     Stdout(String),
     Stderr(String),
+    OutputError,
     Exited(Option<i32>),
 }
 
@@ -22,6 +23,8 @@ pub enum ProcessError {
     Io(#[from] std::io::Error),
     #[error("process has no id")]
     MissingId,
+    #[error("owned process group did not terminate")]
+    GroupStillAlive,
 }
 
 pub struct SupervisedProcess {
@@ -96,20 +99,34 @@ impl SupervisedProcess {
         {
             let _ = self.child.start_kill();
         }
-        match time::timeout(timeout, self.child.wait()).await {
-            Ok(result) => Ok(result?.code()),
-            Err(_) => {
-                #[cfg(unix)]
+        let code: Result<Option<i32>, ProcessError> =
+            match time::timeout(timeout, self.child.wait()).await {
+                Ok(result) => Ok(result?.code()),
+                Err(_) => {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(-(self.pid as i32), libc::SIGKILL);
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        self.child.kill().await?;
+                    }
+                    Ok(self.child.wait().await?.code())
+                }
+            };
+        let code = code?;
+        #[cfg(unix)]
+        {
+            if self.process_group_is_alive() && !wait_for_group_exit(self.pid, timeout).await {
                 unsafe {
                     libc::kill(-(self.pid as i32), libc::SIGKILL);
                 }
-                #[cfg(not(unix))]
-                {
-                    self.child.kill().await?;
+                if !wait_for_group_exit(self.pid, timeout).await {
+                    return Err(ProcessError::GroupStillAlive);
                 }
-                Ok(self.child.wait().await?.code())
             }
         }
+        Ok(code)
     }
 
     pub fn pid(&self) -> u32 {
@@ -122,6 +139,18 @@ impl SupervisedProcess {
     }
 }
 
+#[cfg(unix)]
+async fn wait_for_group_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = time::Instant::now() + timeout;
+    while time::Instant::now() < deadline {
+        if unsafe { libc::kill(-(pid as i32), 0) != 0 } {
+            return true;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+    unsafe { libc::kill(-(pid as i32), 0) != 0 }
+}
+
 fn forward_lines<R>(
     reader: BufReader<R>,
     sender: mpsc::Sender<ProcessEvent>,
@@ -131,9 +160,18 @@ fn forward_lines<R>(
 {
     tokio::spawn(async move {
         let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if sender.send(event(line)).await.is_err() {
-                break;
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if sender.send(event(line)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = sender.send(ProcessEvent::OutputError).await;
+                    break;
+                }
             }
         }
     });

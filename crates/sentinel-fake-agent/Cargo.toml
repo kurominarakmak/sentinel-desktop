@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 sentinel-agent-api = { path = "../sentinel-agent-api" }
+serde_json.workspace = true

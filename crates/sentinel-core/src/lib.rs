@@ -15,6 +15,10 @@ pub const RUN_SCHEMA_VERSION: u16 = 1;
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_TASK_BYTES: usize = 8_000;
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16_000;
+/// Maximum UTF-8 bytes persisted for each SafeRunError field.
+pub const MAX_SAFE_ERROR_CATEGORY_BYTES: usize = 512;
+/// Maximum UTF-8 bytes persisted for each SafeRunError field.
+pub const MAX_SAFE_ERROR_MESSAGE_BYTES: usize = 512;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -250,7 +254,26 @@ pub fn redact(message: &str) -> String {
         cursor = end;
     }
     result.push_str(&message[cursor..]);
-    result.chars().take(512).collect()
+    result
+}
+
+fn normalize_safe_error(value: SafeRunError) -> SafeRunError {
+    SafeRunError {
+        category: redact_and_bound(&value.category, MAX_SAFE_ERROR_CATEGORY_BYTES),
+        message: redact_and_bound(&value.message, MAX_SAFE_ERROR_MESSAGE_BYTES),
+    }
+}
+
+fn redact_and_bound(value: &str, byte_limit: usize) -> String {
+    let redacted = redact(value);
+    if redacted.len() <= byte_limit {
+        return redacted;
+    }
+    let mut end = byte_limit;
+    while end != 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    redacted[..end].to_owned()
 }
 
 fn credential_end(message: &str, start: usize) -> usize {
@@ -402,7 +425,7 @@ impl RunRepository {
         next: RunStatus,
         error: Option<SafeRunError>,
     ) -> Result<Run, CoreError> {
-        self.transition_inner(id, next, error, None).await
+        self.transition_inner(id, next, error, None, None).await
     }
 
     /// Atomically validates and persists a run state change plus one normalized event.
@@ -417,8 +440,33 @@ impl RunRepository {
             return Err(CoreError::InvalidEvent);
         }
         let payload = validate_event(event)?;
-        self.transition_inner(id, next, error, Some((event, payload)))
+        self.transition_inner(id, next, error, Some((event, payload)), None)
             .await
+    }
+
+    /// Atomically records a terminal outcome, including its process exit code.
+    pub async fn finish_run(
+        &self,
+        id: &RunId,
+        status: RunStatus,
+        exit_code: Option<i32>,
+        error: Option<SafeRunError>,
+        event: Option<&NormalizedAgentEvent>,
+    ) -> Result<Run, CoreError> {
+        if !status.terminal() {
+            return Err(CoreError::InvalidEvent);
+        }
+        if let Some(event) = event {
+            if event.run_id != *id {
+                return Err(CoreError::InvalidEvent);
+            }
+            let payload = validate_event(event)?;
+            self.transition_inner(id, status, error, Some((event, payload)), exit_code)
+                .await
+        } else {
+            self.transition_inner(id, status, error, None, exit_code)
+                .await
+        }
     }
 
     async fn transition_inner(
@@ -427,6 +475,7 @@ impl RunRepository {
         next: RunStatus,
         error: Option<SafeRunError>,
         event: Option<(&NormalizedAgentEvent, String)>,
+        exit_code: Option<i32>,
     ) -> Result<Run, CoreError> {
         let mut transaction = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
         let row = sqlx::query("SELECT id, task_text, agent_kind, status, schema_version, created_at_ms, started_at_ms, finished_at_ms, exit_code, error_category, error_message FROM runs WHERE id = ?")
@@ -444,12 +493,9 @@ impl RunRepository {
         } else {
             old.finished_at_ms
         };
-        let safe_error = error.map(|value| SafeRunError {
-            category: redact(&value.category),
-            message: redact(&value.message),
-        });
-        sqlx::query("UPDATE runs SET status = ?, started_at_ms = ?, finished_at_ms = ?, error_category = ?, error_message = ? WHERE id = ?")
-            .bind(status_name(next)).bind(started_at).bind(finished_at).bind(safe_error.as_ref().map(|value| &value.category)).bind(safe_error.as_ref().map(|value| &value.message)).bind(id.to_string())
+        let safe_error = error.map(normalize_safe_error);
+        sqlx::query("UPDATE runs SET status = ?, started_at_ms = ?, finished_at_ms = ?, exit_code = ?, error_category = ?, error_message = ? WHERE id = ?")
+            .bind(status_name(next)).bind(started_at).bind(finished_at).bind(exit_code.or(old.exit_code)).bind(safe_error.as_ref().map(|value| &value.category)).bind(safe_error.as_ref().map(|value| &value.message)).bind(id.to_string())
             .execute(&mut *transaction).await.map_err(|_| CoreError::Storage)?;
         if let Some((event, payload)) = event {
             sqlx::query("INSERT INTO run_events (run_id, sequence_number, event_type, schema_version, occurred_at_ms, payload_json) VALUES (?, ?, ?, ?, ?, ?)")

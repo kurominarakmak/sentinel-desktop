@@ -1,0 +1,17 @@
+[package]
+name = "sentinel-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sentinel-agent-api = { path = "../sentinel-agent-api" }
+sentinel-core = { path = "../sentinel-core" }
+sentinel-fake-agent = { path = "../sentinel-fake-agent" }
+sentinel-process = { path = "../sentinel-process" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

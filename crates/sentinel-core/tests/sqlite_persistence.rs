@@ -1,6 +1,7 @@
 use sentinel_core::{
     redact, CoreError, NormalizedAgentEvent, RunId, RunRepository, RunStatus, SafeRunError,
-    TaskRequest, EVENT_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES, MAX_TASK_BYTES,
+    TaskRequest, EVENT_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES, MAX_SAFE_ERROR_CATEGORY_BYTES,
+    MAX_SAFE_ERROR_MESSAGE_BYTES, MAX_TASK_BYTES,
 };
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
@@ -185,6 +186,45 @@ async fn transitions_persist_timestamps_and_terminal_runs_are_immutable() {
 }
 
 #[tokio::test]
+async fn terminal_outcome_persists_exit_code_atomically_with_its_event() {
+    let (_directory, _url, repository) = repository().await;
+    let run = repository
+        .create_run(TaskRequest {
+            task_text: "terminal outcome".into(),
+        })
+        .await
+        .expect("run");
+    repository
+        .transition(&run.id, RunStatus::Preparing, None)
+        .await
+        .expect("prepare");
+    repository
+        .transition(&run.id, RunStatus::Running, None)
+        .await
+        .expect("run");
+    let event = event(run.id.clone(), 1, json!({"outcome": "failed"}));
+    let failed = repository
+        .finish_run(
+            &run.id,
+            RunStatus::Failed,
+            Some(23),
+            Some(SafeRunError {
+                category: "process".into(),
+                message: "safe failure".into(),
+            }),
+            Some(&event),
+        )
+        .await
+        .expect("terminal outcome");
+    assert_eq!(failed.exit_code, Some(23));
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(
+        repository.list_events(&run.id).await.expect("events"),
+        vec![event]
+    );
+}
+
+#[tokio::test]
 async fn invalid_transition_leaves_persisted_run_unchanged() {
     let (_directory, _url, repository) = repository().await;
     let run = repository
@@ -323,4 +363,113 @@ async fn safe_errors_redact_credentials_without_hiding_ordinary_context() {
         redact("ordinary token refresh failed"),
         "ordinary token refresh failed"
     );
+}
+
+#[tokio::test]
+async fn repository_bounds_safe_errors_on_every_public_transition_path() {
+    let (_directory, _url, repository) = repository().await;
+    let ordinary = repository
+        .create_run(TaskRequest {
+            task_text: "ordinary error".into(),
+        })
+        .await
+        .expect("run");
+    repository
+        .transition(&ordinary.id, RunStatus::Preparing, None)
+        .await
+        .expect("prepare");
+    let ordinary_error = SafeRunError {
+        category: "process".into(),
+        message: "ordinary diagnostic".into(),
+    };
+    let ordinary_result = repository
+        .transition(
+            &ordinary.id,
+            RunStatus::Failed,
+            Some(ordinary_error.clone()),
+        )
+        .await
+        .expect("transition");
+    assert_eq!(ordinary_result.error, Some(ordinary_error));
+
+    let direct = repository
+        .create_run(TaskRequest {
+            task_text: "direct transition".into(),
+        })
+        .await
+        .expect("run");
+    repository
+        .transition(&direct.id, RunStatus::Preparing, None)
+        .await
+        .expect("prepare");
+    let direct_result = repository
+        .transition(
+            &direct.id,
+            RunStatus::Failed,
+            Some(SafeRunError {
+                category: "日本語".repeat(300),
+                message: format!("prefix token=super-secret {}", "😀".repeat(300)),
+            }),
+        )
+        .await
+        .expect("direct transition");
+    assert_bounded_safe_error(direct_result.error.expect("safe error"));
+
+    let atomic = repository
+        .create_run(TaskRequest {
+            task_text: "atomic transition".into(),
+        })
+        .await
+        .expect("run");
+    let event = event(atomic.id.clone(), 1, json!({"state": "preparing"}));
+    let atomic_result = repository
+        .transition_with_event(
+            &atomic.id,
+            RunStatus::Preparing,
+            Some(SafeRunError {
+                category: "ภาษาไทย".repeat(200),
+                message: "emoji ".to_owned() + &"😀".repeat(300),
+            }),
+            &event,
+        )
+        .await
+        .expect("atomic transition");
+    assert_bounded_safe_error(atomic_result.error.expect("safe error"));
+
+    let terminal = repository
+        .create_run(TaskRequest {
+            task_text: "terminal error".into(),
+        })
+        .await
+        .expect("run");
+    repository
+        .transition(&terminal.id, RunStatus::Preparing, None)
+        .await
+        .expect("prepare");
+    repository
+        .transition(&terminal.id, RunStatus::Running, None)
+        .await
+        .expect("running");
+    let terminal_result = repository
+        .finish_run(
+            &terminal.id,
+            RunStatus::Failed,
+            Some(1),
+            Some(SafeRunError {
+                category: "combining e\u{301}".repeat(200),
+                message: "password=very-secret ".to_owned() + &"日本語".repeat(300),
+            }),
+            None,
+        )
+        .await
+        .expect("finish");
+    assert_bounded_safe_error(terminal_result.error.expect("safe error"));
+}
+
+fn assert_bounded_safe_error(error: SafeRunError) {
+    assert!(error.category.len() <= MAX_SAFE_ERROR_CATEGORY_BYTES);
+    assert!(error.message.len() <= MAX_SAFE_ERROR_MESSAGE_BYTES);
+    assert!(std::str::from_utf8(error.category.as_bytes()).is_ok());
+    assert!(std::str::from_utf8(error.message.as_bytes()).is_ok());
+    assert!(!error.message.contains("super-secret") && !error.message.contains("very-secret"));
 }

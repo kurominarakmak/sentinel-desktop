@@ -8,6 +8,8 @@ Integration tests use temporary repositories for worktree creation, branch colli
 
 Phase 2A additionally uses temporary filesystem SQLite databases outside the repository. Its persistence integration suite opens an empty database and checks migrations, schema indexes, foreign-key enforcement, busy timeout, and WAL where supported. It round-trips runs/events and safe JSON, checks sequence ordering and duplicate rejection, verifies state-transition timestamps and invalid-transition rollback, and proves that transition-plus-event commits or rolls back as one transaction. Boundary and redaction cases confirm oversized data never reaches storage and likely credentials are not retained.
 
+Phase 2B runtime integration tests run only the local deterministic fake-agent binary. They use temporary SQLite files and Tokio to verify process-supervised success, failure, partial and malformed output, cancellation races and process groups, parent-exit descendant cleanup with retained stdout/stderr pipes, live-bus lag/disconnect behavior, ordered event persistence, persistence failure, and bounded redacted stderr. No test invokes Codex, Claude Code, or the manual `sentinel-probe` binary.
+
 ## Fixtures And End To End
 
 Maintain Rust, Node/TypeScript, and Python fixture repositories with passing baselines, safe and failing tasks, protected files, dependency manifests, and deterministic evidence commands. The fake agent simulates normal completion, changes, test failure, approval, drift, crash, and cancellation.

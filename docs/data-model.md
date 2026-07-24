@@ -27,7 +27,7 @@ Run transitions are validated before they are stored:
 
 Entering `running` sets `started_at_ms` once. Entering any terminal state sets `finished_at_ms`. `transition_with_event` validates the transition, writes the status/timestamps and event in one SQL transaction, and commits only if both writes succeed. Duplicate events or any write failure roll back the status update too.
 
-Task text is limited to 8,000 UTF-8 bytes and serialized event payloads to 16,000 bytes; over-limit inputs are rejected before a database write. Storage failures use the opaque `CoreError::Storage` rather than returning raw SQLite diagnostics. `SafeRunError` redacts likely bearer tokens, `sk-` keys, API keys, passwords, and secrets while preserving ordinary diagnostic text where possible.
+Task text is limited to 8,000 UTF-8 bytes and serialized event payloads to 16,000 bytes; over-limit inputs are rejected before a database write. Storage failures use the opaque `CoreError::Storage` rather than returning raw SQLite diagnostics. Before every run-error write, `SafeRunError` redacts likely bearer tokens, `sk-` keys, API keys, passwords, and secrets, then caps both category and message at 512 UTF-8 bytes on a character boundary. This repository bound is independent of Phase 2B runtime's 4 KiB redacted stderr capture bound; runtime capture is reduced again at the persistence boundary.
 
 | Entity | Main fields |
 | --- | --- |

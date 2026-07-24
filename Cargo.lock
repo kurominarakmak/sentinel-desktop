@@ -3072,6 +3072,7 @@ name = "sentinel-fake-agent"
 version = "0.1.0"
 dependencies = [
  "sentinel-agent-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -3100,6 +3101,20 @@ name = "sentinel-process"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "sentinel-runtime"
+version = "0.1.0"
+dependencies = [
+ "sentinel-agent-api",
+ "sentinel-core",
+ "sentinel-fake-agent",
+ "sentinel-process",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
 ]
