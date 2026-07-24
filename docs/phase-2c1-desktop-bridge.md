@@ -1,0 +1,18 @@
+# Phase 2C1 Desktop Bridge
+
+The Tauri desktop layer owns startup wiring only: it opens the SQLite database in the platform application-data directory (macOS pattern: `~/Library/Application Support/<bundle-id>/phase2.sqlite3`), applies migrations through `RunRepository`, and creates `RunOrchestrator`. Core and runtime crates remain Tauri-independent.
+
+The fake-agent resolution order is: developer-controlled `AGENT_SENTINEL_FAKE_AGENT`, then the Tauri externalBin runtime sidecar beside the current desktop executable: `sentinel-fake-agent` (or `.exe` on Windows). The source sidecar remains `binaries/sentinel-fake-agent-<target-triple>`; Tauri strips the triple for runtime placement. Development therefore resolves a sibling under `target/debug` or `target/release`; a bundled macOS app resolves `Agent Sentinel.app/Contents/MacOS/sentinel-fake-agent`. The resource directory (`Contents/Resources` on macOS) is deliberately not consulted. The path is canonicalized and must be a regular file; Unix additionally requires an executable bit. No PATH search, current-directory inference, or React-provided path is used. `scripts/prepare-fake-agent-sidecar.sh` prepares the target-triple source file before `npm run tauri`.
+
+The `npm run tauri` wrapper builds the sidecar with the same mode and target as Tauri. `tauri dev` uses Cargo `debug`; `tauri build` uses Cargo `release`. An explicit `--target <triple>` is passed unchanged to Cargo and names the externalBin source `sentinel-fake-agent-<triple>[.exe]`. `CARGO_TARGET_DIR` is respected. The generated Cargo artifact is also the no-bundle runtime sibling, so `tauri build -- --no-bundle` has both desktop and fake-agent executables under the same target/profile directory. Generated sidecars remain ignored.
+
+| Command | Sidecar profile | Sidecar target |
+| --- | --- | --- |
+| `tauri dev` | debug | host or explicit target |
+| `tauri build` | release | host or explicit target |
+
+Commands are `submit_fake_run`, `list_runs`, `get_run`, `list_run_events`, `cancel_run`, and `get_runtime_environment`. Invalid IDs/scenarios return `invalid_input`; other failures return the opaque `phase2_error`. No command accepts an executable, shell command, argument vector, working directory, database URL, or raw error text.
+
+`phase2-run-event` carries `{schema_version, run_id, sequence_number, event_type, timestamp_ms, payload}`. The bridge forwards only runtime events that were persisted first. A per-run desktop registry prevents duplicate forwarders; it reserves the run, subscribes to Tokio broadcast, then replays SQLite before reading live messages. Events created during replay remain buffered and duplicates are suppressed by sequence number. The registry cleans up after a terminal lifecycle event (`run_completed`, `run_failed`, or `run_cancelled`) or channel closure. Tauri emission is best effort: an emission failure advances the replay cursor and leaves SQLite history recoverable through `list_run_events`. On Tokio broadcast lag or closure, the bridge replays persisted events after the last emitted sequence; SQLite remains the source of truth. A fast run can finish before subscription; submission still returns its persisted run and the same replay path forwards its stored events before cleanup. Deprecated `agent-event` is emitted only by the Phase 0 compatibility commands and always has a renderable string `text`; the modern submit path emits only `phase2-run-event`. Compatibility removal is deferred to Phase 2C2.
+
+Persisted active-looking runs from a prior app launch have no current process handle and are not treated as cancellable. Recovery/reconciliation is deferred beyond Phase 2.

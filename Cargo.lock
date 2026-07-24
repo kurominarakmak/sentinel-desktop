@@ -13,13 +13,16 @@ name = "agent-sentinel-desktop"
 version = "0.1.0"
 dependencies = [
  "sentinel-agent-api",
+ "sentinel-core",
  "sentinel-fake-agent",
  "sentinel-process",
+ "sentinel-runtime",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-global-shortcut",
+ "tempfile",
  "tokio",
 ]
 

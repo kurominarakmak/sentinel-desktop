@@ -15,4 +15,9 @@ tauri-plugin-global-shortcut = "2.0"
 sentinel-agent-api = { path = "../../../crates/sentinel-agent-api" }
 sentinel-fake-agent = { path = "../../../crates/sentinel-fake-agent" }
 sentinel-process = { path = "../../../crates/sentinel-process" }
+sentinel-core = { path = "../../../crates/sentinel-core" }
+sentinel-runtime = { path = "../../../crates/sentinel-runtime" }
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -42,6 +42,12 @@ impl std::fmt::Display for RunId {
         self.0.fmt(formatter)
     }
 }
+impl std::str::FromStr for RunId {
+    type Err = uuid::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskRequest {

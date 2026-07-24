@@ -5,5 +5,5 @@
   "identifier": "dev.agent-sentinel.spike",
   "build": { "beforeDevCommand": "npm run dev", "beforeBuildCommand": "npm run build", "devUrl": "http://localhost:1420", "frontendDist": "../dist" },
   "app": { "windows": [{ "label": "prompt", "title": "Agent Sentinel Spike", "width": 500, "height": 650, "resizable": false, "alwaysOnTop": true, "visible": false }], "security": { "csp": null } },
-  "bundle": { "active": false }
+  "bundle": { "active": false, "externalBin": ["binaries/sentinel-fake-agent"] }
 }
