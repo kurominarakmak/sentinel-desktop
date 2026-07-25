@@ -16,6 +16,8 @@ Maintain Rust, Node/TypeScript, and Python fixture repositories with passing bas
 
 Desktop end-to-end tests cover project registration, prompt launch, fake task, tray state, follow-up, approval, drift, evidence, final diff, restart, and retained history. Cross-platform tests validate platform-specific shortcuts, tray behavior, process cancellation, executable discovery, paths, and packaging as each platform phase begins.
 
+Phase 2C2 frontend integration coverage uses deterministic deferred promises to exercise persisted/live event ordering, selection and lifecycle races, listener registration/unmount cleanup, submission pending and failure isolation, every cancellation-result DTO, RunId-scoped cancellation operations, and runtime-environment failure/retry behavior. The completed Phase 2C2 automated gate recorded 92 passing frontend tests, 76 passing Rust workspace tests, passing Vite production and Tauri no-bundle builds, passing `cargo fmt --all --check`, and passing workspace Clippy with warnings denied; final review found no remaining P1/P2 issues. Manual desktop acceptance remains the separate pending Phase 2C3 gate.
+
 ## CI And Release
 
 CI runs Rust and frontend tests, formatting, linting, adapter contracts, and relevant integration tests. Before release, required fixture/e2e flows, redaction, recovery, and platform packaging/signing checks must pass. Failure scenarios are first-class test cases, not only manual testing.

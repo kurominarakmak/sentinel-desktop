@@ -6,6 +6,7 @@ use sentinel_runtime::{
     bounded_redacted_text, CancellationResult, FakeAgentProgram, RunOrchestrator, RunStorage,
     RuntimeError, StorageFuture,
 };
+use serde_json::json;
 use std::{
     path::PathBuf,
     sync::{
@@ -16,7 +17,7 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::{
-    sync::{broadcast, Mutex as TokioMutex},
+    sync::{broadcast, Barrier, Mutex as TokioMutex},
     time,
 };
 
@@ -274,6 +275,50 @@ async fn delayed_run_exposes_running_before_completion() {
 }
 
 #[tokio::test]
+async fn cancellability_requires_current_runtime_ownership() {
+    let (_directory, repository, runtime) = runtime().await;
+    let persisted = repository
+        .create_run(TaskRequest {
+            task_text: "persisted running run".into(),
+        })
+        .await
+        .expect("persisted run");
+    for (sequence, status, event_type) in [
+        (1, RunStatus::Preparing, "run_preparing"),
+        (2, RunStatus::Running, "run_running"),
+    ] {
+        repository
+            .transition_with_event(
+                &persisted.id,
+                status,
+                None,
+                &NormalizedAgentEvent {
+                    run_id: persisted.id.clone(),
+                    sequence_number: sequence,
+                    event_type: event_type.into(),
+                    schema_version: 1,
+                    occurred_at_ms: sequence as i64,
+                    payload: json!({}),
+                },
+            )
+            .await
+            .expect("transition");
+    }
+    let fresh_runtime = RunOrchestrator::new(repository.clone(), fake_agent_program());
+    assert!(!fresh_runtime.is_cancellable(&persisted.id).await);
+
+    let owned = submit(&runtime, FakeAgentScenario::Delayed).await;
+    assert!(runtime.is_cancellable(&owned.id).await);
+    let terminal = runtime
+        .wait_for_run(&owned.id)
+        .await
+        .expect("completed run");
+    assert!(terminal.status.terminal());
+    assert!(!runtime.is_cancellable(&owned.id).await);
+    assert!(!runtime.is_cancellable(&persisted.id).await);
+}
+
+#[tokio::test]
 async fn malformed_output_is_not_persisted_as_agent_event_and_fails_safely() {
     let (_directory, repository, runtime) = runtime().await;
     let run = submit(&runtime, FakeAgentScenario::Malformed).await;
@@ -299,6 +344,7 @@ async fn cancellation_is_idempotent_and_terminal() {
         runtime.cancel_run(&run.id).await,
         CancellationResult::CancellationRequested
     );
+    assert!(!runtime.is_cancellable(&run.id).await);
     assert_eq!(
         runtime.cancel_run(&run.id).await,
         CancellationResult::AlreadyCancelling
@@ -312,6 +358,48 @@ async fn cancellation_is_idempotent_and_terminal() {
         .expect("events")
         .iter()
         .all(|event| event.event_type != "run_completed"));
+}
+
+#[tokio::test]
+async fn concurrent_cancellation_has_one_request_and_revokes_capability() {
+    let (_directory, repository, runtime) = runtime().await;
+    let run = submit(&runtime, FakeAgentScenario::CancellationChild).await;
+    observe_status(&repository, &run.id, RunStatus::Running).await;
+    let barrier = Arc::new(Barrier::new(3));
+    let first_runtime = runtime.clone();
+    let first_id = run.id.clone();
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_runtime.cancel_run(&first_id).await
+    });
+    let second_runtime = runtime.clone();
+    let second_id = run.id.clone();
+    let second_barrier = barrier.clone();
+    let second = tokio::spawn(async move {
+        second_barrier.wait().await;
+        second_runtime.cancel_run(&second_id).await
+    });
+    barrier.wait().await;
+    let results = [
+        first.await.expect("first cancellation"),
+        second.await.expect("second cancellation"),
+    ];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == CancellationResult::CancellationRequested)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == CancellationResult::AlreadyCancelling)
+            .count(),
+        1
+    );
+    assert!(!runtime.is_cancellable(&run.id).await);
 }
 
 #[tokio::test]

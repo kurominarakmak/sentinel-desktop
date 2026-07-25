@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -149,10 +149,32 @@ impl RunStorage for RunRepository {
 
 #[derive(Clone)]
 struct ActiveRun {
+    generation: u64,
+    state: ActiveRunState,
     cancel: mpsc::Sender<RunnerCommand>,
     events: broadcast::Sender<NormalizedAgentEvent>,
     completion: watch::Sender<Option<Result<Run, RuntimeError>>>,
-    cancellation_requested: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveRunState {
+    Active,
+    CancellationRequested,
+    Finalizing,
+}
+
+fn active_can_cancel(active: &ActiveRun) -> bool {
+    active.state == ActiveRunState::Active && !active.cancel.is_closed()
+}
+
+fn active_entry_matches(
+    active_runs: &HashMap<RunId, ActiveRun>,
+    id: &RunId,
+    active: &ActiveRun,
+) -> bool {
+    active_runs
+        .get(id)
+        .is_some_and(|current| current.generation == active.generation)
 }
 
 enum RunnerCommand {
@@ -194,6 +216,7 @@ pub struct RunOrchestrator {
     repository: Arc<dyn RunStorage>,
     fake_agent: FakeAgentProgram,
     active: Arc<Mutex<HashMap<RunId, ActiveRun>>>,
+    next_generation: Arc<AtomicU64>,
 }
 
 impl RunOrchestrator {
@@ -206,6 +229,7 @@ impl RunOrchestrator {
             repository,
             fake_agent,
             active: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -223,10 +247,11 @@ impl RunOrchestrator {
         let (event_sender, _) = broadcast::channel(LIVE_EVENT_CAPACITY);
         let (completion_sender, _) = watch::channel(None);
         let active = ActiveRun {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            state: ActiveRunState::Active,
             cancel: cancel_sender,
             events: event_sender,
             completion: completion_sender,
-            cancellation_requested: Arc::new(AtomicBool::new(false)),
         };
         self.active
             .lock()
@@ -252,6 +277,17 @@ impl RunOrchestrator {
         }
     }
 
+    /// The final active-map inspection is the capability linearization point.
+    /// Persisted status is intentionally not consulted: only current runtime ownership can
+    /// authorize cancellation, and detached persisted runs are never cancellable.
+    pub async fn is_cancellable(&self, id: &RunId) -> bool {
+        self.active
+            .lock()
+            .await
+            .get(id)
+            .is_some_and(active_can_cancel)
+    }
+
     pub async fn subscribe_to_run_events(
         &self,
         id: &RunId,
@@ -265,20 +301,43 @@ impl RunOrchestrator {
     }
 
     pub async fn cancel_run(&self, id: &RunId) -> CancellationResult {
-        let active = self.active.lock().await.get(id).cloned();
-        let Some(active) = active else {
-            return match self.repository.get_run(id).await {
-                Ok(run) if run.status.terminal() => CancellationResult::AlreadyTerminal,
-                _ => CancellationResult::RunNotActive,
+        let cancel = {
+            let mut active_runs = self.active.lock().await;
+            let Some(active) = active_runs.get_mut(id) else {
+                drop(active_runs);
+                return match self.repository.get_run(id).await {
+                    Ok(run) if run.status.terminal() => CancellationResult::AlreadyTerminal,
+                    _ => CancellationResult::RunNotActive,
+                };
             };
+            match active.state {
+                ActiveRunState::CancellationRequested => {
+                    return CancellationResult::AlreadyCancelling
+                }
+                ActiveRunState::Finalizing => return CancellationResult::AlreadyTerminal,
+                ActiveRunState::Active if active.cancel.is_closed() => {
+                    return CancellationResult::TerminationFailed
+                }
+                ActiveRunState::Active => {
+                    // This synchronized mutation is visible before the cancellation signal is sent.
+                    active.state = ActiveRunState::CancellationRequested;
+                    active.cancel.clone()
+                }
+            }
         };
-        if active.cancellation_requested.swap(true, Ordering::AcqRel) {
-            return CancellationResult::AlreadyCancelling;
-        }
-        match active.cancel.try_send(RunnerCommand::Cancel) {
+        match cancel.try_send(RunnerCommand::Cancel) {
             Ok(()) => CancellationResult::CancellationRequested,
             Err(mpsc::error::TrySendError::Full(_)) => CancellationResult::AlreadyCancelling,
             Err(mpsc::error::TrySendError::Closed(_)) => CancellationResult::TerminationFailed,
+        }
+    }
+
+    async fn mark_finalizing(&self, id: &RunId, active: &ActiveRun) {
+        let mut active_runs = self.active.lock().await;
+        if active_entry_matches(&active_runs, id, active) {
+            if let Some(current) = active_runs.get_mut(id) {
+                current.state = ActiveRunState::Finalizing;
+            }
         }
     }
 
@@ -364,6 +423,7 @@ impl RunOrchestrator {
                 "runtime_storage",
                 "unable to persist run lifecycle update",
             ));
+            self.mark_finalizing(&id, &active).await;
             if process.cancel(CANCEL_TIMEOUT).await.is_err() {
                 evidence.termination_error = Some(runtime_error(
                     "termination_failed",
@@ -401,18 +461,18 @@ impl RunOrchestrator {
                 Some(ProcessEvent::Stdout(line)) => match serde_json::from_str::<AgentEvent>(&line) {
                         Ok(agent_event) => {
                             if self.record_agent_event(&id, &mut sequence, agent_event, &mut evidence, &active).await.is_err() {
-                                self.record_event_storage_failure(&mut evidence, &mut process, &active).await;
+                                self.record_event_storage_failure(&id, &mut evidence, &mut process, &active).await;
                                 break 'execution;
                             }
                         }
                         Err(_) => if self.record_parser_error(&id, &mut sequence, &mut evidence, &active).await.is_err() {
-                            self.record_event_storage_failure(&mut evidence, &mut process, &active).await;
+                            self.record_event_storage_failure(&id, &mut evidence, &mut process, &active).await;
                             break 'execution;
                         }
                     },
                     Some(ProcessEvent::Stderr(line)) => append_bounded_redacted(&mut evidence.stderr, &line, STDERR_LIMIT),
                     Some(ProcessEvent::OutputError) => if self.record_parser_error(&id, &mut sequence, &mut evidence, &active).await.is_err() {
-                        self.record_event_storage_failure(&mut evidence, &mut process, &active).await;
+                        self.record_event_storage_failure(&id, &mut evidence, &mut process, &active).await;
                         break 'execution;
                     },
                     Some(ProcessEvent::Exited(_)) => {},
@@ -436,13 +496,15 @@ impl RunOrchestrator {
                 }
             }
         }
+        // Terminal outcome collection is complete. Invalidate the capability before any
+        // cleanup or terminal persistence can await.
+        self.mark_finalizing(&id, &active).await;
         // Reaping the direct child does not prove that its owned process group
         // has exited: a descendant can retain an inherited output pipe. Treat
         // that as an abnormal lifecycle outcome, terminate the owned group,
         // and keep draining only for a bounded period.
         if evidence.parent_exit_observed && process_group_is_alive(&process) {
             evidence.lingering_process_group = true;
-            active.cancellation_requested.store(true, Ordering::Release);
             if process.cancel(CANCEL_TIMEOUT).await.is_err() {
                 evidence.termination_error = Some(runtime_error(
                     "termination_failed",
@@ -463,7 +525,6 @@ impl RunOrchestrator {
                         // Parent exit was already observed. The exit-derived
                         // result wins this race, but consuming the request keeps
                         // the command channel from becoming a shutdown hazard.
-                        active.cancellation_requested.store(true, Ordering::Release);
                     }
                 }
                 _ = time::sleep_until(drain_deadline) => break,
@@ -472,13 +533,13 @@ impl RunOrchestrator {
                 {
                     Ok(agent_event) => {
                         if self.record_agent_event(&id, &mut sequence, agent_event, &mut evidence, &active).await.is_err() {
-                            self.record_event_storage_failure(&mut evidence, &mut process, &active).await;
+                            self.record_event_storage_failure(&id, &mut evidence, &mut process, &active).await;
                             break;
                         }
                     }
                     Err(_) => {
                         if self.record_parser_error(&id, &mut sequence, &mut evidence, &active).await.is_err() {
-                            self.record_event_storage_failure(&mut evidence, &mut process, &active).await;
+                            self.record_event_storage_failure(&id, &mut evidence, &mut process, &active).await;
                             break;
                         }
                     }
@@ -488,7 +549,7 @@ impl RunOrchestrator {
                 }
                 Some(ProcessEvent::OutputError) => {
                     if self.record_parser_error(&id, &mut sequence, &mut evidence, &active).await.is_err() {
-                        self.record_event_storage_failure(&mut evidence, &mut process, &active).await;
+                        self.record_event_storage_failure(&id, &mut evidence, &mut process, &active).await;
                         break;
                     }
                 }
@@ -590,11 +651,12 @@ impl RunOrchestrator {
     }
     async fn record_event_storage_failure(
         &self,
+        id: &RunId,
         evidence: &mut RunOutcomeEvidence,
         process: &mut SupervisedProcess,
         active: &ActiveRun,
     ) {
-        active.cancellation_requested.store(true, Ordering::Release);
+        self.mark_finalizing(id, active).await;
         evidence.storage_error = Some(runtime_error(
             "event_persistence",
             "unable to persist normalized agent event",
@@ -642,6 +704,8 @@ impl RunOrchestrator {
         persist_terminal: bool,
         active: &ActiveRun,
     ) {
+        // The synchronized marker is updated before terminal persistence starts.
+        self.mark_finalizing(id, active).await;
         let terminal = resolve_terminal_outcome(&evidence);
         let outcome = if persist_terminal {
             let event = self.lifecycle_event(id, sequence, terminal.lifecycle_event_type);
@@ -675,7 +739,10 @@ impl RunOrchestrator {
         outcome: Result<Run, RuntimeError>,
     ) {
         let _ = active.completion.send(Some(outcome));
-        self.active.lock().await.remove(id);
+        let mut active_runs = self.active.lock().await;
+        if active_entry_matches(&active_runs, id, active) {
+            active_runs.remove(id);
+        }
     }
 }
 
@@ -795,6 +862,50 @@ fn now_ms() -> i64 {
         .map_or(0, |duration| {
             duration.as_millis().try_into().unwrap_or(i64::MAX)
         })
+}
+
+#[cfg(test)]
+mod active_state_tests {
+    use super::*;
+
+    fn active(generation: u64) -> (ActiveRun, mpsc::Receiver<RunnerCommand>) {
+        let (cancel, receiver) = mpsc::channel(1);
+        let (events, _) = broadcast::channel(1);
+        let (completion, _) = watch::channel(None);
+        (
+            ActiveRun {
+                generation,
+                state: ActiveRunState::Active,
+                cancel,
+                events,
+                completion,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn capability_requires_active_state_and_open_channel() {
+        let (mut run, receiver) = active(1);
+        assert!(active_can_cancel(&run));
+        run.state = ActiveRunState::CancellationRequested;
+        assert!(!active_can_cancel(&run));
+        run.state = ActiveRunState::Finalizing;
+        assert!(!active_can_cancel(&run));
+        run.state = ActiveRunState::Active;
+        drop(receiver);
+        assert!(!active_can_cancel(&run));
+    }
+
+    #[test]
+    fn replacement_generation_invalidates_the_previous_entry() {
+        let id = RunId::new();
+        let (old, _old_receiver) = active(1);
+        let (replacement, _replacement_receiver) = active(2);
+        let mut active_runs = HashMap::new();
+        active_runs.insert(id.clone(), replacement);
+        assert!(!active_entry_matches(&active_runs, &id, &old));
+    }
 }
 fn redact_value(value: Value) -> Value {
     match value {

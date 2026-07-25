@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 2 — In progress (Phase 2A, Phase 2B, and Phase 2C1 complete)**
+**Current phase: Phase 2 — In progress (Phase 2A, Phase 2B, Phase 2C1, and Phase 2C2 complete; Phase 2C3 pending manual desktop acceptance; Phase 3 not started)**
 
 ## Documentation Navigation
 
@@ -24,11 +24,11 @@ Phase 2A completed the typed run domain, validated state machine, and SQLite per
 
 Phase 2B completed the Tauri-independent fake-agent runtime, ordered event persistence, live event bus, process-group cancellation, storage-failure cleanup, and deterministic terminal-outcome resolution.
 
-Phase 2C1 completed the typed Tauri desktop bridge, trusted fake-agent sidecar preparation and resolution, safe command DTOs, live-event forwarding with SQLite replay and lag recovery, and temporary Phase 0 frontend compatibility.
+Phase 2C1 is **COMPLETE**: it delivered the typed Tauri desktop bridge, trusted fake-agent sidecar preparation and resolution, safe command DTOs, live-event forwarding with SQLite replay and lag recovery, and temporary Phase 0 frontend compatibility.
 
-The immediate next action is Phase 2C2: replace the Phase 0 React screen with the typed fake-run task, active-run, event-stream, cancellation, and persisted-history UI.
+Phase 2C2 is **COMPLETE**: it delivered typed React/Tauri bridge integration; fake-run submission and history; live/persisted event reconciliation; lifecycle and terminal freshness protection; runtime-authoritative cancellation capability with RunId-scoped cancellation operations; scoped loading, error, and retry states; runtime-environment readiness; safe allowlisted event presentation; focus/listener lifecycle handling; error-boundary/bootstrap fallback; and comprehensive race/integration tests. Final evidence: 92 frontend tests passed, 76 Rust workspace tests passed in the final full Rust validation, frontend production and Tauri no-bundle builds passed, `cargo fmt --all --check` passed, workspace Clippy with warnings denied passed, and final review found no remaining P1/P2 issues.
 
-Phase 2C3 will then perform the complete live desktop acceptance flow and final Phase 2 verification.
+The immediate next action is Phase 2C3, **PENDING** manual desktop acceptance and final Phase 2 verification. Phase 2 overall remains **IN PROGRESS**; Phase 3 is **NOT STARTED**.
 
 Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
 

@@ -1,7 +1,7 @@
 mod windowing;
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
-use sentinel_core::{NormalizedAgentEvent, RunId, RunRepository, TaskRequest};
+use sentinel_core::{NormalizedAgentEvent, Run, RunId, RunRepository, TaskRequest};
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,22 @@ struct EventDto {
     event_type: String,
     timestamp_ms: i64,
     payload: serde_json::Value,
+}
+/// Stable desktop API shape. Do not expose the domain `Run` serde layout directly.
+#[derive(Clone, Debug, Serialize)]
+struct RunDto {
+    id: String,
+    task_text: String,
+    agent_kind: String,
+    status: sentinel_core::RunStatus,
+    schema_version: u16,
+    created_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    exit_code: Option<i32>,
+    error_category: Option<String>,
+    error_message: Option<String>,
+    cancellable: bool,
 }
 #[derive(Deserialize)]
 struct SubmitFakeRun {
@@ -173,13 +189,47 @@ async fn replay_persisted_events(
     }
     Ok(false)
 }
+async fn run_dto(state: &DesktopState, run: sentinel_core::Run) -> RunDto {
+    let cancellable = state.orchestrator.is_cancellable(&run.id).await;
+    run_dto_with_capability(run, cancellable)
+}
+fn run_dto_with_capability(run: Run, cancellable: bool) -> RunDto {
+    let (error_category, error_message) = match run.error {
+        Some(error) => (Some(error.category), Some(error.message)),
+        None => (None, None),
+    };
+    RunDto {
+        id: run.id.to_string(),
+        task_text: run.task_text,
+        agent_kind: match run.agent {
+            AgentKind::Fake => "fake",
+            AgentKind::Codex => "codex",
+            AgentKind::ClaudeCode => "claude_code",
+        }
+        .into(),
+        status: run.status,
+        schema_version: run.schema_version,
+        created_at_ms: run.created_at_ms,
+        started_at_ms: run.started_at_ms,
+        finished_at_ms: run.finished_at_ms,
+        exit_code: run.exit_code,
+        error_category,
+        error_message,
+        cancellable,
+    }
+}
 #[tauri::command]
-async fn list_runs(state: State<'_, DesktopState>) -> Result<Vec<sentinel_core::Run>, SafeError> {
-    state
+async fn list_runs(state: State<'_, DesktopState>) -> Result<Vec<RunDto>, SafeError> {
+    let runs = state
         .repository
         .list_recent_runs()
         .await
-        .map_err(safe_error)
+        .map_err(safe_error)?;
+    let mut result = Vec::with_capacity(runs.len());
+    for run in runs {
+        result.push(run_dto(&state, run).await);
+    }
+    Ok(result)
 }
 #[tauri::command]
 async fn list_run_events(
@@ -194,15 +244,13 @@ async fn list_run_events(
         .map_err(safe_error)
 }
 #[tauri::command]
-async fn get_run(
-    id: String,
-    state: State<'_, DesktopState>,
-) -> Result<sentinel_core::Run, SafeError> {
-    state
+async fn get_run(id: String, state: State<'_, DesktopState>) -> Result<RunDto, SafeError> {
+    let run = state
         .repository
         .get_run(&RunId::from_str(&id).map_err(|_| input_error())?)
         .await
-        .map_err(safe_error)
+        .map_err(safe_error)?;
+    Ok(run_dto(&state, run).await)
 }
 #[tauri::command]
 fn get_runtime_environment(state: State<'_, DesktopState>) -> RuntimeEnvironment {
@@ -217,7 +265,7 @@ async fn submit_fake_run(
     request: SubmitFakeRun,
     state: State<'_, DesktopState>,
     app: AppHandle,
-) -> Result<sentinel_core::Run, SafeError> {
+) -> Result<RunDto, SafeError> {
     let scenario = FakeAgentScenario::from_str(&request.scenario).map_err(|_| input_error())?;
     let run = state
         .orchestrator
@@ -231,7 +279,7 @@ async fn submit_fake_run(
         .map_err(safe_error)?;
     let registered = { state.forwarders.lock().await.insert(run.id.clone()) };
     if !registered {
-        return Ok(run);
+        return Ok(run_dto(&state, run).await);
     }
     let mut receiver = match state.orchestrator.subscribe_to_run_events(&run.id).await {
         Ok(value) => value,
@@ -249,7 +297,7 @@ async fn submit_fake_run(
                         .await;
                 forwarders.lock().await.remove(&run_id);
             });
-            return Ok(run);
+            return Ok(run_dto(&state, run).await);
         }
     };
     let forwarders = state.forwarders.clone();
@@ -297,7 +345,7 @@ async fn submit_fake_run(
         }
         forwarders.lock().await.remove(&run_id);
     });
-    Ok(run)
+    Ok(run_dto(&state, run).await)
 }
 /// Deprecated Phase 0 command compatibility; delegates to the trusted runtime only.
 #[tauri::command]
@@ -522,6 +570,7 @@ mod macos_tests {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
+    use sentinel_core::{RunStatus, SafeRunError};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -554,6 +603,56 @@ mod bridge_tests {
         assert_eq!(dto.run_id, id.to_string());
         assert_eq!(dto.sequence_number, 7);
         assert_eq!(dto.timestamp_ms, 42);
+    }
+    fn run(status: RunStatus, error: Option<SafeRunError>) -> Run {
+        Run {
+            id: RunId::new(),
+            task_text: "inspect fixture".into(),
+            agent: AgentKind::Fake,
+            status,
+            schema_version: 1,
+            created_at_ms: 10,
+            started_at_ms: Some(20),
+            finished_at_ms: None,
+            exit_code: None,
+            error,
+        }
+    }
+    #[test]
+    fn run_dto_serializes_running_shape_exactly() {
+        let run = run(RunStatus::Running, None);
+        assert_eq!(
+            serde_json::to_value(run_dto_with_capability(run.clone(), true)).unwrap(),
+            json!({"id":run.id.to_string(),"task_text":"inspect fixture","agent_kind":"fake","status":"running","schema_version":1,"created_at_ms":10,"started_at_ms":20,"finished_at_ms":null,"exit_code":null,"error_category":null,"error_message":null,"cancellable":true})
+        );
+    }
+    #[test]
+    fn run_dto_flattens_failed_error_without_internal_fields() {
+        let mut run = run(
+            RunStatus::Failed,
+            Some(SafeRunError {
+                category: "agent_failed".into(),
+                message: "safe failure".into(),
+            }),
+        );
+        run.finished_at_ms = Some(30);
+        run.exit_code = Some(1);
+        let value = serde_json::to_value(run_dto_with_capability(run.clone(), false)).unwrap();
+        assert_eq!(
+            value,
+            json!({"id":run.id.to_string(),"task_text":"inspect fixture","agent_kind":"fake","status":"failed","schema_version":1,"created_at_ms":10,"started_at_ms":20,"finished_at_ms":30,"exit_code":1,"error_category":"agent_failed","error_message":"safe failure","cancellable":false})
+        );
+        assert!(value.get("error").is_none());
+        assert!(value.get("executable").is_none());
+        assert!(value.get("stderr").is_none());
+    }
+    #[test]
+    fn detached_nonterminal_run_uses_the_same_shape_without_capability() {
+        let run = run(RunStatus::Running, None);
+        let value = serde_json::to_value(run_dto_with_capability(run, false)).unwrap();
+        assert_eq!(value.get("status"), Some(&json!("running")));
+        assert_eq!(value.get("cancellable"), Some(&json!(false)));
+        assert_eq!(value.as_object().map(|object| object.len()), Some(12));
     }
     #[test]
     fn input_errors_are_stable_and_safe() {
