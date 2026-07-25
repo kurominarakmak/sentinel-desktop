@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 2 — In progress (Phase 2A, Phase 2B, Phase 2C1, and Phase 2C2 complete; Phase 2C3 pending manual desktop acceptance; Phase 3 not started)**
+**Current phase: Phase 2 — COMPLETE (Phase 2A, Phase 2B, Phase 2C1, Phase 2C2, and Phase 2C3 complete; Phase 3 NOT STARTED)**
 
 ## Documentation Navigation
 
@@ -28,8 +28,10 @@ Phase 2C1 is **COMPLETE**: it delivered the typed Tauri desktop bridge, trusted 
 
 Phase 2C2 is **COMPLETE**: it delivered typed React/Tauri bridge integration; fake-run submission and history; live/persisted event reconciliation; lifecycle and terminal freshness protection; runtime-authoritative cancellation capability with RunId-scoped cancellation operations; scoped loading, error, and retry states; runtime-environment readiness; safe allowlisted event presentation; focus/listener lifecycle handling; error-boundary/bootstrap fallback; and comprehensive race/integration tests. Final evidence: 92 frontend tests passed, 76 Rust workspace tests passed in the final full Rust validation, frontend production and Tauri no-bundle builds passed, `cargo fmt --all --check` passed, workspace Clippy with warnings denied passed, and final review found no remaining P1/P2 issues.
 
-The immediate next action is Phase 2C3, **PENDING** manual desktop acceptance and final Phase 2 verification. Phase 2 overall remains **IN PROGRESS**; Phase 3 is **NOT STARTED**.
+Phase 2C3 is **COMPLETE**: manual macOS Tauri desktop acceptance verified success, failure, delayed child-process cancellation, burst/replay ordering, malformed/incomplete protocol handling, SQLite persistence across restart, detached persisted-run capability, and Escape/reopen focus preservation.
+
+Phase 2 is **COMPLETE**. Its exit criterion is satisfied: a deterministic fake task traverses the desktop UI, typed Tauri bridge, Rust orchestrator and state machine, SQLite persistence, live/persisted event recovery, history, terminal handling, and cancellation. Phase 3 is **NOT STARTED**.
 
 Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
 
-Interactive macOS end-to-end verification of the new Phase 2 UI remains pending and must not be claimed as complete. Phase 2 is not complete until a deterministic fake task traverses React → Tauri → runtime → SQLite → React successfully.
+Interactive macOS end-to-end verification completed through the real desktop application. Real Codex and Claude execution remain disabled; Phase 0 Codex validation remains feasibility-only and Claude remains deferred.
