@@ -53,6 +53,15 @@ async fn fresh_database_migrates_with_required_schema_and_configuration() {
             ("index".into(), "runs_recent_order".into()),
         ]
     );
+    let project_columns: Vec<String> = sqlx::query("PRAGMA table_info(projects)")
+        .fetch_all(&pool)
+        .await
+        .expect("project schema")
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect();
+    assert!(project_columns.contains(&"repository_fingerprint".into()));
+    assert!(project_columns.contains(&"fingerprint_scheme".into()));
 }
 
 #[tokio::test]

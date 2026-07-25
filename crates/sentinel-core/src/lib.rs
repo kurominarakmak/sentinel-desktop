@@ -31,6 +31,115 @@ impl RunId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(Uuid);
+impl ProjectId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+impl Default for ProjectId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl std::fmt::Display for ProjectId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+impl std::str::FromStr for ProjectId {
+    type Err = uuid::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectValidationState {
+    Valid,
+    Detached,
+    Unborn,
+    LinkedWorktree,
+    RequiresTrustedRevalidation,
+}
+fn project_state_name(state: ProjectValidationState) -> &'static str {
+    match state {
+        ProjectValidationState::Valid => "valid",
+        ProjectValidationState::Detached => "detached",
+        ProjectValidationState::Unborn => "unborn",
+        ProjectValidationState::LinkedWorktree => "linked_worktree",
+        // This is a bridge-facing derived state for legacy rows. New trusted
+        // registrations always persist one of the repository states above.
+        ProjectValidationState::RequiresTrustedRevalidation => "valid",
+    }
+}
+fn parse_project_state(value: &str) -> Result<ProjectValidationState, CoreError> {
+    match value {
+        "valid" => Ok(ProjectValidationState::Valid),
+        "detached" => Ok(ProjectValidationState::Detached),
+        "unborn" => Ok(ProjectValidationState::Unborn),
+        "linked_worktree" => Ok(ProjectValidationState::LinkedWorktree),
+        _ => Err(CoreError::Storage),
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectFingerprintScheme {
+    LegacyUnverified,
+    WeakV0,
+    StrongV1,
+}
+fn fingerprint_scheme_name(scheme: ProjectFingerprintScheme) -> &'static str {
+    match scheme {
+        ProjectFingerprintScheme::LegacyUnverified => "legacy_unverified",
+        ProjectFingerprintScheme::WeakV0 => "weak_v0",
+        ProjectFingerprintScheme::StrongV1 => "strong_v1",
+    }
+}
+fn parse_fingerprint_scheme(value: &str) -> Result<ProjectFingerprintScheme, CoreError> {
+    match value {
+        "legacy_unverified" => Ok(ProjectFingerprintScheme::LegacyUnverified),
+        "weak_v0" => Ok(ProjectFingerprintScheme::WeakV0),
+        "strong_v1" => Ok(ProjectFingerprintScheme::StrongV1),
+        _ => Err(CoreError::Storage),
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectRegistration {
+    pub display_name: String,
+    pub repository_identity: String,
+    pub repository_fingerprint: String,
+    pub fingerprint_scheme: ProjectFingerprintScheme,
+    pub repository_root: String,
+    pub primary_root: String,
+    pub git_common_dir: String,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub validation_state: ProjectValidationState,
+    pub is_primary_worktree: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Project {
+    pub id: ProjectId,
+    pub display_name: String,
+    pub repository_identity: String,
+    pub repository_fingerprint: String,
+    pub fingerprint_scheme: ProjectFingerprintScheme,
+    pub repository_root: String,
+    pub primary_root: String,
+    pub git_common_dir: String,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub validation_state: ProjectValidationState,
+    pub is_primary_worktree: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_validated_at_ms: i64,
+}
+
 impl Default for RunId {
     fn default() -> Self {
         Self::new()
@@ -149,10 +258,46 @@ pub enum CoreError {
     PayloadTooLarge,
     #[error("run not found")]
     NotFound,
+    #[error("duplicate project")]
+    DuplicateProject,
+    #[error("repository identity changed")]
+    RepositoryIdentityChanged,
     #[error(transparent)]
     Transition(#[from] TransitionError),
     #[error("storage error")]
     Storage,
+}
+fn row_to_project(row: &sqlx::sqlite::SqliteRow) -> Result<Project, CoreError> {
+    let fingerprint_scheme = parse_fingerprint_scheme(&row.get::<String, _>("fingerprint_scheme"))?;
+    let stored_validation_state = parse_project_state(&row.get::<String, _>("validation_state"))?;
+    Ok(Project {
+        id: ProjectId(Uuid::from_str(&row.get::<String, _>("id")).map_err(|_| CoreError::Storage)?),
+        display_name: row.get("display_name"),
+        repository_identity: row.get("repository_identity"),
+        repository_fingerprint: row.get("repository_fingerprint"),
+        fingerprint_scheme,
+        repository_root: row.get("repository_root"),
+        primary_root: row.get("primary_root"),
+        git_common_dir: row.get("git_common_dir"),
+        branch: row.get("branch"),
+        head: row.get("head"),
+        validation_state: if fingerprint_scheme == ProjectFingerprintScheme::StrongV1 {
+            stored_validation_state
+        } else {
+            ProjectValidationState::RequiresTrustedRevalidation
+        },
+        is_primary_worktree: row.get::<i64, _>("is_primary_worktree") != 0,
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+        last_validated_at_ms: row.get("last_validated_at_ms"),
+    })
+}
+
+fn duplicate_project_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| code == "2067")
 }
 
 fn now() -> i64 {
@@ -389,6 +534,108 @@ impl RunRepository {
             journal_mode,
             busy_timeout_ms,
         })
+    }
+    pub async fn register_project(
+        &self,
+        registration: ProjectRegistration,
+    ) -> Result<Project, CoreError> {
+        if registration.display_name.trim().is_empty()
+            || registration.repository_identity.is_empty()
+            || registration.repository_fingerprint.is_empty()
+            || registration.fingerprint_scheme != ProjectFingerprintScheme::StrongV1
+        {
+            return Err(CoreError::InvalidTask);
+        }
+        let timestamp = now();
+        let project = Project {
+            id: ProjectId::new(),
+            display_name: registration.display_name,
+            repository_identity: registration.repository_identity,
+            repository_fingerprint: registration.repository_fingerprint,
+            fingerprint_scheme: registration.fingerprint_scheme,
+            repository_root: registration.repository_root,
+            primary_root: registration.primary_root,
+            git_common_dir: registration.git_common_dir,
+            branch: registration.branch,
+            head: registration.head,
+            validation_state: registration.validation_state,
+            is_primary_worktree: registration.is_primary_worktree,
+            created_at_ms: timestamp,
+            updated_at_ms: timestamp,
+            last_validated_at_ms: timestamp,
+        };
+        let result = sqlx::query("INSERT INTO projects (id, display_name, repository_identity, repository_fingerprint, fingerprint_scheme, repository_root, primary_root, git_common_dir, branch, head, validation_state, is_primary_worktree, created_at_ms, updated_at_ms, last_validated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(project.id.to_string()).bind(&project.display_name).bind(&project.repository_identity).bind(&project.repository_fingerprint).bind(fingerprint_scheme_name(project.fingerprint_scheme)).bind(&project.repository_root).bind(&project.primary_root).bind(&project.git_common_dir).bind(&project.branch).bind(&project.head).bind(project_state_name(project.validation_state)).bind(i64::from(project.is_primary_worktree)).bind(project.created_at_ms).bind(project.updated_at_ms).bind(project.last_validated_at_ms).execute(&self.pool).await;
+        match result {
+            Ok(_) => Ok(project),
+            Err(error) if duplicate_project_error(&error) => Err(CoreError::DuplicateProject),
+            Err(_) => Err(CoreError::Storage),
+        }
+    }
+    pub async fn get_project(&self, id: &ProjectId) -> Result<Project, CoreError> {
+        let row = sqlx::query("SELECT * FROM projects WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .ok_or(CoreError::NotFound)?;
+        row_to_project(&row)
+    }
+    pub async fn list_projects(&self) -> Result<Vec<Project>, CoreError> {
+        let rows = sqlx::query("SELECT * FROM projects ORDER BY created_at_ms DESC, id DESC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?;
+        rows.iter().map(row_to_project).collect()
+    }
+    pub async fn revalidate_project(
+        &self,
+        id: &ProjectId,
+        registration: ProjectRegistration,
+    ) -> Result<Project, CoreError> {
+        if registration.fingerprint_scheme != ProjectFingerprintScheme::StrongV1 {
+            return Err(CoreError::InvalidTask);
+        }
+        let existing = self.get_project(id).await?;
+        if existing.repository_identity != registration.repository_identity {
+            return Err(CoreError::RepositoryIdentityChanged);
+        }
+        let timestamp = now();
+        let changed = match existing.fingerprint_scheme {
+            ProjectFingerprintScheme::StrongV1 => {
+                if existing.repository_fingerprint != registration.repository_fingerprint {
+                    return Err(CoreError::RepositoryIdentityChanged);
+                }
+                sqlx::query("UPDATE projects SET display_name = ?, repository_root = ?, primary_root = ?, git_common_dir = ?, branch = ?, head = ?, validation_state = ?, is_primary_worktree = ?, updated_at_ms = ?, last_validated_at_ms = ? WHERE id = ? AND repository_identity = ? AND repository_fingerprint = ? AND fingerprint_scheme = 'strong_v1'").bind(&registration.display_name).bind(&registration.repository_root).bind(&registration.primary_root).bind(&registration.git_common_dir).bind(&registration.branch).bind(&registration.head).bind(project_state_name(registration.validation_state)).bind(i64::from(registration.is_primary_worktree)).bind(timestamp).bind(timestamp).bind(id.to_string()).bind(&registration.repository_identity).bind(&registration.repository_fingerprint).execute(&self.pool).await.map_err(|_| CoreError::Storage)?.rows_affected()
+            }
+            ProjectFingerprintScheme::LegacyUnverified | ProjectFingerprintScheme::WeakV0 => {
+                // This is an explicit user-requested trust reset. It may adopt
+                // the repository currently found at the stored identity once,
+                // then all later refreshes use strict strong matching.
+                sqlx::query("UPDATE projects SET display_name = ?, repository_fingerprint = ?, fingerprint_scheme = 'strong_v1', repository_root = ?, primary_root = ?, git_common_dir = ?, branch = ?, head = ?, validation_state = ?, is_primary_worktree = ?, updated_at_ms = ?, last_validated_at_ms = ? WHERE id = ? AND repository_identity = ? AND fingerprint_scheme IN ('legacy_unverified', 'weak_v0')").bind(&registration.display_name).bind(&registration.repository_fingerprint).bind(&registration.repository_root).bind(&registration.primary_root).bind(&registration.git_common_dir).bind(&registration.branch).bind(&registration.head).bind(project_state_name(registration.validation_state)).bind(i64::from(registration.is_primary_worktree)).bind(timestamp).bind(timestamp).bind(id.to_string()).bind(&registration.repository_identity).execute(&self.pool).await.map_err(|_| CoreError::Storage)?.rows_affected()
+            }
+        };
+        if changed == 0 {
+            return if self.get_project(id).await.is_ok() {
+                Err(CoreError::RepositoryIdentityChanged)
+            } else {
+                Err(CoreError::NotFound)
+            };
+        }
+        self.get_project(id).await
+    }
+    pub async fn unregister_project(&self, id: &ProjectId) -> Result<(), CoreError> {
+        if sqlx::query("DELETE FROM projects WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .rows_affected()
+            == 0
+        {
+            Err(CoreError::NotFound)
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn create_run(&self, request: TaskRequest) -> Result<Run, CoreError> {

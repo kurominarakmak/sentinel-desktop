@@ -1,8 +1,12 @@
 mod windowing;
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
-use sentinel_core::{NormalizedAgentEvent, Run, RunId, RunRepository, TaskRequest};
+use sentinel_core::{
+    CoreError, NormalizedAgentEvent, Project, ProjectFingerprintScheme, ProjectId,
+    ProjectRegistration, ProjectValidationState, Run, RunId, RunRepository, TaskRequest,
+};
 use sentinel_fake_agent::FakeAgentScenario;
+use sentinel_git::{inspect_repository, GitError, RepositoryInspection, RepositoryState};
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -34,6 +38,12 @@ struct DesktopState {
     orchestrator: RunOrchestrator,
     database_path: PathBuf,
     forwarders: Arc<tokio::sync::Mutex<HashSet<RunId>>>,
+    protected_application_repository: Option<ProtectedRepository>,
+}
+#[derive(Clone)]
+struct ProtectedRepository {
+    identity: String,
+    fingerprint: String,
 }
 #[derive(Debug, Serialize)]
 struct SafeError {
@@ -76,6 +86,21 @@ struct SubmitFakeRun {
     task_text: String,
     scenario: String,
 }
+#[derive(Deserialize)]
+struct RegisterProjectRequest {
+    directory: String,
+    display_name: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+struct ProjectDto {
+    id: String,
+    display_name: String,
+    validation_state: ProjectValidationState,
+    is_primary_worktree: bool,
+    branch: Option<String>,
+    head: Option<String>,
+    last_validated_at_ms: i64,
+}
 const RUN_EVENT: &str = "phase2-run-event";
 
 // Tauri requires the returned handle to outlive setup for the tray item to remain visible.
@@ -102,6 +127,155 @@ fn input_error() -> SafeError {
         code: "invalid_input",
         message: "The request contains an invalid identifier or scenario.",
     }
+}
+fn project_error(error: &GitError) -> SafeError {
+    match error {
+        GitError::PathNotFound => SafeError {
+            code: "path_not_found",
+            message: "The selected folder is no longer available.",
+        },
+        GitError::NotDirectory => SafeError {
+            code: "not_directory",
+            message: "Select a folder containing a local Git working tree.",
+        },
+        GitError::NotRepository(_) => SafeError {
+            code: "not_git_repository",
+            message: "Select a local Git working tree.",
+        },
+        GitError::BareRepository => SafeError {
+            code: "bare_repository_unsupported",
+            message: "A working-tree repository is required.",
+        },
+        GitError::GitNotAvailable => SafeError {
+            code: "git_not_available",
+            message: "Git is not available on this device.",
+        },
+        GitError::GitDiscoveryFailed => SafeError {
+            code: "git_discovery_failed",
+            message: "Git could not be safely prepared for validation.",
+        },
+        GitError::TimedOut => SafeError {
+            code: "git_timeout",
+            message: "Repository validation timed out.",
+        },
+        GitError::StdoutTooLarge | GitError::StderrTooLarge => SafeError {
+            code: "git_output_too_large",
+            message: "Repository validation returned too much output.",
+        },
+        GitError::MetadataInvalid | GitError::FingerprintUnavailable => SafeError {
+            code: "repository_metadata_invalid",
+            message: "The repository metadata could not be validated.",
+        },
+        _ => SafeError {
+            code: "validation_failed",
+            message: "The selected repository could not be validated.",
+        },
+    }
+}
+fn project_storage_error(error: CoreError) -> SafeError {
+    match error {
+        CoreError::DuplicateProject => SafeError {
+            code: "duplicate_project",
+            message: "This repository is already registered.",
+        },
+        CoreError::NotFound => SafeError {
+            code: "project_not_found",
+            message: "The registered project is no longer available.",
+        },
+        CoreError::RepositoryIdentityChanged => SafeError {
+            code: "repository_identity_changed",
+            message: "The registered repository was replaced or changed identity.",
+        },
+        _ => SafeError {
+            code: "project_registry_failed",
+            message: "The project registry could not be updated.",
+        },
+    }
+}
+fn project_dto(project: Project) -> ProjectDto {
+    ProjectDto {
+        id: project.id.to_string(),
+        display_name: project.display_name,
+        validation_state: project.validation_state,
+        is_primary_worktree: project.is_primary_worktree,
+        branch: project.branch,
+        head: project.head,
+        last_validated_at_ms: project.last_validated_at_ms,
+    }
+}
+fn project_display_name(requested: Option<String>, inspection: &RepositoryInspection) -> String {
+    let candidate = requested.unwrap_or_else(|| {
+        inspection
+            .repository_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Registered project")
+            .to_owned()
+    });
+    let filtered: String = candidate
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(120)
+        .collect();
+    if filtered.is_empty() {
+        "Registered project".into()
+    } else {
+        filtered
+    }
+}
+fn project_state(state: &RepositoryState) -> ProjectValidationState {
+    match state {
+        RepositoryState::Valid => ProjectValidationState::Valid,
+        RepositoryState::Detached => ProjectValidationState::Detached,
+        RepositoryState::Unborn => ProjectValidationState::Unborn,
+        RepositoryState::LinkedWorktree => ProjectValidationState::LinkedWorktree,
+    }
+}
+fn application_repository_root() -> Option<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)?
+        .canonicalize()
+        .ok()
+}
+fn registration_from_inspection(
+    inspection: RepositoryInspection,
+    display_name: Option<String>,
+    protected: Option<&ProtectedRepository>,
+) -> Result<ProjectRegistration, SafeError> {
+    if protected.is_some_and(|application| {
+        application.identity == inspection.identity
+            && application.fingerprint == inspection.fingerprint.as_str()
+    }) {
+        return Err(SafeError {
+            code: "repository_unsupported",
+            message: "This application repository cannot be registered.",
+        });
+    }
+    Ok(ProjectRegistration {
+        display_name: project_display_name(display_name, &inspection),
+        repository_identity: inspection.identity,
+        repository_fingerprint: inspection.fingerprint.as_str().to_owned(),
+        fingerprint_scheme: ProjectFingerprintScheme::StrongV1,
+        repository_root: inspection.repository_root.to_string_lossy().into_owned(),
+        primary_root: inspection.primary_root.to_string_lossy().into_owned(),
+        git_common_dir: inspection.common_dir.to_string_lossy().into_owned(),
+        branch: inspection.branch,
+        head: inspection.head,
+        validation_state: project_state(&inspection.state),
+        is_primary_worktree: inspection.is_primary,
+    })
+}
+async fn validate_project_registration(
+    directory: PathBuf,
+    display_name: Option<String>,
+    protected: Option<&ProtectedRepository>,
+) -> Result<ProjectRegistration, SafeError> {
+    let inspection = inspect_repository(&directory)
+        .await
+        .map_err(|error| project_error(&error))?;
+    registration_from_inspection(inspection, display_name, protected)
 }
 fn fake_agent_filename() -> &'static str {
     if cfg!(windows) {
@@ -259,6 +433,86 @@ fn get_runtime_environment(state: State<'_, DesktopState>) -> RuntimeEnvironment
         database_initialized: state.database_path.is_file(),
         fake_agent_available: true,
     }
+}
+#[tauri::command]
+async fn register_project(
+    request: RegisterProjectRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ProjectDto, SafeError> {
+    let registration = validate_project_registration(
+        PathBuf::from(request.directory),
+        request.display_name,
+        state.protected_application_repository.as_ref(),
+    )
+    .await?;
+    state
+        .repository
+        .register_project(registration)
+        .await
+        .map(project_dto)
+        .map_err(project_storage_error)
+}
+#[tauri::command]
+async fn list_projects(state: State<'_, DesktopState>) -> Result<Vec<ProjectDto>, SafeError> {
+    state
+        .repository
+        .list_projects()
+        .await
+        .map(|projects| projects.into_iter().map(project_dto).collect())
+        .map_err(project_storage_error)
+}
+#[tauri::command]
+async fn get_project(id: String, state: State<'_, DesktopState>) -> Result<ProjectDto, SafeError> {
+    let id = ProjectId::from_str(&id).map_err(|_| input_error())?;
+    state
+        .repository
+        .get_project(&id)
+        .await
+        .map(project_dto)
+        .map_err(project_storage_error)
+}
+#[tauri::command]
+async fn revalidate_project(
+    id: String,
+    state: State<'_, DesktopState>,
+) -> Result<ProjectDto, SafeError> {
+    let id = ProjectId::from_str(&id).map_err(|_| input_error())?;
+    let existing = state
+        .repository
+        .get_project(&id)
+        .await
+        .map_err(project_storage_error)?;
+    let registration = validate_project_registration(
+        PathBuf::from(existing.repository_root),
+        Some(existing.display_name),
+        state.protected_application_repository.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        if matches!(error.code, "path_not_found" | "not_directory") {
+            SafeError {
+                code: "repository_moved_or_missing",
+                message: "The registered repository was moved or is no longer available.",
+            }
+        } else {
+            error
+        }
+    })?;
+    state
+        .repository
+        .revalidate_project(&id, registration)
+        .await
+        .map(project_dto)
+        .map_err(project_storage_error)
+}
+#[tauri::command]
+async fn unregister_project(id: String, state: State<'_, DesktopState>) -> Result<(), SafeError> {
+    let id = ProjectId::from_str(&id).map_err(|_| input_error())?;
+    state
+        .repository
+        .unregister_project(&id)
+        .await
+        .map_err(project_storage_error)
 }
 #[tauri::command]
 async fn submit_fake_run(
@@ -512,6 +766,21 @@ fn main() {
                     "Agent Sentinel could not initialize its local database",
                 )
             })?;
+            let protected_application_repository = application_repository_root()
+                .map(|root| {
+                    tauri::async_runtime::block_on(inspect_repository(&root)).map(|inspection| {
+                        ProtectedRepository {
+                            identity: inspection.identity,
+                            fingerprint: inspection.fingerprint.as_str().to_owned(),
+                        }
+                    })
+                })
+                .transpose()
+                .map_err(|_| {
+                    Box::<dyn std::error::Error>::from(
+                        "Agent Sentinel could not validate its protected repository",
+                    )
+                })?;
             let fake_agent = FakeAgentProgram::from_executable(executable).map_err(|_| {
                 Box::<dyn std::error::Error>::from(
                     "Agent Sentinel fake-agent executable is unavailable",
@@ -522,6 +791,7 @@ fn main() {
                 repository,
                 database_path,
                 forwarders: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                protected_application_repository,
             });
             app.global_shortcut()
                 .on_shortcut(DEFAULT_GLOBAL_SHORTCUT, |app, _, event| {
@@ -547,6 +817,11 @@ fn main() {
             list_run_events,
             cancel_run,
             get_runtime_environment,
+            register_project,
+            list_projects,
+            get_project,
+            revalidate_project,
+            unregister_project,
             run_fake_agent,
             record_manual_probe_request
         ])
@@ -570,7 +845,8 @@ mod macos_tests {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    use sentinel_core::{RunStatus, SafeRunError};
+    use sentinel_core::{ProjectId, RunStatus, SafeRunError};
+    use sentinel_git::RepositoryFingerprint;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -659,6 +935,83 @@ mod bridge_tests {
         let error = input_error();
         assert_eq!(error.code, "invalid_input");
         assert!(!error.message.contains('/'));
+    }
+    #[test]
+    fn project_dto_has_an_explicit_safe_shape() {
+        let project = Project {
+            id: ProjectId::new(),
+            display_name: "Fixture project".into(),
+            repository_identity: "/private/secret/.git".into(),
+            repository_fingerprint: "unix:private-device:private-inode".into(),
+            fingerprint_scheme: ProjectFingerprintScheme::StrongV1,
+            repository_root: "/private/secret".into(),
+            primary_root: "/private/secret".into(),
+            git_common_dir: "/private/secret/.git".into(),
+            branch: Some("main".into()),
+            head: Some("abc123".into()),
+            validation_state: ProjectValidationState::Valid,
+            is_primary_worktree: true,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            last_validated_at_ms: 3,
+        };
+        let value = serde_json::to_value(project_dto(project)).expect("serialize project DTO");
+        assert_eq!(value["display_name"], "Fixture project");
+        assert!(value.get("repository_root").is_none());
+        assert!(value.get("git_common_dir").is_none());
+        assert!(value.get("repository_fingerprint").is_none());
+        assert!(!value.to_string().contains("/private/secret"));
+    }
+    #[test]
+    fn validation_errors_do_not_expose_git_diagnostics() {
+        let error = project_error(&GitError::Command(
+            "fatal: /private/private-repository token=secret".into(),
+        ));
+        assert_eq!(error.code, "validation_failed");
+        assert!(!error.message.contains("private-repository"));
+        assert!(!error.message.contains("secret"));
+    }
+    #[test]
+    fn repository_identity_change_has_a_safe_typed_bridge_error() {
+        let error = project_storage_error(CoreError::RepositoryIdentityChanged);
+        assert_eq!(error.code, "repository_identity_changed");
+        assert!(!error.message.contains('/'));
+        assert!(!error.message.contains("inode"));
+    }
+    #[test]
+    fn application_repository_cannot_be_registered() {
+        let root = application_repository_root().expect("application repository root");
+        let inspection = RepositoryInspection {
+            repository_root: root.join("linked-worktree-fixture"),
+            primary_root: root,
+            common_dir: PathBuf::from("/private/ignored/.git"),
+            identity: "fixture".into(),
+            fingerprint: RepositoryFingerprint::from_stored("unix:1:2".into()).unwrap(),
+            branch: Some("main".into()),
+            head: Some("abc123".into()),
+            state: RepositoryState::LinkedWorktree,
+            is_primary: false,
+        };
+        let protected = ProtectedRepository {
+            identity: "fixture".into(),
+            fingerprint: "unix:1:2".into(),
+        };
+        let error = registration_from_inspection(inspection, None, Some(&protected))
+            .expect_err("protected root");
+        assert_eq!(error.code, "repository_unsupported");
+        assert!(!error.message.contains('/'));
+    }
+    #[tokio::test]
+    async fn missing_project_directory_has_a_safe_validation_result() {
+        let missing = tempdir()
+            .expect("temporary parent")
+            .path()
+            .join("missing repository");
+        let error = validate_project_registration(missing, Some("Fixture".into()), None)
+            .await
+            .expect_err("missing path");
+        assert_eq!(error.code, "path_not_found");
+        assert!(!error.message.contains("missing repository"));
     }
     #[cfg(unix)]
     #[test]

@@ -17,6 +17,7 @@ sentinel-fake-agent = { path = "../../../crates/sentinel-fake-agent" }
 sentinel-process = { path = "../../../crates/sentinel-process" }
 sentinel-core = { path = "../../../crates/sentinel-core" }
 sentinel-runtime = { path = "../../../crates/sentinel-runtime" }
+sentinel-git = { path = "../../../crates/sentinel-git" }
 tokio.workspace = true
 
 [dev-dependencies]

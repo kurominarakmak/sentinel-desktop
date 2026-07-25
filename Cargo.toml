@@ -23,4 +23,5 @@ tempfile = "3.14"
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "migrate", "macros"] }
+sha2 = "0.10"
 uuid = { version = "1.12", features = ["v4", "serde"] }
