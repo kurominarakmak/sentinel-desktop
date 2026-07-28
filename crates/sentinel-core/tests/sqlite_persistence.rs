@@ -61,6 +61,15 @@ async fn fresh_database_migrates_with_required_schema_and_configuration() {
         .map(|row| row.get("name"))
         .collect();
     assert!(project_columns.contains(&"repository_fingerprint".into()));
+    let worktree_columns: Vec<String> = sqlx::query("PRAGMA table_info(managed_worktrees)")
+        .fetch_all(&pool)
+        .await
+        .expect("worktree schema")
+        .into_iter()
+        .map(|row| row.get("name"))
+        .collect();
+    assert!(worktree_columns.contains(&"worktree_path".into()));
+    assert!(worktree_columns.contains(&"base_commit".into()));
     assert!(project_columns.contains(&"fingerprint_scheme".into()));
 }
 

@@ -1,4 +1,9 @@
-use sentinel_git::{inspect_repository, GitError, RepositoryState, TrustedGitExecutableResolver};
+use sentinel_git::{
+    add_detached_worktree, inspect_repository, inspect_worktree_destination_no_follow,
+    parse_worktree_porcelain_v1_z, remove_detached_worktree, resolve_exact_head, worktree_is_clean,
+    worktree_metadata_lookup, GitError, RepositoryState, TrustedGitExecutableResolver,
+    WorktreeDestinationState, WorktreeMetadataLookup,
+};
 use std::{path::Path, process::Command};
 use tempfile::TempDir;
 
@@ -273,5 +278,150 @@ async fn canonicalizes_symlinks_and_unicode_paths() {
     assert_eq!(
         through_alias.repository_root,
         source.canonicalize().expect("source canonical")
+    );
+}
+
+#[tokio::test]
+async fn detached_worktrees_are_exact_commit_isolated_and_cleanly_removable() {
+    let primary = repository();
+    let root = tempfile::tempdir().expect("trusted worktree root");
+    let commit = resolve_exact_head(primary.path())
+        .await
+        .expect("exact head");
+    std::fs::write(primary.path().join("primary-untracked.txt"), "primary only")
+        .expect("primary dirty fixture");
+    let first = root.path().join("project").join("first");
+    let second = root.path().join("project").join("second");
+    std::fs::create_dir_all(first.parent().expect("parent")).expect("first parent");
+    add_detached_worktree(primary.path(), &first, &commit)
+        .await
+        .expect("first add");
+    add_detached_worktree(primary.path(), &second, &commit)
+        .await
+        .expect("second add");
+    let first_inspection = inspect_repository(&first).await.expect("first inspection");
+    let second_inspection = inspect_repository(&second)
+        .await
+        .expect("second inspection");
+    assert!(!first_inspection.is_primary && !second_inspection.is_primary);
+    assert_eq!(first_inspection.head.as_deref(), Some(commit.as_str()));
+    assert_eq!(second_inspection.head.as_deref(), Some(commit.as_str()));
+    assert_eq!(
+        worktree_metadata_lookup(primary.path(), &first)
+            .await
+            .expect("first metadata"),
+        WorktreeMetadataLookup::Present
+    );
+    std::fs::write(first.join("only-first.txt"), "a").expect("first edit");
+    std::fs::write(second.join("only-second.txt"), "b").expect("second edit");
+    assert!(!second.join("only-first.txt").exists());
+    assert!(!first.join("only-second.txt").exists());
+    assert!(!primary.path().join("only-first.txt").exists());
+    assert!(!primary.path().join("only-second.txt").exists());
+    assert!(!first.join("primary-untracked.txt").exists());
+    assert!(!second.join("primary-untracked.txt").exists());
+    assert!(!worktree_is_clean(&first).await.expect("first status"));
+    assert!(matches!(
+        remove_detached_worktree(primary.path(), &first).await,
+        Err(GitError::DirtyWorktree(_))
+    ));
+    std::fs::remove_file(first.join("only-first.txt")).expect("restore first");
+    assert!(worktree_is_clean(&first).await.expect("clean first"));
+    remove_detached_worktree(primary.path(), &first)
+        .await
+        .expect("remove first");
+    std::fs::remove_file(second.join("only-second.txt")).expect("restore second");
+    remove_detached_worktree(primary.path(), &second)
+        .await
+        .expect("remove second");
+    assert!(!first.exists() && !second.exists());
+    assert_eq!(
+        worktree_metadata_lookup(primary.path(), &first)
+            .await
+            .expect("removed metadata"),
+        WorktreeMetadataLookup::Absent
+    );
+    std::fs::remove_file(primary.path().join("primary-untracked.txt")).expect("restore primary");
+}
+
+#[test]
+fn strict_worktree_porcelain_parser_accepts_complete_records_and_rejects_damage() {
+    let oid = "0123456789abcdef0123456789abcdef01234567";
+    let valid = format!("worktree /tmp/primary\0HEAD {oid}\0branch refs/heads/main\0\0worktree /tmp/linked space 空\0HEAD {oid}\0detached\0locked reason\0prunable stale\0\0");
+    let records = parse_worktree_porcelain_v1_z(valid.as_bytes()).expect("valid records");
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].branch.as_deref(), Some("refs/heads/main"));
+    assert!(records[1].detached);
+    assert_eq!(records[1].locked.as_deref(), Some("reason"));
+    assert_eq!(records[1].prunable.as_deref(), Some("stale"));
+    let malformed = [
+        Vec::new(),
+        format!("worktree /tmp/a\0HEAD {oid}\0").into_bytes(),
+        format!("HEAD {oid}\0\0").into_bytes(),
+        format!("worktree /tmp/a\0worktree /tmp/b\0HEAD {oid}\0\0").into_bytes(),
+        format!("worktree /tmp/a\0HEAD {oid}\0HEAD {oid}\0\0").into_bytes(),
+        b"worktree /tmp/a\0HEAD nope\0\0".to_vec(),
+        format!("worktree /tmp/a\0HEAD {oid}\0branch refs/heads/main\0detached\0\0").into_bytes(),
+        "worktree /tmp/a\0unknown value\0\0".as_bytes().to_vec(),
+        format!("worktree /tmp/a\0HEAD {oid}\0\0worktree /tmp/a\0HEAD {oid}\0\0").into_bytes(),
+        b"worktree /tmp/\xff\0HEAD 0123456789abcdef0123456789abcdef01234567\0\0".to_vec(),
+    ];
+    for bytes in malformed {
+        assert!(parse_worktree_porcelain_v1_z(&bytes).is_err(), "{bytes:?}");
+    }
+}
+
+#[test]
+fn strict_worktree_porcelain_paths_are_absolute_normalized_and_unambiguous() {
+    let oid = "0123456789abcdef0123456789abcdef01234567";
+    let valid = format!(
+        "worktree /tmp/-leading-ü\nname\0HEAD {oid}\0detached\0\0worktree /tmp/space path\0HEAD {oid}\0branch refs/heads/main\0\0"
+    );
+    let records = parse_worktree_porcelain_v1_z(valid.as_bytes()).expect("valid absolute paths");
+    assert_eq!(records.len(), 2);
+
+    let malformed = [
+        format!("worktree relative/id\0HEAD {oid}\0\0"),
+        format!("worktree ./worktree\0HEAD {oid}\0\0"),
+        format!("worktree /managed/project/./id\0HEAD {oid}\0\0"),
+        format!("worktree /managed/project/../other\0HEAD {oid}\0\0"),
+        format!("worktree /managed/project/id\0HEAD {oid}\0\0worktree /managed/project/./id\0HEAD {oid}\0\0"),
+        format!("worktree C:relative\\id\0HEAD {oid}\0\0"),
+        format!("worktree \\\\?\\C:\\device\\id\0HEAD {oid}\0\0"),
+    ];
+    for fixture in malformed {
+        assert!(
+            parse_worktree_porcelain_v1_z(fixture.as_bytes()).is_err(),
+            "{fixture:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_destination_never_becomes_metadata_absent() {
+    let primary = repository();
+    let dangling = primary.path().join("dangling managed leaf");
+    std::os::unix::fs::symlink(primary.path().join("missing target"), &dangling)
+        .expect("dangling symlink");
+    assert_eq!(
+        inspect_worktree_destination_no_follow(&dangling),
+        WorktreeDestinationState::UnsafeLinkOrReparse
+    );
+    assert!(matches!(
+        worktree_metadata_lookup(primary.path(), &dangling).await,
+        Err(GitError::MetadataInvalid)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn metadata_access_failure_is_not_missing() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0, b'x']));
+    assert_eq!(
+        inspect_worktree_destination_no_follow(&path),
+        WorktreeDestinationState::MetadataUnavailable
     );
 }

@@ -1,5 +1,6 @@
 use sentinel_core::{
-    CoreError, ProjectFingerprintScheme, ProjectRegistration, ProjectValidationState, RunRepository,
+    CoreError, ManagedWorktreeState, ProjectFingerprintScheme, ProjectRegistration,
+    ProjectValidationState, RunRepository, WorktreeId,
 };
 use sqlx::SqlitePool;
 use tempfile::TempDir;
@@ -198,4 +199,124 @@ async fn legacy_and_weak_rows_require_explicit_one_time_trusted_upgrade() {
         weak.validation_state,
         ProjectValidationState::RequiresTrustedRevalidation
     );
+}
+
+#[tokio::test]
+async fn managed_worktrees_persist_and_restrict_project_unregistration() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let url = database_url(&directory);
+    let repository = RunRepository::open(&url).await.expect("open repository");
+    let project = repository
+        .register_project(registration("worktree-project", "Worktree"))
+        .await
+        .expect("project");
+    let worktree = repository
+        .insert_creating_worktree(
+            WorktreeId::new(),
+            &project,
+            "/private/trusted/worktrees/worktree-project/fixture".into(),
+            "0123456789abcdef0123456789abcdef01234567".into(),
+        )
+        .await
+        .expect("creating row");
+    assert_eq!(worktree.state, ManagedWorktreeState::Creating);
+    assert!(matches!(
+        repository.unregister_project(&project.id).await,
+        Err(CoreError::ProjectHasWorktrees)
+    ));
+    let ready = repository
+        .transition_worktree(
+            &worktree.id,
+            ManagedWorktreeState::Creating,
+            ManagedWorktreeState::Ready,
+            None,
+        )
+        .await
+        .expect("ready");
+    assert_eq!(ready.state, ManagedWorktreeState::Ready);
+    let removed = repository
+        .transition_worktree(
+            &worktree.id,
+            ManagedWorktreeState::Ready,
+            ManagedWorktreeState::Removed,
+            None,
+        )
+        .await
+        .expect("removed");
+    assert_eq!(removed.state, ManagedWorktreeState::Removed);
+    drop(repository);
+    let reopened = RunRepository::open(&url).await.expect("reopen");
+    assert_eq!(
+        reopened
+            .get_worktree(&worktree.id)
+            .await
+            .expect("persisted")
+            .state,
+        ManagedWorktreeState::Removed
+    );
+    reopened
+        .unregister_project(&project.id)
+        .await
+        .expect("unregister after removal");
+}
+
+#[tokio::test]
+async fn core_recovery_failed_worktrees_persist_block_unregistration_and_resist_stale_updates() {
+    let directory = tempfile::tempdir().expect("temporary database directory");
+    let url = database_url(&directory);
+    let repository = RunRepository::open(&url).await.expect("open repository");
+    let project = repository
+        .register_project(registration("recovery-project", "Recovery"))
+        .await
+        .expect("project");
+    let worktree = repository
+        .insert_creating_worktree(
+            WorktreeId::new(),
+            &project,
+            "/private/trusted/worktrees/recovery-project/fixture".into(),
+            "0123456789abcdef0123456789abcdef01234567".into(),
+        )
+        .await
+        .expect("creating row");
+    let failed = repository
+        .transition_worktree(
+            &worktree.id,
+            ManagedWorktreeState::Creating,
+            ManagedWorktreeState::Failed,
+            Some("recovery_required"),
+        )
+        .await
+        .expect("durable recovery failure");
+    assert_eq!(failed.state, ManagedWorktreeState::Failed);
+    assert_eq!(failed.error_category.as_deref(), Some("recovery_required"));
+    assert!(matches!(
+        repository
+            .transition_worktree(
+                &worktree.id,
+                ManagedWorktreeState::Creating,
+                ManagedWorktreeState::Failed,
+                Some("recovery_required"),
+            )
+            .await,
+        Err(CoreError::WorktreeStateConflict)
+    ));
+    assert!(matches!(
+        repository.unregister_project(&project.id).await,
+        Err(CoreError::ProjectHasWorktrees)
+    ));
+    drop(repository);
+    let reopened = RunRepository::open(&url).await.expect("reopen");
+    let persisted = reopened
+        .get_worktree(&worktree.id)
+        .await
+        .expect("persisted");
+    assert_eq!(persisted.state, ManagedWorktreeState::Failed);
+    assert_eq!(
+        persisted.error_category.as_deref(),
+        Some("recovery_required")
+    );
+    assert!(matches!(
+        reopened.unregister_project(&project.id).await,
+        Err(CoreError::ProjectHasWorktrees)
+    ));
 }

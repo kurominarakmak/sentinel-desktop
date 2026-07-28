@@ -2,16 +2,27 @@ mod windowing;
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
 use sentinel_core::{
-    CoreError, NormalizedAgentEvent, Project, ProjectFingerprintScheme, ProjectId,
-    ProjectRegistration, ProjectValidationState, Run, RunId, RunRepository, TaskRequest,
+    CoreError, ManagedWorktree, ManagedWorktreeState, NormalizedAgentEvent, Project,
+    ProjectFingerprintScheme, ProjectId, ProjectRegistration, ProjectValidationState, Run, RunId,
+    RunRepository, TaskRequest, WorktreeId,
 };
 use sentinel_fake_agent::FakeAgentScenario;
-use sentinel_git::{inspect_repository, GitError, RepositoryInspection, RepositoryState};
+use sentinel_git::{
+    add_detached_worktree, inspect_repository, inspect_worktree_destination_no_follow,
+    remove_detached_worktree, resolve_exact_head, worktree_is_clean, worktree_metadata_lookup,
+    GitError, RepositoryInspection, RepositoryState, WorktreeDestinationState,
+    WorktreeMetadataLookup,
+};
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -39,6 +50,17 @@ struct DesktopState {
     database_path: PathBuf,
     forwarders: Arc<tokio::sync::Mutex<HashSet<RunId>>>,
     protected_application_repository: Option<ProtectedRepository>,
+    worktree_root: PathBuf,
+    worktree_projects: Arc<tokio::sync::Mutex<HashSet<ProjectId>>>,
+    #[cfg(test)]
+    reconciliation_test_hooks: Option<ReconciliationTestHooks>,
+}
+#[cfg(test)]
+#[derive(Clone)]
+struct ReconciliationTestHooks {
+    fail_leaf_canonicalization: bool,
+    failure_reached: Option<Arc<tokio::sync::Notify>>,
+    resume_failure: Option<Arc<tokio::sync::Notify>>,
 }
 #[derive(Clone)]
 struct ProtectedRepository {
@@ -100,6 +122,17 @@ struct ProjectDto {
     branch: Option<String>,
     head: Option<String>,
     last_validated_at_ms: i64,
+}
+#[derive(Clone, Debug, Serialize)]
+struct WorktreeDto {
+    id: String,
+    project_id: String,
+    state: ManagedWorktreeState,
+    base_commit: String,
+    created_at_ms: i64,
+    ready_at_ms: Option<i64>,
+    removed_at_ms: Option<i64>,
+    error_category: Option<String>,
 }
 const RUN_EVENT: &str = "phase2-run-event";
 
@@ -514,6 +547,618 @@ async fn unregister_project(id: String, state: State<'_, DesktopState>) -> Resul
         .await
         .map_err(project_storage_error)
 }
+
+fn worktree_dto(worktree: ManagedWorktree) -> WorktreeDto {
+    WorktreeDto {
+        id: worktree.id.to_string(),
+        project_id: worktree.project_id.to_string(),
+        state: worktree.state,
+        base_commit: worktree.base_commit,
+        created_at_ms: worktree.created_at_ms,
+        ready_at_ms: worktree.ready_at_ms,
+        removed_at_ms: worktree.removed_at_ms,
+        error_category: worktree.error_category,
+    }
+}
+fn worktree_error(_: impl std::fmt::Debug) -> SafeError {
+    SafeError {
+        code: "worktree_operation_failed",
+        message: "The managed worktree operation could not be completed.",
+    }
+}
+fn validate_managed_directory(path: &Path) -> Result<(), SafeError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(worktree_error)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(worktree_error("unsafe managed root component"));
+    }
+    #[cfg(windows)]
+    if std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x400 != 0 {
+        return Err(worktree_error("reparse-point managed root component"));
+    }
+    Ok(())
+}
+fn ensure_managed_directory(parent: &Path, name: &str) -> Result<PathBuf, SafeError> {
+    validate_managed_directory(parent)?;
+    let child = parent.join(name);
+    match std::fs::symlink_metadata(&child) {
+        Ok(_) => validate_managed_directory(&child)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&child).map_err(worktree_error)?;
+            validate_managed_directory(&child)?;
+        }
+        Err(error) => return Err(worktree_error(error)),
+    }
+    Ok(child)
+}
+fn worktree_parent(root: &Path, project: &ProjectId) -> Result<PathBuf, SafeError> {
+    let base = root
+        .parent()
+        .ok_or_else(|| worktree_error("missing application-data parent"))?;
+    validate_managed_directory(base)?;
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| worktree_error("invalid root"))?;
+    let configured_root = ensure_managed_directory(base, root_name)?;
+    let canonical_root = configured_root.canonicalize().map_err(worktree_error)?;
+    let parent = ensure_managed_directory(&configured_root, &project.to_string())?;
+    let canonical_parent = parent.canonicalize().map_err(worktree_error)?;
+    if canonical_parent.parent() != Some(canonical_root.as_path()) {
+        return Err(worktree_error("containment"));
+    }
+    Ok(canonical_parent)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedLeafState {
+    Missing,
+    RealDirectory,
+    UnsafeLinkOrReparse,
+    NonDirectory,
+    MetadataUnavailable,
+}
+
+/// Checks the backend-derived exact leaf without following it. Missing is
+/// returned only for a no-follow `NotFound`; every unsafe or unavailable state
+/// stays distinct for removal and reconciliation.
+fn inspect_managed_leaf(
+    root: &Path,
+    project: &ProjectId,
+    worktree: &WorktreeId,
+    stored: &Path,
+) -> Result<ManagedLeafState, SafeError> {
+    let parent = worktree_parent(root, project)?;
+    let expected = parent.join(worktree.to_string());
+    if stored != expected {
+        return Err(worktree_error("managed leaf ownership"));
+    }
+    Ok(match inspect_worktree_destination_no_follow(stored) {
+        WorktreeDestinationState::Missing => ManagedLeafState::Missing,
+        WorktreeDestinationState::RealDirectory => ManagedLeafState::RealDirectory,
+        WorktreeDestinationState::UnsafeLinkOrReparse => ManagedLeafState::UnsafeLinkOrReparse,
+        WorktreeDestinationState::NonDirectory => ManagedLeafState::NonDirectory,
+        WorktreeDestinationState::MetadataUnavailable => ManagedLeafState::MetadataUnavailable,
+    })
+}
+
+/// Validates the persisted, backend-generated leaf itself before anything is
+/// allowed to follow it. The returned path is the only canonical leaf callers
+/// may give to Git inspection or mutation APIs.
+fn validate_managed_leaf(
+    root: &Path,
+    project: &ProjectId,
+    worktree: &WorktreeId,
+    stored: &Path,
+) -> Result<PathBuf, SafeError> {
+    validate_managed_leaf_with_canonicalize(root, project, worktree, stored, |path| {
+        path.canonicalize()
+    })
+}
+
+fn validate_managed_leaf_with_canonicalize(
+    root: &Path,
+    project: &ProjectId,
+    worktree: &WorktreeId,
+    stored: &Path,
+    canonicalize: impl FnOnce(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, SafeError> {
+    if inspect_managed_leaf(root, project, worktree, stored)? != ManagedLeafState::RealDirectory {
+        return Err(worktree_error("unsafe managed leaf"));
+    }
+    let canonical = canonicalize(stored).map_err(worktree_error)?;
+    let parent = worktree_parent(root, project)?;
+    let expected = parent.join(worktree.to_string());
+    if canonical != expected || canonical.parent() != Some(parent.as_path()) {
+        return Err(worktree_error("managed leaf containment"));
+    }
+    Ok(canonical)
+}
+
+fn validate_managed_leaf_for_reconciliation(
+    state: &DesktopState,
+    project: &ProjectId,
+    worktree: &WorktreeId,
+    stored: &Path,
+) -> Result<PathBuf, SafeError> {
+    #[cfg(test)]
+    if state
+        .reconciliation_test_hooks
+        .as_ref()
+        .is_some_and(|hooks| hooks.fail_leaf_canonicalization)
+    {
+        return validate_managed_leaf_with_canonicalize(
+            &state.worktree_root,
+            project,
+            worktree,
+            stored,
+            |_| Err(std::io::Error::other("test canonicalization failure")),
+        );
+    }
+    validate_managed_leaf(&state.worktree_root, project, worktree, stored)
+}
+
+#[cfg(test)]
+async fn pause_before_reconciliation_failure_transition(state: &DesktopState) {
+    let Some(hooks) = state.reconciliation_test_hooks.as_ref() else {
+        return;
+    };
+    if let Some(reached) = &hooks.failure_reached {
+        reached.notify_one();
+    }
+    if let Some(resume) = &hooks.resume_failure {
+        resume.notified().await;
+    }
+}
+
+fn post_remove_state(
+    leaf: Result<ManagedLeafState, SafeError>,
+    metadata: Result<WorktreeMetadataLookup, GitError>,
+) -> ManagedWorktreeState {
+    if matches!(leaf, Ok(ManagedLeafState::Missing))
+        && matches!(metadata, Ok(WorktreeMetadataLookup::Absent))
+    {
+        ManagedWorktreeState::Removed
+    } else {
+        ManagedWorktreeState::Failed
+    }
+}
+
+fn reconciliation_validation_failure_state(
+    state: ManagedWorktreeState,
+) -> Option<ManagedWorktreeState> {
+    match state {
+        ManagedWorktreeState::Creating | ManagedWorktreeState::Ready => {
+            Some(ManagedWorktreeState::Failed)
+        }
+        _ => None,
+    }
+}
+
+async fn acquire_project_worktree_lock(
+    state: &DesktopState,
+    project: &ProjectId,
+) -> Result<(), SafeError> {
+    let mut active = state.worktree_projects.lock().await;
+    if !active.insert(project.clone()) {
+        return Err(SafeError {
+            code: "worktree_busy",
+            message: "Another worktree operation is already in progress for this project.",
+        });
+    }
+    Ok(())
+}
+async fn release_project_worktree_lock(state: &DesktopState, project: &ProjectId) {
+    state.worktree_projects.lock().await.remove(project);
+}
+async fn strict_project_for_worktree(
+    state: &DesktopState,
+    id: &ProjectId,
+) -> Result<Project, SafeError> {
+    let project = state
+        .repository
+        .get_project(id)
+        .await
+        .map_err(project_storage_error)?;
+    if project.fingerprint_scheme != ProjectFingerprintScheme::StrongV1
+        || project.validation_state == ProjectValidationState::RequiresTrustedRevalidation
+    {
+        return Err(SafeError {
+            code: "project_requires_revalidation",
+            message: "The project requires trusted revalidation before a worktree can be created.",
+        });
+    }
+    if project.head.is_none() {
+        return Err(SafeError {
+            code: "project_unborn_head",
+            message: "A project without a commit cannot create a worktree.",
+        });
+    }
+    let inspection = inspect_repository(Path::new(&project.repository_root))
+        .await
+        .map_err(|error| project_error(&error))?;
+    if inspection.identity != project.repository_identity
+        || inspection.fingerprint.as_str() != project.repository_fingerprint
+    {
+        return Err(SafeError {
+            code: "project_identity_changed",
+            message: "The registered repository was replaced or changed identity.",
+        });
+    }
+    Ok(project)
+}
+#[tauri::command]
+async fn create_project_worktree(
+    id: String,
+    state: State<'_, DesktopState>,
+) -> Result<WorktreeDto, SafeError> {
+    let project_id = ProjectId::from_str(&id).map_err(|_| input_error())?;
+    acquire_project_worktree_lock(&state, &project_id).await?;
+    let result = async {
+        let project = strict_project_for_worktree(&state, &project_id).await?;
+        let base_commit = resolve_exact_head(Path::new(&project.repository_root))
+            .await
+            .map_err(|error| project_error(&error))?;
+        let worktree_id = WorktreeId::new();
+        let parent = worktree_parent(&state.worktree_root, &project_id)?;
+        let path = parent.join(worktree_id.to_string());
+        if inspect_worktree_destination_no_follow(&path) != WorktreeDestinationState::Missing {
+            return Err(worktree_error("preexisting leaf"));
+        }
+        let row = state
+            .repository
+            .insert_creating_worktree(
+                worktree_id,
+                &project,
+                path.to_string_lossy().into_owned(),
+                base_commit.clone(),
+            )
+            .await
+            .map_err(worktree_error)?;
+        if let Err(error) =
+            add_detached_worktree(Path::new(&project.repository_root), &path, &base_commit).await
+        {
+            let _ = state
+                .repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Creating,
+                    ManagedWorktreeState::Failed,
+                    Some("worktree_create_failed"),
+                )
+                .await;
+            return Err(project_error(&error));
+        }
+        let verified_parent = worktree_parent(&state.worktree_root, &project_id)?;
+        let leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &path);
+        if verified_parent != parent
+            || !matches!(leaf, Ok(ref canonical) if canonical == &path)
+            || !matches!(
+                worktree_metadata_lookup(Path::new(&project.repository_root), &path)
+                    .await
+                    .map_err(|error| project_error(&error))?,
+                WorktreeMetadataLookup::Present
+            )
+        {
+            let _ = state
+                .repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Creating,
+                    ManagedWorktreeState::Failed,
+                    Some("worktree_verification_failed"),
+                )
+                .await;
+            return Err(SafeError {
+                code: "worktree_verification_failed",
+                message: "The managed worktree could not be verified.",
+            });
+        }
+        let leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &path)?;
+        let inspection = inspect_repository(&leaf)
+            .await
+            .map_err(|error| project_error(&error))?;
+        if leaf != path
+            || inspection.is_primary
+            || inspection.identity != project.repository_identity
+            || inspection.fingerprint.as_str() != project.repository_fingerprint
+            || inspection.head.as_deref() != Some(base_commit.as_str())
+        {
+            let _ = state
+                .repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Creating,
+                    ManagedWorktreeState::Failed,
+                    Some("worktree_verification_failed"),
+                )
+                .await;
+            return Err(SafeError {
+                code: "worktree_verification_failed",
+                message: "The managed worktree could not be verified.",
+            });
+        }
+        state
+            .repository
+            .transition_worktree(
+                &row.id,
+                ManagedWorktreeState::Creating,
+                ManagedWorktreeState::Ready,
+                None,
+            )
+            .await
+            .map(worktree_dto)
+            .map_err(worktree_error)
+    }
+    .await;
+    release_project_worktree_lock(&state, &project_id).await;
+    result
+}
+#[tauri::command]
+async fn list_project_worktrees(
+    id: String,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<WorktreeDto>, SafeError> {
+    let id = ProjectId::from_str(&id).map_err(|_| input_error())?;
+    state
+        .repository
+        .list_project_worktrees(&id)
+        .await
+        .map(|rows| rows.into_iter().map(worktree_dto).collect())
+        .map_err(worktree_error)
+}
+#[tauri::command]
+async fn remove_project_worktree(
+    id: String,
+    state: State<'_, DesktopState>,
+) -> Result<WorktreeDto, SafeError> {
+    let id = WorktreeId::from_str(&id).map_err(|_| input_error())?;
+    let row = state
+        .repository
+        .get_worktree(&id)
+        .await
+        .map_err(worktree_error)?;
+    acquire_project_worktree_lock(&state, &row.project_id).await?;
+    let project_id = row.project_id.clone();
+    let result = async {
+        if row.state != ManagedWorktreeState::Ready {
+            return Err(SafeError {
+                code: "worktree_not_owned",
+                message: "This worktree is not available for managed removal.",
+            });
+        }
+        let project = strict_project_for_worktree(&state, &row.project_id).await?;
+        let path = PathBuf::from(&row.path);
+        let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)
+            .map_err(|_| SafeError {
+                code: "worktree_not_owned",
+                message: "This worktree is not available for managed removal.",
+            })?;
+        let inspection = inspect_repository(&leaf)
+            .await
+            .map_err(|error| project_error(&error))?;
+        let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)
+            .map_err(|_| SafeError {
+                code: "worktree_not_owned",
+                message: "This worktree is not available for managed removal.",
+            })?;
+        if inspection.is_primary
+            || inspection.identity != row.repository_identity
+            || inspection.fingerprint.as_str() != row.repository_fingerprint
+            || inspection.head.as_deref() != Some(row.base_commit.as_str())
+            || !matches!(
+                worktree_metadata_lookup(Path::new(&project.repository_root), &leaf)
+                    .await
+                    .map_err(|error| project_error(&error))?,
+                WorktreeMetadataLookup::Present
+            )
+        {
+            return Err(SafeError {
+                code: "worktree_not_owned",
+                message: "This worktree is not available for managed removal.",
+            });
+        }
+        let _ = state
+            .repository
+            .transition_worktree(
+                &row.id,
+                ManagedWorktreeState::Ready,
+                ManagedWorktreeState::Removing,
+                None,
+            )
+            .await
+            .map_err(worktree_error)?;
+        // Validate before each path-following operation and again immediately
+        // before the mutating Git invocation.
+        let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)?;
+        if !worktree_is_clean(&leaf)
+            .await
+            .map_err(|error| project_error(&error))?
+        {
+            return state
+                .repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Removing,
+                    ManagedWorktreeState::RetainedDirty,
+                    Some("worktree_dirty"),
+                )
+                .await
+                .map(worktree_dto)
+                .map_err(worktree_error);
+        }
+        let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)?;
+        match remove_detached_worktree(Path::new(&project.repository_root), &leaf).await {
+            Ok(()) => {
+                let metadata =
+                    worktree_metadata_lookup(Path::new(&project.repository_root), &path).await;
+                let next = post_remove_state(
+                    inspect_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path),
+                    metadata,
+                );
+                let error = (next != ManagedWorktreeState::Removed).then_some("recovery_required");
+                state
+                    .repository
+                    .transition_worktree(&row.id, ManagedWorktreeState::Removing, next, error)
+                    .await
+                    .map(worktree_dto)
+                    .map_err(worktree_error)
+            }
+            Err(GitError::DirtyWorktree(_)) => state
+                .repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Removing,
+                    ManagedWorktreeState::RetainedDirty,
+                    Some("worktree_dirty"),
+                )
+                .await
+                .map(worktree_dto)
+                .map_err(worktree_error),
+            Err(error) => {
+                let _ = state
+                    .repository
+                    .transition_worktree(
+                        &row.id,
+                        ManagedWorktreeState::Removing,
+                        ManagedWorktreeState::Failed,
+                        Some("worktree_remove_failed"),
+                    )
+                    .await;
+                Err(project_error(&error))
+            }
+        }
+    }
+    .await;
+    release_project_worktree_lock(&state, &project_id).await;
+    result
+}
+async fn reconcile_project_worktrees_impl(
+    state: &DesktopState,
+) -> Result<Vec<WorktreeDto>, SafeError> {
+    let rows = state
+        .repository
+        .list_reconcilable_worktrees()
+        .await
+        .map_err(worktree_error)?;
+    for row in rows {
+        if acquire_project_worktree_lock(state, &row.project_id)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let path = PathBuf::from(&row.path);
+        let project = match state.repository.get_project(&row.project_id).await {
+            Ok(project) => project,
+            Err(_) => {
+                let _ = state
+                    .repository
+                    .transition_worktree(
+                        &row.id,
+                        row.state,
+                        ManagedWorktreeState::Failed,
+                        Some("recovery_required"),
+                    )
+                    .await;
+                release_project_worktree_lock(state, &row.project_id).await;
+                continue;
+            }
+        };
+        // Metadata lookup may use a missing backend-derived spelling only
+        // after this no-follow state proves `NotFound`. Unsafe or unavailable
+        // leaves never become missing or removed.
+        let leaf_state =
+            inspect_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path);
+        let next = match leaf_state {
+            Ok(ManagedLeafState::Missing) => {
+                let metadata =
+                    worktree_metadata_lookup(Path::new(&project.repository_root), &path).await;
+                if row.state == ManagedWorktreeState::Removing
+                    && matches!(metadata, Ok(WorktreeMetadataLookup::Absent))
+                {
+                    Some(ManagedWorktreeState::Removed)
+                } else if row.state == ManagedWorktreeState::Creating {
+                    Some(ManagedWorktreeState::Failed)
+                } else {
+                    Some(ManagedWorktreeState::Missing)
+                }
+            }
+            Ok(ManagedLeafState::RealDirectory)
+                if matches!(
+                    row.state,
+                    ManagedWorktreeState::Creating | ManagedWorktreeState::Ready
+                ) =>
+            {
+                match validate_managed_leaf_for_reconciliation(
+                    state,
+                    &row.project_id,
+                    &row.id,
+                    &path,
+                ) {
+                    Ok(leaf) => {
+                        match worktree_metadata_lookup(Path::new(&project.repository_root), &leaf)
+                            .await
+                        {
+                            Ok(WorktreeMetadataLookup::Present) => {
+                                match inspect_repository(&leaf).await {
+                                    Ok(inspection)
+                                        if !inspection.is_primary
+                                            && inspection.identity == row.repository_identity
+                                            && inspection.fingerprint.as_str()
+                                                == row.repository_fingerprint
+                                            && inspection.head.as_deref()
+                                                == Some(row.base_commit.as_str()) =>
+                                    {
+                                        if row.state == ManagedWorktreeState::Creating {
+                                            Some(ManagedWorktreeState::Ready)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    Ok(_) => Some(ManagedWorktreeState::IdentityChanged),
+                                    Err(_) => Some(ManagedWorktreeState::Failed),
+                                }
+                            }
+                            _ => Some(ManagedWorktreeState::Failed),
+                        }
+                    }
+                    Err(_) => {
+                        #[cfg(test)]
+                        pause_before_reconciliation_failure_transition(state).await;
+                        reconciliation_validation_failure_state(row.state)
+                    }
+                }
+            }
+            Ok(ManagedLeafState::RealDirectory) if row.state == ManagedWorktreeState::Removing => {
+                Some(ManagedWorktreeState::Failed)
+            }
+            Ok(ManagedLeafState::RealDirectory) => None,
+            Ok(ManagedLeafState::UnsafeLinkOrReparse)
+            | Ok(ManagedLeafState::NonDirectory)
+            | Ok(ManagedLeafState::MetadataUnavailable)
+            | Err(_) => Some(ManagedWorktreeState::Failed),
+        };
+        if let Some(next) = next {
+            let _ = state
+                .repository
+                .transition_worktree(&row.id, row.state, next, Some("recovery_required"))
+                .await;
+        }
+        release_project_worktree_lock(state, &row.project_id).await;
+    }
+    state
+        .repository
+        .list_reconcilable_worktrees()
+        .await
+        .map(|rows| rows.into_iter().map(worktree_dto).collect())
+        .map_err(worktree_error)
+}
+
+#[tauri::command]
+async fn reconcile_project_worktrees(
+    state: State<'_, DesktopState>,
+) -> Result<Vec<WorktreeDto>, SafeError> {
+    reconcile_project_worktrees_impl(&state).await
+}
 #[tauri::command]
 async fn submit_fake_run(
     request: SubmitFakeRun,
@@ -748,6 +1393,7 @@ fn main() {
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
             std::fs::create_dir_all(&data_dir)?;
             let database_path = data_dir.join("phase2.sqlite3");
+            let worktree_root = data_dir.join("worktrees");
             let executable = resolve_fake_agent_path(
                 std::env::var_os("AGENT_SENTINEL_FAKE_AGENT").map(PathBuf::from),
                 tauri::process::current_binary(&app.env())?,
@@ -792,6 +1438,10 @@ fn main() {
                 database_path,
                 forwarders: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
                 protected_application_repository,
+                worktree_root,
+                worktree_projects: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                #[cfg(test)]
+                reconciliation_test_hooks: None,
             });
             app.global_shortcut()
                 .on_shortcut(DEFAULT_GLOBAL_SHORTCUT, |app, _, event| {
@@ -822,6 +1472,10 @@ fn main() {
             get_project,
             revalidate_project,
             unregister_project,
+            create_project_worktree,
+            list_project_worktrees,
+            remove_project_worktree,
+            reconcile_project_worktrees,
             run_fake_agent,
             record_manual_probe_request
         ])
@@ -845,10 +1499,490 @@ mod macos_tests {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    use sentinel_core::{ProjectId, RunStatus, SafeRunError};
+    use sentinel_core::{
+        CoreError, ProjectId, ProjectRegistration, ProjectValidationState, RunStatus, SafeRunError,
+    };
     use sentinel_git::RepositoryFingerprint;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_root_rejects_a_configured_symlink_before_canonicalization() {
+        let app_data = tempdir().unwrap();
+        let external = tempdir().unwrap();
+        let root = app_data.path().join("worktrees");
+        std::os::unix::fs::symlink(external.path(), &root).unwrap();
+        assert!(worktree_parent(&root, &ProjectId::new()).is_err());
+        assert!(std::fs::read_dir(external.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_leaf_replacement_symlink_is_rejected_without_following_target() {
+        let app_data = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let project = ProjectId::new();
+        let worktree = WorktreeId::new();
+        let root = app_data.path().join("worktrees");
+        let parent = worktree_parent(&root, &project).unwrap();
+        let leaf = parent.join(worktree.to_string());
+        std::os::unix::fs::symlink(target.path(), &leaf).unwrap();
+        assert!(validate_managed_leaf(&root, &project, &worktree, &leaf).is_err());
+        assert!(target.path().exists());
+    }
+
+    #[test]
+    fn post_remove_requires_proven_missing_leaf_and_exact_metadata_absence() {
+        assert_eq!(
+            post_remove_state(
+                Ok(ManagedLeafState::Missing),
+                Ok(WorktreeMetadataLookup::Absent)
+            ),
+            ManagedWorktreeState::Removed
+        );
+        for leaf in [
+            ManagedLeafState::RealDirectory,
+            ManagedLeafState::UnsafeLinkOrReparse,
+            ManagedLeafState::NonDirectory,
+            ManagedLeafState::MetadataUnavailable,
+        ] {
+            assert_eq!(
+                post_remove_state(Ok(leaf), Ok(WorktreeMetadataLookup::Absent)),
+                ManagedWorktreeState::Failed
+            );
+        }
+        assert_eq!(
+            post_remove_state(
+                Ok(ManagedLeafState::Missing),
+                Ok(WorktreeMetadataLookup::Present)
+            ),
+            ManagedWorktreeState::Failed
+        );
+        assert_eq!(
+            post_remove_state(
+                Ok(ManagedLeafState::Missing),
+                Err(GitError::MetadataInvalid)
+            ),
+            ManagedWorktreeState::Failed
+        );
+    }
+
+    #[test]
+    fn reconciliation_validation_failure_state_mapping_is_limited_to_active_states() {
+        for state in [ManagedWorktreeState::Creating, ManagedWorktreeState::Ready] {
+            assert_eq!(
+                reconciliation_validation_failure_state(state),
+                Some(ManagedWorktreeState::Failed)
+            );
+        }
+        assert_eq!(
+            reconciliation_validation_failure_state(ManagedWorktreeState::Removing),
+            None
+        );
+    }
+
+    fn reconciliation_registration(
+        directory: &std::path::Path,
+        identity: &str,
+    ) -> ProjectRegistration {
+        let repository_root = directory.join(format!("unavailable-repository-{identity}"));
+        ProjectRegistration {
+            display_name: format!("Fixture {identity}"),
+            repository_identity: format!("fixture-identity-{identity}"),
+            repository_fingerprint: format!("strong_v1:fixture:{identity}"),
+            fingerprint_scheme: ProjectFingerprintScheme::StrongV1,
+            repository_root: repository_root.to_string_lossy().into_owned(),
+            primary_root: repository_root.to_string_lossy().into_owned(),
+            git_common_dir: repository_root.join(".git").to_string_lossy().into_owned(),
+            branch: Some("main".into()),
+            head: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            validation_state: ProjectValidationState::Valid,
+            is_primary_worktree: true,
+        }
+    }
+
+    fn reconciliation_test_state(
+        repository: RunRepository,
+        database_path: PathBuf,
+        worktree_root: PathBuf,
+        hooks: Option<ReconciliationTestHooks>,
+    ) -> DesktopState {
+        let executable = std::env::current_exe().expect("test executable");
+        DesktopState {
+            orchestrator: RunOrchestrator::new(
+                repository.clone(),
+                FakeAgentProgram::from_executable(executable).expect("test executable program"),
+            ),
+            repository,
+            database_path,
+            forwarders: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            protected_application_repository: None,
+            worktree_root,
+            worktree_projects: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            reconciliation_test_hooks: hooks,
+        }
+    }
+
+    async fn insert_reconciliation_row(
+        repository: &RunRepository,
+        root: &Path,
+        project: &Project,
+        state: ManagedWorktreeState,
+        create_leaf: bool,
+    ) -> (ManagedWorktree, PathBuf) {
+        let id = WorktreeId::new();
+        let leaf = worktree_parent(root, &project.id)
+            .expect("managed parent")
+            .join(id.to_string());
+        if create_leaf {
+            std::fs::create_dir(&leaf).expect("real managed leaf");
+        }
+        let row = repository
+            .insert_creating_worktree(
+                id,
+                project,
+                leaf.to_string_lossy().into_owned(),
+                "0123456789abcdef0123456789abcdef01234567".into(),
+            )
+            .await
+            .expect("creating row");
+        let row = if state == ManagedWorktreeState::Ready {
+            repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Creating,
+                    ManagedWorktreeState::Ready,
+                    None,
+                )
+                .await
+                .expect("ready row")
+        } else {
+            row
+        };
+        (row, leaf)
+    }
+
+    async fn reconciliation_fixture(
+        initial_state: ManagedWorktreeState,
+        hooks: Option<ReconciliationTestHooks>,
+    ) -> (
+        tempfile::TempDir,
+        String,
+        DesktopState,
+        Project,
+        ManagedWorktree,
+        PathBuf,
+    ) {
+        let directory = tempdir().expect("temporary reconciliation fixture");
+        let database_path = directory.path().join("desktop.sqlite");
+        let url = format!("sqlite://{}", database_path.display());
+        let repository = RunRepository::open(&url).await.expect("open repository");
+        let project = repository
+            .register_project(reconciliation_registration(directory.path(), "primary"))
+            .await
+            .expect("project");
+        let root = directory.path().join("managed-worktrees");
+        let (row, leaf) =
+            insert_reconciliation_row(&repository, &root, &project, initial_state, true).await;
+        let state = reconciliation_test_state(repository, database_path, root, hooks);
+        (directory, url, state, project, row, leaf)
+    }
+
+    async fn assert_reconciliation_validation_failure(initial_state: ManagedWorktreeState) {
+        let (directory, url, state, project, row, leaf) = reconciliation_fixture(
+            initial_state,
+            Some(ReconciliationTestHooks {
+                fail_leaf_canonicalization: true,
+                failure_reached: None,
+                resume_failure: None,
+            }),
+        )
+        .await;
+        let marker = leaf.join("must-remain");
+        std::fs::write(&marker, "unchanged").expect("managed fixture marker");
+        let missing_repository = PathBuf::from(&project.repository_root);
+
+        let reconciled = reconcile_project_worktrees_impl(&state)
+            .await
+            .expect("reconcile");
+        assert!(reconciled.iter().any(|worktree| {
+            worktree.id == row.id.to_string()
+                && worktree.state == ManagedWorktreeState::Failed
+                && worktree.error_category.as_deref() == Some("recovery_required")
+        }));
+        let failed = state
+            .repository
+            .get_worktree(&row.id)
+            .await
+            .expect("failed row");
+        assert_eq!(failed.state, ManagedWorktreeState::Failed);
+        assert_eq!(failed.error_category.as_deref(), Some("recovery_required"));
+        assert!(leaf.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker remains"),
+            "unchanged"
+        );
+        assert!(!missing_repository.exists());
+        assert!(matches!(
+            state.repository.unregister_project(&project.id).await,
+            Err(CoreError::ProjectHasWorktrees)
+        ));
+
+        drop(state);
+        let reopened = RunRepository::open(&url).await.expect("reopen repository");
+        let persisted = reopened.get_worktree(&row.id).await.expect("persisted row");
+        assert_eq!(persisted.state, ManagedWorktreeState::Failed);
+        assert_eq!(
+            persisted.error_category.as_deref(),
+            Some("recovery_required")
+        );
+        assert!(matches!(
+            reopened.unregister_project(&project.id).await,
+            Err(CoreError::ProjectHasWorktrees)
+        ));
+        drop(directory);
+    }
+
+    #[tokio::test]
+    async fn creating_reconciliation_validation_failure_is_a_durable_recovery_failure() {
+        assert_reconciliation_validation_failure(ManagedWorktreeState::Creating).await;
+    }
+
+    #[tokio::test]
+    async fn ready_reconciliation_validation_failure_is_a_durable_recovery_failure() {
+        assert_reconciliation_validation_failure(ManagedWorktreeState::Ready).await;
+    }
+
+    #[tokio::test]
+    async fn reconciliation_validation_failure_does_not_overwrite_a_newer_state() {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let (_directory, _url, state, _project, row, leaf) = reconciliation_fixture(
+            ManagedWorktreeState::Ready,
+            Some(ReconciliationTestHooks {
+                fail_leaf_canonicalization: true,
+                failure_reached: Some(reached.clone()),
+                resume_failure: Some(resume.clone()),
+            }),
+        )
+        .await;
+        let reconciliation_state = state.clone();
+        let reconciliation =
+            tokio::spawn(
+                async move { reconcile_project_worktrees_impl(&reconciliation_state).await },
+            );
+        reached.notified().await;
+        state
+            .repository
+            .transition_worktree(
+                &row.id,
+                ManagedWorktreeState::Ready,
+                ManagedWorktreeState::Removing,
+                None,
+            )
+            .await
+            .expect("newer transition");
+        resume.notify_one();
+        reconciliation
+            .await
+            .expect("reconciliation task")
+            .expect("reconciliation result");
+        assert_eq!(
+            state
+                .repository
+                .get_worktree(&row.id)
+                .await
+                .expect("row")
+                .state,
+            ManagedWorktreeState::Removing
+        );
+        assert!(leaf.is_dir());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_continues_after_validation_failure_for_an_independent_row() {
+        let directory = tempdir().expect("temporary reconciliation fixture");
+        let database_path = directory.path().join("desktop.sqlite");
+        let url = format!("sqlite://{}", database_path.display());
+        let repository = RunRepository::open(&url).await.expect("open repository");
+        let root = directory.path().join("managed-worktrees");
+        let project_a = repository
+            .register_project(reconciliation_registration(directory.path(), "first"))
+            .await
+            .expect("first project");
+        let (first, first_leaf) = insert_reconciliation_row(
+            &repository,
+            &root,
+            &project_a,
+            ManagedWorktreeState::Creating,
+            true,
+        )
+        .await;
+        let project_b = repository
+            .register_project(reconciliation_registration(directory.path(), "second"))
+            .await
+            .expect("second project");
+        let (second, second_leaf) = insert_reconciliation_row(
+            &repository,
+            &root,
+            &project_b,
+            ManagedWorktreeState::Ready,
+            false,
+        )
+        .await;
+        let pool = sqlx::SqlitePool::connect(&url).await.expect("fixture pool");
+        sqlx::query("UPDATE managed_worktrees SET created_at_ms = ? WHERE id = ?")
+            .bind(1_i64)
+            .bind(first.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("first ordering");
+        sqlx::query("UPDATE managed_worktrees SET created_at_ms = ? WHERE id = ?")
+            .bind(2_i64)
+            .bind(second.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("second ordering");
+        drop(pool);
+        let state = reconciliation_test_state(
+            repository,
+            database_path,
+            root,
+            Some(ReconciliationTestHooks {
+                fail_leaf_canonicalization: true,
+                failure_reached: None,
+                resume_failure: None,
+            }),
+        );
+
+        reconcile_project_worktrees_impl(&state)
+            .await
+            .expect("reconcile all rows");
+        let first_after = state
+            .repository
+            .get_worktree(&first.id)
+            .await
+            .expect("first row");
+        let second_after = state
+            .repository
+            .get_worktree(&second.id)
+            .await
+            .expect("second row");
+        assert_eq!(first_after.state, ManagedWorktreeState::Failed);
+        assert_eq!(
+            first_after.error_category.as_deref(),
+            Some("recovery_required")
+        );
+        assert_eq!(second_after.state, ManagedWorktreeState::Missing);
+        assert!(first_leaf.is_dir());
+        assert!(!second_leaf.exists());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_releases_a_failed_projects_lock_for_a_later_same_project_row() {
+        let directory = tempdir().expect("temporary reconciliation fixture");
+        let database_path = directory.path().join("desktop.sqlite");
+        let url = format!("sqlite://{}", database_path.display());
+        let repository = RunRepository::open(&url).await.expect("open repository");
+        let root = directory.path().join("managed-worktrees");
+        let project = repository
+            .register_project(reconciliation_registration(
+                directory.path(),
+                "same-project",
+            ))
+            .await
+            .expect("project");
+        let (first, first_leaf) = insert_reconciliation_row(
+            &repository,
+            &root,
+            &project,
+            ManagedWorktreeState::Creating,
+            true,
+        )
+        .await;
+        let (second, second_leaf) = insert_reconciliation_row(
+            &repository,
+            &root,
+            &project,
+            ManagedWorktreeState::Ready,
+            false,
+        )
+        .await;
+        let pool = sqlx::SqlitePool::connect(&url).await.expect("fixture pool");
+        sqlx::query("UPDATE managed_worktrees SET created_at_ms = ? WHERE id = ?")
+            .bind(1_i64)
+            .bind(first.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("first ordering");
+        sqlx::query("UPDATE managed_worktrees SET created_at_ms = ? WHERE id = ?")
+            .bind(2_i64)
+            .bind(second.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("second ordering");
+        drop(pool);
+        let queued = repository
+            .list_reconcilable_worktrees()
+            .await
+            .expect("ordered rows");
+        assert_eq!(
+            queued.iter().map(|row| &row.id).collect::<Vec<_>>(),
+            vec![&first.id, &second.id]
+        );
+        assert_eq!(first.project_id, second.project_id);
+        assert_eq!(first.project_id, project.id);
+        let marker = first_leaf.join("must-remain");
+        std::fs::write(&marker, "unchanged").expect("managed fixture marker");
+        let unavailable_repository = PathBuf::from(&project.repository_root);
+        let state = reconciliation_test_state(
+            repository,
+            database_path,
+            root,
+            Some(ReconciliationTestHooks {
+                fail_leaf_canonicalization: true,
+                failure_reached: None,
+                resume_failure: None,
+            }),
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reconcile_project_worktrees_impl(&state),
+        )
+        .await
+        .expect("same-project reconciliation did not complete")
+        .expect("same-project reconciliation");
+        let first_after = state
+            .repository
+            .get_worktree(&first.id)
+            .await
+            .expect("first row");
+        let second_after = state
+            .repository
+            .get_worktree(&second.id)
+            .await
+            .expect("second row");
+        assert_eq!(first_after.state, ManagedWorktreeState::Failed);
+        assert_eq!(
+            first_after.error_category.as_deref(),
+            Some("recovery_required")
+        );
+        assert_eq!(second_after.state, ManagedWorktreeState::Missing);
+        assert!(first_leaf.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker remains"),
+            "unchanged"
+        );
+        assert!(!second_leaf.exists());
+        assert!(!unavailable_repository.exists());
+
+        acquire_project_worktree_lock(&state, &project.id)
+            .await
+            .expect("failed project's lock was released");
+        release_project_worktree_lock(&state, &project.id).await;
+    }
 
     #[cfg(unix)]
     fn executable(path: &std::path::Path) {

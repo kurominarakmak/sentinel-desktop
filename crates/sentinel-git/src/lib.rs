@@ -44,6 +44,56 @@ pub enum GitError {
     Io(#[from] std::io::Error),
 }
 
+/// The result of a complete, successfully parsed worktree-list lookup.  This
+/// deliberately has no boolean default: callers must not turn a malformed
+/// metadata response into an absent entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeMetadataLookup {
+    Present,
+    Absent,
+}
+
+/// No-follow state for a worktree destination.  Only `Missing` is a proven
+/// absence; all other states must be handled explicitly by ownership callers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeDestinationState {
+    Missing,
+    RealDirectory,
+    UnsafeLinkOrReparse,
+    NonDirectory,
+    MetadataUnavailable,
+}
+
+/// A lexically validated, absolute porcelain worktree path.  Its comparison
+/// key is platform-normalized without consulting the filesystem, so prunable
+/// worktrees remain parseable while aliases are rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedWorktreePath {
+    path: PathBuf,
+    comparison_key: String,
+}
+
+impl ValidatedWorktreePath {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn comparison_key(&self) -> &str {
+        &self.comparison_key
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeMetadataRecord {
+    pub path: ValidatedWorktreePath,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub bare: bool,
+    pub locked: Option<String>,
+    pub prunable: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepositoryState {
     Valid,
@@ -318,6 +368,398 @@ pub async fn inspect_repository_with_resolver(
     })
 }
 
+/// Resolves the current HEAD to an immutable full commit object through the
+/// same trusted, bounded Git boundary used for repository inspection.
+pub async fn resolve_exact_head(repository: &Path) -> Result<String, GitError> {
+    let inspection = inspect_repository(repository).await?;
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let output = run_git(
+        &executable,
+        &inspection.repository_root,
+        ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+    )
+    .await?;
+    let commit = nonempty_output(output.stdout)?;
+    if !output.status.success()
+        || commit.len() != 40
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GitError::MetadataInvalid);
+    }
+    Ok(commit)
+}
+
+/// Adds a detached worktree using backend-owned path and exact OID arguments.
+/// Callers must perform containment and ownership checks before and after this
+/// intentionally mutating operation.
+pub async fn add_detached_worktree(
+    repository: &Path,
+    destination: &Path,
+    commit: &str,
+) -> Result<(), GitError> {
+    if inspect_worktree_destination_no_follow(destination) != WorktreeDestinationState::Missing
+        || commit.len() != 40
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(GitError::MetadataInvalid);
+    }
+    let inspection = inspect_repository(repository).await?;
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let destination = destination.to_str().ok_or(GitError::MetadataInvalid)?;
+    let output = run_git(
+        &executable,
+        &inspection.repository_root,
+        ["worktree", "add", "--detach", destination, commit],
+    )
+    .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::MetadataInvalid)
+    }
+}
+
+pub async fn worktree_is_clean(worktree: &Path) -> Result<bool, GitError> {
+    let inspection = inspect_repository(worktree).await?;
+    if inspection.is_primary {
+        return Err(GitError::MetadataInvalid);
+    }
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let output = run_git(
+        &executable,
+        &inspection.repository_root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(GitError::MetadataInvalid);
+    }
+    Ok(output.stdout.is_empty())
+}
+
+/// Inspects exactly the configured entry without following symbolic links or
+/// Windows reparse points.  Metadata failures deliberately remain distinct
+/// from absence.
+pub fn inspect_worktree_destination_no_follow(path: &Path) -> WorktreeDestinationState {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WorktreeDestinationState::Missing;
+        }
+        Err(_) => return WorktreeDestinationState::MetadataUnavailable,
+    };
+    if metadata.file_type().is_symlink() {
+        return WorktreeDestinationState::UnsafeLinkOrReparse;
+    }
+    #[cfg(windows)]
+    if std::os::windows::fs::MetadataExt::file_attributes(&metadata) & 0x400 != 0 {
+        return WorktreeDestinationState::UnsafeLinkOrReparse;
+    }
+    if metadata.is_dir() {
+        WorktreeDestinationState::RealDirectory
+    } else {
+        WorktreeDestinationState::NonDirectory
+    }
+}
+
+fn normalized_worktree_path(path: &Path) -> Result<ValidatedWorktreePath, GitError> {
+    if !path.is_absolute() {
+        return Err(GitError::MetadataInvalid);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let text = path.to_str().ok_or(GitError::MetadataInvalid)?;
+        let separator_normalized = text.replace('\\', "/");
+        let segments: Vec<_> = separator_normalized.split('/').collect();
+        let ordinary_segments: &[&str] = if separator_normalized.starts_with("//") {
+            if segments.len() < 4 || segments[2].is_empty() || segments[3].is_empty() {
+                return Err(GitError::MetadataInvalid);
+            }
+            &segments[2..]
+        } else {
+            if segments.len() < 2 || segments[0].len() != 2 || !segments[0].ends_with(':') {
+                return Err(GitError::MetadataInvalid);
+            }
+            &segments[1..]
+        };
+        if !(ordinary_segments.len() == 1 && ordinary_segments[0].is_empty())
+            && ordinary_segments
+                .iter()
+                .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+        {
+            return Err(GitError::MetadataInvalid);
+        }
+
+        let mut components = path.components();
+        let prefix = match components.next() {
+            Some(Component::Prefix(prefix)) => prefix,
+            _ => return Err(GitError::MetadataInvalid),
+        };
+        match prefix.kind() {
+            Prefix::Disk(_) | Prefix::UNC(_, _) => {}
+            Prefix::Verbatim(_)
+            | Prefix::VerbatimDisk(_)
+            | Prefix::VerbatimUNC(_, _)
+            | Prefix::DeviceNS(_) => {
+                return Err(GitError::MetadataInvalid);
+            }
+        }
+        if !matches!(components.next(), Some(Component::RootDir)) {
+            return Err(GitError::MetadataInvalid);
+        }
+        let mut normalized = PathBuf::from(prefix.as_os_str());
+        normalized.push(Path::new("\\"));
+        for component in components {
+            match component {
+                Component::Normal(value) => normalized.push(value),
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => {
+                    return Err(GitError::MetadataInvalid);
+                }
+            }
+        }
+        let comparison_key = normalized
+            .to_str()
+            .ok_or(GitError::MetadataInvalid)?
+            .to_lowercase();
+        return Ok(ValidatedWorktreePath {
+            path: normalized,
+            comparison_key,
+        });
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::path::Component;
+
+        let text = path.to_str().ok_or(GitError::MetadataInvalid)?;
+        if text != "/"
+            && (text
+                .strip_prefix('/')
+                .ok_or(GitError::MetadataInvalid)?
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == ".."))
+        {
+            return Err(GitError::MetadataInvalid);
+        }
+        let mut normalized = PathBuf::from(Path::new("/"));
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(value) => normalized.push(value),
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                    return Err(GitError::MetadataInvalid);
+                }
+            }
+        }
+        let comparison_key = normalized
+            .to_str()
+            .ok_or(GitError::MetadataInvalid)?
+            .to_owned();
+        Ok(ValidatedWorktreePath {
+            path: normalized,
+            comparison_key,
+        })
+    }
+}
+
+fn expected_worktree_path(destination: &Path) -> Result<ValidatedWorktreePath, GitError> {
+    expected_worktree_path_with(destination, |path| path.canonicalize())
+}
+
+fn expected_worktree_path_with<F>(
+    destination: &Path,
+    canonicalize: F,
+) -> Result<ValidatedWorktreePath, GitError>
+where
+    F: FnOnce(&Path) -> std::io::Result<PathBuf>,
+{
+    match inspect_worktree_destination_no_follow(destination) {
+        WorktreeDestinationState::RealDirectory => {
+            let canonical = canonicalize(destination).map_err(GitError::Io)?;
+            normalized_worktree_path(&canonical)
+        }
+        // A missing configured leaf has no canonical target. Its
+        // backend-provided spelling is still required to be absolute and
+        // lexically normalized before it can be compared with Git metadata.
+        WorktreeDestinationState::Missing => normalized_worktree_path(destination),
+        WorktreeDestinationState::UnsafeLinkOrReparse
+        | WorktreeDestinationState::NonDirectory
+        | WorktreeDestinationState::MetadataUnavailable => Err(GitError::MetadataInvalid),
+    }
+}
+
+/// Returns an exact metadata lookup result after fully parsing porcelain-v1
+/// NUL records.  Command and parser failures are errors, never `Absent`.
+pub async fn worktree_metadata_lookup(
+    repository: &Path,
+    destination: &Path,
+) -> Result<WorktreeMetadataLookup, GitError> {
+    let inspection = inspect_repository(repository).await?;
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let output = run_git(
+        &executable,
+        &inspection.repository_root,
+        ["worktree", "list", "--porcelain", "-z"],
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(GitError::MetadataInvalid);
+    }
+    let records = parse_worktree_porcelain_v1_z(&output.stdout)?;
+    let expected = expected_worktree_path(destination)?;
+    let matches = records
+        .iter()
+        .filter(|record| record.path.comparison_key() == expected.comparison_key())
+        .count();
+    match matches {
+        0 => Ok(WorktreeMetadataLookup::Absent),
+        1 => Ok(WorktreeMetadataLookup::Present),
+        _ => Err(GitError::MetadataInvalid),
+    }
+}
+
+/// Strict parser for Git's documented porcelain-v1 `worktree list -z` form.
+/// Each record is terminated by an empty NUL field. Unknown fields are
+/// rejected rather than ignored, so a newer or damaged format cannot make an
+/// existing worktree appear absent.
+pub fn parse_worktree_porcelain_v1_z(
+    bytes: &[u8],
+) -> Result<Vec<WorktreeMetadataRecord>, GitError> {
+    if bytes.is_empty() || !bytes.ends_with(&[0, 0]) {
+        return Err(GitError::MetadataInvalid);
+    }
+    let mut records = Vec::new();
+    let mut fields: Vec<&[u8]> = Vec::new();
+    // Discard only the framing NUL; the preceding NUL remains the explicit
+    // terminator for the final record.
+    for field in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        if field.is_empty() {
+            if fields.is_empty() {
+                return Err(GitError::MetadataInvalid);
+            }
+            records.push(parse_worktree_record(&fields)?);
+            fields.clear();
+        } else {
+            fields.push(field);
+        }
+    }
+    if !fields.is_empty() || records.is_empty() {
+        return Err(GitError::MetadataInvalid);
+    }
+    let mut comparison_keys = std::collections::HashSet::new();
+    for record in &records {
+        if !comparison_keys.insert(record.path.comparison_key().to_owned()) {
+            return Err(GitError::MetadataInvalid);
+        }
+    }
+    Ok(records)
+}
+
+fn parse_worktree_record(fields: &[&[u8]]) -> Result<WorktreeMetadataRecord, GitError> {
+    let mut path = None;
+    let mut head = None;
+    let mut branch = None;
+    let mut detached = false;
+    let mut bare = false;
+    let mut locked = None;
+    let mut prunable = None;
+    for field in fields {
+        let field = std::str::from_utf8(field).map_err(|_| GitError::MetadataInvalid)?;
+        if let Some(value) = field.strip_prefix("worktree ") {
+            if value.is_empty()
+                || path
+                    .replace(normalized_worktree_path(Path::new(value))?)
+                    .is_some()
+            {
+                return Err(GitError::MetadataInvalid);
+            }
+        } else if let Some(value) = field.strip_prefix("HEAD ") {
+            if value.len() != 40
+                || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || head.replace(value.to_owned()).is_some()
+            {
+                return Err(GitError::MetadataInvalid);
+            }
+        } else if let Some(value) = field.strip_prefix("branch ") {
+            if value.is_empty() || branch.replace(value.to_owned()).is_some() {
+                return Err(GitError::MetadataInvalid);
+            }
+        } else if field == "detached" {
+            if detached {
+                return Err(GitError::MetadataInvalid);
+            }
+            detached = true;
+        } else if field == "bare" {
+            if bare {
+                return Err(GitError::MetadataInvalid);
+            }
+            bare = true;
+        } else if field == "locked" || field.starts_with("locked ") {
+            if locked
+                .replace(field.strip_prefix("locked ").unwrap_or("").to_owned())
+                .is_some()
+            {
+                return Err(GitError::MetadataInvalid);
+            }
+        } else if field == "prunable" || field.starts_with("prunable ") {
+            if prunable
+                .replace(field.strip_prefix("prunable ").unwrap_or("").to_owned())
+                .is_some()
+            {
+                return Err(GitError::MetadataInvalid);
+            }
+        } else {
+            return Err(GitError::MetadataInvalid);
+        }
+    }
+    if path.is_none()
+        || (branch.is_some() && detached)
+        || (bare && (head.is_some() || branch.is_some() || detached))
+    {
+        return Err(GitError::MetadataInvalid);
+    }
+    Ok(WorktreeMetadataRecord {
+        path: path.unwrap(),
+        head,
+        branch,
+        detached,
+        bare,
+        locked,
+        prunable,
+    })
+}
+
+/// Removes only a clean, linked worktree. The caller supplies a path loaded
+/// from trusted persistence, never frontend input.
+pub async fn remove_detached_worktree(
+    repository: &Path,
+    destination: &Path,
+) -> Result<(), GitError> {
+    if !worktree_is_clean(destination).await? {
+        return Err(GitError::DirtyWorktree(destination.to_path_buf()));
+    }
+    let inspection = inspect_repository(repository).await?;
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let destination = destination.to_str().ok_or(GitError::MetadataInvalid)?;
+    let output = run_git(
+        &executable,
+        &inspection.repository_root,
+        ["worktree", "remove", destination],
+    )
+    .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::MetadataInvalid)
+    }
+}
+
 struct GitCommandOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
@@ -465,13 +907,11 @@ async fn primary_worktree_root(
     if !output.status.success() {
         return Err(GitError::MetadataInvalid);
     }
-    let first = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .find_map(|record| record.strip_prefix(b"worktree "))
-        .ok_or(GitError::MetadataInvalid)?;
-    let path = std::str::from_utf8(first).map_err(|_| GitError::MetadataInvalid)?;
-    PathBuf::from(path)
+    let records = parse_worktree_porcelain_v1_z(&output.stdout)?;
+    let primary = records.first().ok_or(GitError::MetadataInvalid)?;
+    primary
+        .path
+        .path()
         .canonicalize()
         .map_err(|_| GitError::MetadataInvalid)
 }
@@ -781,6 +1221,17 @@ mod inspection_tests {
         assert!(matches!(
             repository_fingerprint(Path::new("/private/agent-sentinel-no-such-git-directory")),
             Err(GitError::FingerprintUnavailable)
+        ));
+    }
+
+    #[test]
+    fn existing_destination_canonicalization_failure_never_uses_raw_path() {
+        let directory = tempfile::tempdir().expect("existing directory");
+        assert!(matches!(
+            expected_worktree_path_with(directory.path(), |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }),
+            Err(GitError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
     }
 }

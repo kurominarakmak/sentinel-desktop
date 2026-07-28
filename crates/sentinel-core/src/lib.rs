@@ -39,6 +39,84 @@ impl ProjectId {
         Self(Uuid::new_v4())
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorktreeId(Uuid);
+impl WorktreeId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+impl Default for WorktreeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl std::fmt::Display for WorktreeId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+impl std::str::FromStr for WorktreeId {
+    type Err = uuid::Error;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedWorktreeState {
+    Creating,
+    Ready,
+    Removing,
+    Removed,
+    Failed,
+    Missing,
+    IdentityChanged,
+    RetainedDirty,
+}
+fn worktree_state_name(state: ManagedWorktreeState) -> &'static str {
+    match state {
+        ManagedWorktreeState::Creating => "creating",
+        ManagedWorktreeState::Ready => "ready",
+        ManagedWorktreeState::Removing => "removing",
+        ManagedWorktreeState::Removed => "removed",
+        ManagedWorktreeState::Failed => "failed",
+        ManagedWorktreeState::Missing => "missing",
+        ManagedWorktreeState::IdentityChanged => "identity_changed",
+        ManagedWorktreeState::RetainedDirty => "retained_dirty",
+    }
+}
+fn parse_worktree_state(value: &str) -> Result<ManagedWorktreeState, CoreError> {
+    match value {
+        "creating" => Ok(ManagedWorktreeState::Creating),
+        "ready" => Ok(ManagedWorktreeState::Ready),
+        "removing" => Ok(ManagedWorktreeState::Removing),
+        "removed" => Ok(ManagedWorktreeState::Removed),
+        "failed" => Ok(ManagedWorktreeState::Failed),
+        "missing" => Ok(ManagedWorktreeState::Missing),
+        "identity_changed" => Ok(ManagedWorktreeState::IdentityChanged),
+        "retained_dirty" => Ok(ManagedWorktreeState::RetainedDirty),
+        _ => Err(CoreError::Storage),
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedWorktree {
+    pub id: WorktreeId,
+    pub project_id: ProjectId,
+    pub path: String,
+    pub base_commit: String,
+    pub repository_identity: String,
+    pub repository_fingerprint: String,
+    pub state: ManagedWorktreeState,
+    pub error_category: Option<String>,
+    pub created_at_ms: i64,
+    pub ready_at_ms: Option<i64>,
+    pub removed_at_ms: Option<i64>,
+    pub last_validated_at_ms: i64,
+}
 impl Default for ProjectId {
     fn default() -> Self {
         Self::new()
@@ -262,6 +340,12 @@ pub enum CoreError {
     DuplicateProject,
     #[error("repository identity changed")]
     RepositoryIdentityChanged,
+    #[error("project has managed worktrees")]
+    ProjectHasWorktrees,
+    #[error("worktree not found")]
+    WorktreeNotFound,
+    #[error("worktree state conflict")]
+    WorktreeStateConflict,
     #[error(transparent)]
     Transition(#[from] TransitionError),
     #[error("storage error")]
@@ -289,6 +373,26 @@ fn row_to_project(row: &sqlx::sqlite::SqliteRow) -> Result<Project, CoreError> {
         is_primary_worktree: row.get::<i64, _>("is_primary_worktree") != 0,
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
+        last_validated_at_ms: row.get("last_validated_at_ms"),
+    })
+}
+fn row_to_worktree(row: &sqlx::sqlite::SqliteRow) -> Result<ManagedWorktree, CoreError> {
+    Ok(ManagedWorktree {
+        id: WorktreeId(
+            Uuid::from_str(&row.get::<String, _>("id")).map_err(|_| CoreError::Storage)?,
+        ),
+        project_id: ProjectId(
+            Uuid::from_str(&row.get::<String, _>("project_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        path: row.get("worktree_path"),
+        base_commit: row.get("base_commit"),
+        repository_identity: row.get("repository_identity"),
+        repository_fingerprint: row.get("repository_fingerprint"),
+        state: parse_worktree_state(&row.get::<String, _>("state"))?,
+        error_category: row.get("error_category"),
+        created_at_ms: row.get("created_at_ms"),
+        ready_at_ms: row.get("ready_at_ms"),
+        removed_at_ms: row.get("removed_at_ms"),
         last_validated_at_ms: row.get("last_validated_at_ms"),
     })
 }
@@ -623,7 +727,100 @@ impl RunRepository {
         }
         self.get_project(id).await
     }
+    pub async fn insert_creating_worktree(
+        &self,
+        id: WorktreeId,
+        project: &Project,
+        path: String,
+        base_commit: String,
+    ) -> Result<ManagedWorktree, CoreError> {
+        if project.fingerprint_scheme != ProjectFingerprintScheme::StrongV1
+            || base_commit.len() != 40
+            || path.is_empty()
+        {
+            return Err(CoreError::InvalidTask);
+        }
+        let timestamp = now();
+        let worktree = ManagedWorktree {
+            id,
+            project_id: project.id.clone(),
+            path,
+            base_commit,
+            repository_identity: project.repository_identity.clone(),
+            repository_fingerprint: project.repository_fingerprint.clone(),
+            state: ManagedWorktreeState::Creating,
+            error_category: None,
+            created_at_ms: timestamp,
+            ready_at_ms: None,
+            removed_at_ms: None,
+            last_validated_at_ms: timestamp,
+        };
+        sqlx::query("INSERT INTO managed_worktrees (id, project_id, worktree_path, base_commit, repository_identity, repository_fingerprint, state, error_category, created_at_ms, ready_at_ms, removed_at_ms, last_validated_at_ms) VALUES (?, ?, ?, ?, ?, ?, 'creating', NULL, ?, NULL, NULL, ?)")
+            .bind(worktree.id.to_string()).bind(worktree.project_id.to_string()).bind(&worktree.path).bind(&worktree.base_commit).bind(&worktree.repository_identity).bind(&worktree.repository_fingerprint).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        Ok(worktree)
+    }
+    pub async fn get_worktree(&self, id: &WorktreeId) -> Result<ManagedWorktree, CoreError> {
+        let row = sqlx::query("SELECT * FROM managed_worktrees WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .ok_or(CoreError::WorktreeNotFound)?;
+        row_to_worktree(&row)
+    }
+    pub async fn list_project_worktrees(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<ManagedWorktree>, CoreError> {
+        let rows = sqlx::query("SELECT * FROM managed_worktrees WHERE project_id = ? ORDER BY created_at_ms DESC, id DESC").bind(project.to_string()).fetch_all(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        rows.iter().map(row_to_worktree).collect()
+    }
+    pub async fn list_reconcilable_worktrees(&self) -> Result<Vec<ManagedWorktree>, CoreError> {
+        let rows = sqlx::query("SELECT * FROM managed_worktrees WHERE state <> 'removed' ORDER BY created_at_ms ASC, id ASC")
+            .fetch_all(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        rows.iter().map(row_to_worktree).collect()
+    }
+    pub async fn transition_worktree(
+        &self,
+        id: &WorktreeId,
+        expected: ManagedWorktreeState,
+        next: ManagedWorktreeState,
+        error: Option<&str>,
+    ) -> Result<ManagedWorktree, CoreError> {
+        let timestamp = now();
+        let ready = if next == ManagedWorktreeState::Ready {
+            Some(timestamp)
+        } else {
+            None
+        };
+        let removed = if next == ManagedWorktreeState::Removed {
+            Some(timestamp)
+        } else {
+            None
+        };
+        let changed = sqlx::query("UPDATE managed_worktrees SET state = ?, error_category = ?, ready_at_ms = COALESCE(?, ready_at_ms), removed_at_ms = COALESCE(?, removed_at_ms), last_validated_at_ms = ? WHERE id = ? AND state = ?")
+            .bind(worktree_state_name(next)).bind(error).bind(ready).bind(removed).bind(timestamp).bind(id.to_string()).bind(worktree_state_name(expected)).execute(&self.pool).await.map_err(|_| CoreError::Storage)?.rows_affected();
+        if changed == 0 {
+            return Err(CoreError::WorktreeStateConflict);
+        }
+        self.get_worktree(id).await
+    }
     pub async fn unregister_project(&self, id: &ProjectId) -> Result<(), CoreError> {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM managed_worktrees WHERE project_id = ? AND state <> 'removed'",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| CoreError::Storage)?;
+        if remaining != 0 {
+            return Err(CoreError::ProjectHasWorktrees);
+        }
+        sqlx::query("DELETE FROM managed_worktrees WHERE project_id = ? AND state = 'removed'")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?;
         if sqlx::query("DELETE FROM projects WHERE id = ?")
             .bind(id.to_string())
             .execute(&self.pool)
