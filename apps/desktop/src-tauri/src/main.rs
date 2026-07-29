@@ -8,10 +8,10 @@ use sentinel_core::{
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
-    add_detached_worktree, inspect_repository, inspect_worktree_destination_no_follow,
-    remove_detached_worktree, resolve_exact_head, worktree_is_clean, worktree_metadata_lookup,
-    GitError, RepositoryInspection, RepositoryState, WorktreeDestinationState,
-    WorktreeMetadataLookup,
+    add_detached_worktree, inspect_repository, inspect_worktree_changes,
+    inspect_worktree_destination_no_follow, remove_detached_worktree, resolve_exact_head,
+    worktree_is_clean, worktree_metadata_lookup, ChangedFile, GitError, RepositoryInspection,
+    RepositoryState, WorktreeDestinationState, WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -133,6 +133,14 @@ struct WorktreeDto {
     ready_at_ms: Option<i64>,
     removed_at_ms: Option<i64>,
     error_category: Option<String>,
+}
+/// Internal Phase 3C-A result.  It is deliberately not a Tauri DTO yet.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct WorktreeChangeInventory {
+    worktree_id: WorktreeId,
+    clean: bool,
+    files: Vec<ChangedFile>,
 }
 const RUN_EVENT: &str = "phase2-run-event";
 
@@ -566,6 +574,33 @@ fn worktree_error(_: impl std::fmt::Debug) -> SafeError {
         message: "The managed worktree operation could not be completed.",
     }
 }
+#[allow(dead_code)]
+fn inventory_error(error: GitError) -> SafeError {
+    match error {
+        GitError::GitNotAvailable => SafeError {
+            code: "git_not_available",
+            message: "Git is not available on this device.",
+        },
+        GitError::TimedOut => SafeError {
+            code: "git_command_failed",
+            message: "The worktree inventory could not be completed.",
+        },
+        GitError::StdoutTooLarge | GitError::StderrTooLarge | GitError::StatusTooManyRecords => {
+            SafeError {
+                code: "git_output_too_large",
+                message: "The worktree inventory exceeds its safe limit.",
+            }
+        }
+        GitError::StatusMalformed | GitError::MetadataInvalid => SafeError {
+            code: "git_output_malformed",
+            message: "The worktree inventory could not be verified.",
+        },
+        _ => SafeError {
+            code: "git_command_failed",
+            message: "The worktree inventory could not be completed.",
+        },
+    }
+}
 fn validate_managed_directory(path: &Path) -> Result<(), SafeError> {
     let metadata = std::fs::symlink_metadata(path).map_err(worktree_error)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -784,6 +819,131 @@ async fn strict_project_for_worktree(
         });
     }
     Ok(project)
+}
+
+#[allow(dead_code)]
+fn inventory_eligible(state: ManagedWorktreeState) -> bool {
+    matches!(
+        state,
+        ManagedWorktreeState::Ready | ManagedWorktreeState::RetainedDirty
+    )
+}
+
+/// Shared production Phase 3C-A inspection orchestration.  It intentionally
+/// remains internal until Phase 3C-C defines the public bridge contract.
+#[allow(dead_code)]
+async fn inspect_worktree_changes_impl(
+    state: &DesktopState,
+    worktree_id: WorktreeId,
+) -> Result<WorktreeChangeInventory, SafeError> {
+    let initial = state
+        .repository
+        .get_worktree(&worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    acquire_project_worktree_lock(state, &initial.project_id).await?;
+    let project_id = initial.project_id.clone();
+    let result = async {
+        let row = state
+            .repository
+            .get_worktree(&worktree_id)
+            .await
+            .map_err(|_| SafeError {
+                code: "worktree_not_found",
+                message: "The managed worktree was not found.",
+            })?;
+        if row.project_id != project_id || !inventory_eligible(row.state) {
+            return Err(SafeError {
+                code: "worktree_not_ready",
+                message: "This worktree is not available for inspection.",
+            });
+        }
+        let project = strict_project_for_worktree(state, &project_id).await?;
+        let stored = PathBuf::from(&row.path);
+        let leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &stored)
+            .map_err(|_| SafeError {
+                code: "ownership_validation_failed",
+                message: "The managed worktree could not be verified.",
+            })?;
+        let inspection = inspect_repository(&leaf).await.map_err(inventory_error)?;
+        if inspection.is_primary
+            || inspection.identity != row.repository_identity
+            || inspection.fingerprint.as_str() != row.repository_fingerprint
+            || inspection.head.as_deref() != Some(row.base_commit.as_str())
+            || !matches!(
+                worktree_metadata_lookup(Path::new(&project.repository_root), &leaf).await,
+                Ok(WorktreeMetadataLookup::Present)
+            )
+        {
+            return Err(SafeError {
+                code: "ownership_validation_failed",
+                message: "The managed worktree could not be verified.",
+            });
+        }
+        // Repeat exact no-follow validation immediately before the only
+        // path-following Phase 3C-A Git status operation.
+        let leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &stored)
+            .map_err(|_| SafeError {
+                code: "ownership_validation_failed",
+                message: "The managed worktree could not be verified.",
+            })?;
+        let files = inspect_worktree_changes(&leaf)
+            .await
+            .map_err(inventory_error)?;
+        let after_leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &stored)
+            .map_err(|_| SafeError {
+                code: "ownership_validation_failed",
+                message: "The managed worktree could not be verified.",
+            })?;
+        let after_inspection = inspect_repository(&after_leaf)
+            .await
+            .map_err(inventory_error)?;
+        if after_inspection.is_primary
+            || after_inspection.identity != row.repository_identity
+            || after_inspection.fingerprint.as_str() != row.repository_fingerprint
+            || after_inspection.head.as_deref() != Some(row.base_commit.as_str())
+            || !matches!(
+                worktree_metadata_lookup(Path::new(&project.repository_root), &after_leaf).await,
+                Ok(WorktreeMetadataLookup::Present)
+            )
+        {
+            return Err(SafeError {
+                code: "ownership_validation_failed",
+                message: "The managed worktree could not be verified.",
+            });
+        }
+        let after = state
+            .repository
+            .get_worktree(&worktree_id)
+            .await
+            .map_err(|_| SafeError {
+                code: "worktree_not_found",
+                message: "The managed worktree was not found.",
+            })?;
+        if after_leaf != leaf
+            || after.project_id != project_id
+            || after.state != row.state
+            || after.base_commit != row.base_commit
+            || after.repository_identity != row.repository_identity
+            || after.repository_fingerprint != row.repository_fingerprint
+        {
+            return Err(SafeError {
+                code: "recovery_required",
+                message: "The managed worktree changed during inspection.",
+            });
+        }
+        Ok(WorktreeChangeInventory {
+            worktree_id,
+            clean: files.is_empty(),
+            files,
+        })
+    }
+    .await;
+    release_project_worktree_lock(state, &project_id).await;
+    result
 }
 #[tauri::command]
 async fn create_project_worktree(
@@ -1504,7 +1664,247 @@ mod bridge_tests {
     };
     use sentinel_git::RepositoryFingerprint;
     use serde_json::json;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn fixture_git(directory: &Path, args: &[&str]) {
+        let output = Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture git failed");
+    }
+
+    fn fixture_git_output(directory: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture git output failed");
+        output.stdout
+    }
+
+    fn fixture_git_path(directory: &Path, name: &str) -> PathBuf {
+        let output = fixture_git_output(directory, &["rev-parse", "--git-path", name]);
+        let spelling = String::from_utf8(output).unwrap();
+        let path = PathBuf::from(spelling.trim_end());
+        if path.is_absolute() {
+            path
+        } else {
+            directory.join(path)
+        }
+    }
+
+    fn fixture_index_bytes(directory: &Path) -> Vec<u8> {
+        std::fs::read(fixture_git_path(directory, "index")).unwrap()
+    }
+
+    fn fixture_readonly_status(directory: &Path) -> Vec<u8> {
+        fixture_git_output(
+            directory,
+            &[
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+                "--no-renames",
+            ],
+        )
+    }
+
+    struct InventorySnapshot {
+        head: Option<String>,
+        branch: Option<String>,
+        index: Vec<u8>,
+        status: Vec<u8>,
+        readme: String,
+        untracked: Option<String>,
+        index_lock_exists: bool,
+    }
+
+    async fn inventory_snapshot(directory: &Path, untracked_name: &str) -> InventorySnapshot {
+        let inspection = inspect_repository(directory).await.unwrap();
+        InventorySnapshot {
+            head: inspection.head,
+            branch: inspection.branch,
+            index: fixture_index_bytes(directory),
+            status: fixture_readonly_status(directory),
+            readme: std::fs::read_to_string(directory.join("README.md")).unwrap(),
+            untracked: std::fs::read_to_string(directory.join(untracked_name)).ok(),
+            index_lock_exists: fixture_git_path(directory, "index.lock").exists(),
+        }
+    }
+
+    async fn inventory_fixture(
+        state_kind: ManagedWorktreeState,
+    ) -> (tempfile::TempDir, DesktopState, ManagedWorktree) {
+        let fixture = tempdir().unwrap();
+        let primary = fixture.path().join("primary");
+        std::fs::create_dir(&primary).unwrap();
+        fixture_git(&primary, &["init"]);
+        fixture_git(&primary, &["config", "user.email", "tests@example.invalid"]);
+        fixture_git(&primary, &["config", "user.name", "Tests"]);
+        std::fs::write(primary.join("README.md"), "fixture").unwrap();
+        fixture_git(&primary, &["add", "README.md"]);
+        fixture_git(&primary, &["commit", "-m", "fixture"]);
+        let inspection = inspect_repository(&primary).await.unwrap();
+        let database_path = fixture.path().join("inventory.sqlite");
+        let repository = RunRepository::open(&format!("sqlite://{}", database_path.display()))
+            .await
+            .unwrap();
+        let project = repository
+            .register_project(ProjectRegistration {
+                display_name: "Inventory fixture".into(),
+                repository_identity: inspection.identity.clone(),
+                repository_fingerprint: inspection.fingerprint.as_str().into(),
+                fingerprint_scheme: ProjectFingerprintScheme::StrongV1,
+                repository_root: inspection.repository_root.to_string_lossy().into_owned(),
+                primary_root: inspection.primary_root.to_string_lossy().into_owned(),
+                git_common_dir: inspection.common_dir.to_string_lossy().into_owned(),
+                branch: inspection.branch.clone(),
+                head: inspection.head.clone(),
+                validation_state: ProjectValidationState::Valid,
+                is_primary_worktree: true,
+            })
+            .await
+            .unwrap();
+        let app_data = fixture.path().join("app-data");
+        std::fs::create_dir(&app_data).unwrap();
+        let state = reconciliation_test_state(
+            repository.clone(),
+            database_path,
+            app_data.join("worktrees"),
+            None,
+        );
+        let id = WorktreeId::new();
+        let leaf = worktree_parent(&state.worktree_root, &project.id)
+            .unwrap()
+            .join(id.to_string());
+        let commit = inspection.head.unwrap();
+        add_detached_worktree(&primary, &leaf, &commit)
+            .await
+            .unwrap();
+        let row = repository
+            .insert_creating_worktree(id, &project, leaf.to_string_lossy().into_owned(), commit)
+            .await
+            .unwrap();
+        let row = if state_kind == ManagedWorktreeState::Ready {
+            repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Creating,
+                    ManagedWorktreeState::Ready,
+                    None,
+                )
+                .await
+                .unwrap()
+        } else {
+            let ready = repository
+                .transition_worktree(
+                    &row.id,
+                    ManagedWorktreeState::Creating,
+                    ManagedWorktreeState::Ready,
+                    None,
+                )
+                .await
+                .unwrap();
+            repository
+                .transition_worktree(
+                    &ready.id,
+                    ManagedWorktreeState::Ready,
+                    ManagedWorktreeState::RetainedDirty,
+                    Some("worktree_dirty"),
+                )
+                .await
+                .unwrap()
+        };
+        (fixture, state, row)
+    }
+
+    #[tokio::test]
+    async fn production_inventory_service_is_read_only_for_ready_and_retained_dirty_worktrees() {
+        for state_kind in [
+            ManagedWorktreeState::Ready,
+            ManagedWorktreeState::RetainedDirty,
+        ] {
+            let (fixture, state, row) = inventory_fixture(state_kind).await;
+            let leaf = PathBuf::from(&row.path);
+            let primary = fixture.path().join("primary");
+            let marker = fixture.path().join("fsmonitor-marker");
+            let helper = fixture.path().join("fsmonitor-helper");
+            std::fs::write(
+                &helper,
+                format!("#!/bin/sh\nprintf invoked > {}\n", marker.display()),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+                permissions.set_mode(0o755);
+                std::fs::set_permissions(&helper, permissions).unwrap();
+            }
+            fixture_git(
+                &primary,
+                &["config", "core.fsmonitor", helper.to_str().unwrap()],
+            );
+            assert_eq!(
+                String::from_utf8(fixture_git_output(
+                    &primary,
+                    &["config", "--get", "core.fsmonitor"],
+                ))
+                .unwrap()
+                .trim(),
+                helper.to_str().unwrap(),
+            );
+            std::fs::write(leaf.join("README.md"), "managed modification").unwrap();
+            std::fs::write(leaf.join("untracked file"), "not returned").unwrap();
+            let managed_before = inventory_snapshot(&leaf, "untracked file").await;
+            let primary_before = inventory_snapshot(&primary, "untracked file").await;
+            assert!(!marker.exists());
+            let inventory = inspect_worktree_changes_impl(&state, row.id.clone())
+                .await
+                .unwrap();
+            assert_eq!(inventory.worktree_id, row.id);
+            assert!(!inventory.clean);
+            assert_eq!(inventory.files.len(), 2);
+            assert_eq!(inventory.files[0].path.as_str(), "README.md");
+            assert_eq!(inventory.files[1].path.as_str(), "untracked file");
+            assert!(!marker.exists());
+            let managed_after = inventory_snapshot(&leaf, "untracked file").await;
+            let primary_after = inventory_snapshot(&primary, "untracked file").await;
+            assert_eq!(managed_after.head, managed_before.head);
+            assert_eq!(managed_after.branch, managed_before.branch);
+            assert_eq!(managed_after.index, managed_before.index);
+            assert_eq!(managed_after.status, managed_before.status);
+            assert_eq!(managed_after.readme, managed_before.readme);
+            assert_eq!(managed_after.untracked, managed_before.untracked);
+            assert!(!managed_after.index_lock_exists);
+            assert_eq!(primary_after.head, primary_before.head);
+            assert_eq!(primary_after.branch, primary_before.branch);
+            assert_eq!(primary_after.index, primary_before.index);
+            assert_eq!(primary_after.status, primary_before.status);
+            assert_eq!(primary_after.readme, primary_before.readme);
+            assert_eq!(primary_after.untracked, primary_before.untracked);
+            assert!(!primary_after.index_lock_exists);
+            assert_eq!(
+                state.repository.get_worktree(&row.id).await.unwrap().state,
+                state_kind
+            );
+            acquire_project_worktree_lock(&state, &row.project_id)
+                .await
+                .unwrap();
+            release_project_worktree_lock(&state, &row.project_id).await;
+        }
+    }
 
     #[cfg(unix)]
     #[test]

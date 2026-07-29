@@ -1,5 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -30,6 +31,10 @@ pub enum GitError {
     StderrTooLarge,
     #[error("git repository metadata is invalid")]
     MetadataInvalid,
+    #[error("git status output is malformed")]
+    StatusMalformed,
+    #[error("git status output has too many records")]
+    StatusTooManyRecords,
     #[error("repository fingerprint is unavailable")]
     FingerprintUnavailable,
     #[error("path does not exist")]
@@ -42,6 +47,82 @@ pub enum GitError {
     DirtyWorktree(PathBuf),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+/// Maximum bytes accepted from the read-only Phase 3C-A status operation.
+pub const MAX_STATUS_STDOUT: usize = 256 * 1024;
+pub const MAX_STATUS_STDERR: usize = 16 * 1024;
+pub const MAX_STATUS_RECORDS: usize = 1_000;
+pub const MAX_REPOSITORY_RELATIVE_PATH_BYTES: usize = 4 * 1024;
+const STATUS_INVENTORY_ARGS: [&str; 11] = [
+    "--no-optional-locks",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "status",
+    "--porcelain=v2",
+    "-z",
+    "--untracked-files=all",
+    "--ignore-submodules=none",
+    "--no-renames",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RepositoryRelativePath(String);
+
+impl RepositoryRelativePath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    TypeChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    BothDeleted,
+    AddedByUs,
+    DeletedByThem,
+    AddedByThem,
+    DeletedByUs,
+    BothAdded,
+    BothModified,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryMode {
+    Absent,
+    Regular,
+    Executable,
+    SymbolicLink,
+    Gitlink,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubmoduleStatus {
+    pub commit_changed: bool,
+    pub modified: bool,
+    pub untracked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: RepositoryRelativePath,
+    pub index_change: Option<ChangeKind>,
+    pub worktree_change: Option<ChangeKind>,
+    pub conflict: Option<ConflictKind>,
+    pub untracked: bool,
+    pub submodule: Option<SubmoduleStatus>,
+    pub mode_head: Option<RepositoryMode>,
+    pub mode_index: Option<RepositoryMode>,
+    pub mode_worktree: Option<RepositoryMode>,
 }
 
 /// The result of a complete, successfully parsed worktree-list lookup.  This
@@ -437,6 +518,225 @@ pub async fn worktree_is_clean(worktree: &Path) -> Result<bool, GitError> {
     Ok(output.stdout.is_empty())
 }
 
+/// Returns a complete, read-only porcelain-v2 inventory for a caller-verified
+/// linked worktree.  The caller owns exact managed-leaf validation; this crate
+/// deliberately accepts only a backend-provided directory and fixed arguments.
+pub async fn inspect_worktree_changes(worktree: &Path) -> Result<Vec<ChangedFile>, GitError> {
+    let inspection = inspect_repository(worktree).await?;
+    if inspection.is_primary {
+        return Err(GitError::MetadataInvalid);
+    }
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let output = run_git_with_limits(
+        &executable,
+        &inspection.repository_root,
+        STATUS_INVENTORY_ARGS,
+        GIT_TIMEOUT,
+        MAX_STATUS_STDOUT,
+        MAX_STATUS_STDERR,
+        true,
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(GitError::Command("status failed".into()));
+    }
+    parse_status_porcelain_v2_z(&output.stdout)
+}
+
+/// Strict parser for the fixed Phase 3C-A porcelain-v2, NUL-delimited status
+/// command. Empty output is the sole valid representation of a clean tree.
+pub fn parse_status_porcelain_v2_z(bytes: &[u8]) -> Result<Vec<ChangedFile>, GitError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(&[0]) {
+        return Err(GitError::StatusMalformed);
+    }
+    let mut files = Vec::new();
+    let mut paths = HashSet::new();
+    for record in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        if record.is_empty() {
+            return Err(GitError::StatusMalformed);
+        }
+        let file = match record.first().copied() {
+            Some(b'1') if record.get(1) == Some(&b' ') => parse_status_ordinary(record)?,
+            Some(b'u') if record.get(1) == Some(&b' ') => parse_status_unmerged(record)?,
+            Some(b'?') if record.get(1) == Some(&b' ') => ChangedFile {
+                path: parse_repository_relative_path(&record[2..])?,
+                index_change: None,
+                worktree_change: None,
+                conflict: None,
+                untracked: true,
+                submodule: None,
+                mode_head: None,
+                mode_index: None,
+                mode_worktree: None,
+            },
+            Some(b'2') | Some(b'!') | Some(b'#') => return Err(GitError::StatusMalformed),
+            _ => return Err(GitError::StatusMalformed),
+        };
+        if !paths.insert(file.path.0.clone()) {
+            return Err(GitError::StatusMalformed);
+        }
+        files.push(file);
+        if files.len() > MAX_STATUS_RECORDS {
+            return Err(GitError::StatusTooManyRecords);
+        }
+    }
+    files.sort_by(|left, right| left.path.0.as_bytes().cmp(right.path.0.as_bytes()));
+    Ok(files)
+}
+
+fn fields(record: &[u8], count: usize) -> Result<Vec<&[u8]>, GitError> {
+    let values: Vec<_> = record.splitn(count, |byte| *byte == b' ').collect();
+    if values.len() != count || values.iter().any(|value| value.is_empty()) {
+        return Err(GitError::StatusMalformed);
+    }
+    Ok(values)
+}
+
+fn parse_status_ordinary(record: &[u8]) -> Result<ChangedFile, GitError> {
+    // 1 XY SUB MHEAD MINDEX MWORKTREE HHEAD HINDEX PATH
+    let fields = fields(record, 9)?;
+    let (tag, xy, sub, head_mode, index_mode, worktree_mode, head_oid, index_oid, path) = (
+        fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7],
+        fields[8],
+    );
+    if tag != b"1" || !valid_oid(head_oid) || !valid_oid(index_oid) {
+        return Err(GitError::StatusMalformed);
+    }
+    let (index_change, worktree_change) = parse_xy(xy)?;
+    // `status --porcelain=v2` emits no ordinary record for a clean path.  A
+    // syntactically valid `..` record is therefore malformed rather than a
+    // harmless empty change: accepting it would make a clean inventory appear
+    // dirty.
+    if index_change.is_none() && worktree_change.is_none() {
+        return Err(GitError::StatusMalformed);
+    }
+    Ok(ChangedFile {
+        path: parse_repository_relative_path(path)?,
+        index_change,
+        worktree_change,
+        conflict: None,
+        untracked: false,
+        submodule: parse_submodule(sub)?,
+        mode_head: Some(parse_mode(head_mode)?),
+        mode_index: Some(parse_mode(index_mode)?),
+        mode_worktree: Some(parse_mode(worktree_mode)?),
+    })
+}
+
+fn parse_status_unmerged(record: &[u8]) -> Result<ChangedFile, GitError> {
+    // u XY SUB M1 M2 M3 MWORKTREE H1 H2 H3 PATH
+    let fields = fields(record, 11)?;
+    let (tag, xy, sub, mode1, mode2, mode3, worktree_mode, oid1, oid2, oid3, path) = (
+        fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], fields[7],
+        fields[8], fields[9], fields[10],
+    );
+    if tag != b"u" || !valid_oid(oid1) || !valid_oid(oid2) || !valid_oid(oid3) {
+        return Err(GitError::StatusMalformed);
+    }
+    let conflict = match xy {
+        b"DD" => ConflictKind::BothDeleted,
+        b"AU" => ConflictKind::AddedByUs,
+        b"UD" => ConflictKind::DeletedByThem,
+        b"UA" => ConflictKind::AddedByThem,
+        b"DU" => ConflictKind::DeletedByUs,
+        b"AA" => ConflictKind::BothAdded,
+        b"UU" => ConflictKind::BothModified,
+        _ => return Err(GitError::StatusMalformed),
+    };
+    Ok(ChangedFile {
+        path: parse_repository_relative_path(path)?,
+        index_change: None,
+        worktree_change: None,
+        conflict: Some(conflict),
+        untracked: false,
+        submodule: parse_submodule(sub)?,
+        mode_head: Some(parse_mode(mode1)?),
+        mode_index: Some(parse_mode(mode2)?),
+        mode_worktree: Some(parse_mode(mode3)?),
+    })
+    .and_then(|file| {
+        let _ = parse_mode(worktree_mode)?;
+        Ok(file)
+    })
+}
+
+fn parse_xy(value: &[u8]) -> Result<(Option<ChangeKind>, Option<ChangeKind>), GitError> {
+    if value.len() != 2 {
+        return Err(GitError::StatusMalformed);
+    }
+    Ok((parse_change(value[0])?, parse_change(value[1])?))
+}
+fn parse_change(value: u8) -> Result<Option<ChangeKind>, GitError> {
+    Ok(match value {
+        b'.' => None,
+        b'A' => Some(ChangeKind::Added),
+        b'M' => Some(ChangeKind::Modified),
+        b'D' => Some(ChangeKind::Deleted),
+        b'T' => Some(ChangeKind::TypeChanged),
+        _ => return Err(GitError::StatusMalformed),
+    })
+}
+fn parse_submodule(value: &[u8]) -> Result<Option<SubmoduleStatus>, GitError> {
+    if value == b"N..." {
+        return Ok(None);
+    }
+    if value.len() != 4 || value[0] != b'S' {
+        return Err(GitError::StatusMalformed);
+    }
+    let valid = |actual: u8, expected: u8| actual == b'.' || actual == expected;
+    if !valid(value[1], b'C') || !valid(value[2], b'M') || !valid(value[3], b'U') {
+        return Err(GitError::StatusMalformed);
+    }
+    Ok(Some(SubmoduleStatus {
+        commit_changed: value[1] == b'C',
+        modified: value[2] == b'M',
+        untracked: value[3] == b'U',
+    }))
+}
+fn parse_mode(value: &[u8]) -> Result<RepositoryMode, GitError> {
+    match value {
+        b"000000" => Ok(RepositoryMode::Absent),
+        b"100644" => Ok(RepositoryMode::Regular),
+        b"100755" => Ok(RepositoryMode::Executable),
+        b"120000" => Ok(RepositoryMode::SymbolicLink),
+        b"160000" => Ok(RepositoryMode::Gitlink),
+        _ => Err(GitError::StatusMalformed),
+    }
+}
+fn valid_oid(value: &[u8]) -> bool {
+    value.len() == 40
+        && value
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+fn parse_repository_relative_path(value: &[u8]) -> Result<RepositoryRelativePath, GitError> {
+    if value.is_empty() || value.len() > MAX_REPOSITORY_RELATIVE_PATH_BYTES {
+        return Err(GitError::StatusMalformed);
+    }
+    let text = std::str::from_utf8(value).map_err(|_| GitError::StatusMalformed)?;
+    // A leading backslash is rooted on Windows, including device and verbatim
+    // namespaces.  Reject it on every host so this bridge-safe relative-path
+    // type can never be reinterpreted as absolute by a future Windows client.
+    // Non-leading backslashes remain ordinary filename bytes under the
+    // documented Unix-safe policy.
+    if text.contains('\0')
+        || text.starts_with('/')
+        || text.starts_with('\\')
+        || (text.len() >= 2
+            && text.as_bytes()[0].is_ascii_alphabetic()
+            && text.as_bytes()[1] == b':')
+        || text
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(GitError::StatusMalformed);
+    }
+    Ok(RepositoryRelativePath(text.to_owned()))
+}
+
 /// Inspects exactly the configured entry without following symbolic links or
 /// Windows reparse points.  Metadata failures deliberately remain distinct
 /// from absence.
@@ -780,6 +1080,27 @@ async fn run_git_with_timeout<const N: usize>(
     args: [&str; N],
     timeout: std::time::Duration,
 ) -> Result<GitCommandOutput, GitError> {
+    run_git_with_limits(
+        executable,
+        directory,
+        args,
+        timeout,
+        MAX_GIT_OUTPUT,
+        MAX_GIT_OUTPUT,
+        false,
+    )
+    .await
+}
+
+async fn run_git_with_limits<const N: usize>(
+    executable: &ResolvedGitExecutable,
+    directory: &Path,
+    args: [&str; N],
+    timeout: std::time::Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    read_only: bool,
+) -> Result<GitCommandOutput, GitError> {
     let mut command = TokioCommand::new(&executable.0);
     command
         .args(args)
@@ -796,13 +1117,16 @@ async fn run_git_with_timeout<const N: usize>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if read_only {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     let mut child = command.spawn().map_err(|_| GitError::GitDiscoveryFailed)?;
     let stdout = child.stdout.take().ok_or(GitError::MetadataInvalid)?;
     let stderr = child.stderr.take().ok_or(GitError::MetadataInvalid)?;
     let collected = time::timeout(timeout, async {
         let streams = tokio::try_join!(
-            read_capped(stdout, GitError::StdoutTooLarge),
-            read_capped(stderr, GitError::StderrTooLarge)
+            read_capped(stdout, GitError::StdoutTooLarge, stdout_limit),
+            read_capped(stderr, GitError::StderrTooLarge, stderr_limit)
         );
         let status = child.wait().await.map_err(|_| GitError::MetadataInvalid)?;
         streams.map(|(stdout, stderr)| GitCommandOutput {
@@ -830,8 +1154,9 @@ async fn run_git_with_timeout<const N: usize>(
 async fn read_capped<R: AsyncRead + Unpin>(
     mut reader: R,
     overflow: GitError,
+    limit: usize,
 ) -> Result<Vec<u8>, GitError> {
-    let mut bytes = Vec::with_capacity(MAX_GIT_OUTPUT.min(1024));
+    let mut bytes = Vec::with_capacity(limit.min(1024));
     let mut buffer = [0_u8; 1024];
     loop {
         let count = reader
@@ -841,7 +1166,7 @@ async fn read_capped<R: AsyncRead + Unpin>(
         if count == 0 {
             return Ok(bytes);
         }
-        if bytes.len().saturating_add(count) > MAX_GIT_OUTPUT {
+        if bytes.len().saturating_add(count) > limit {
             return Err(overflow);
         }
         bytes.extend_from_slice(&buffer[..count]);
@@ -1136,6 +1461,106 @@ fn git<const N: usize>(directory: &Path, args: [&str; N]) -> Result<String, GitE
     ))
 }
 
+#[cfg(test)]
+mod status_inventory_tests {
+    use super::*;
+
+    const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+    fn ordinary(xy: &str, path: &str) -> Vec<u8> {
+        format!("1 {xy} N... 100644 100644 100644 {OID} {OID} {path}\0").into_bytes()
+    }
+
+    #[test]
+    fn status_inventory_accepts_clean_and_separate_staged_unstaged_changes() {
+        assert!(parse_status_porcelain_v2_z(b"").unwrap().is_empty());
+        let files = parse_status_porcelain_v2_z(&ordinary("MM", "src/one file.rs")).unwrap();
+        assert_eq!(files[0].index_change, Some(ChangeKind::Modified));
+        assert_eq!(files[0].worktree_change, Some(ChangeKind::Modified));
+        assert_eq!(files[0].path.as_str(), "src/one file.rs");
+    }
+
+    #[test]
+    fn status_inventory_supports_untracked_unicode_newline_and_gitlink_metadata() {
+        let mut bytes = "? - ünicode\nname\0".to_owned().into_bytes();
+        bytes.extend_from_slice(
+            format!("1 M. SC.. 160000 160000 160000 {OID} {OID} module\0").as_bytes(),
+        );
+        let files = parse_status_porcelain_v2_z(&bytes).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .any(|file| file.untracked && file.path.as_str() == "- ünicode\nname"));
+        assert!(files
+            .iter()
+            .any(|file| file.mode_head == Some(RepositoryMode::Gitlink)));
+    }
+
+    #[test]
+    fn status_inventory_supports_all_documented_unmerged_codes() {
+        for code in ["DD", "AU", "UD", "UA", "DU", "AA", "UU"] {
+            let bytes =
+                format!("u {code} N... 100644 100644 100644 100644 {OID} {OID} {OID} conflict\0");
+            let files = parse_status_porcelain_v2_z(bytes.as_bytes()).unwrap();
+            assert!(files[0].conflict.is_some());
+        }
+    }
+
+    #[test]
+    fn status_inventory_rejects_damage_aliases_and_ambiguous_records() {
+        for bytes in [
+            b"? ../escape\0".as_slice(),
+            b"? /absolute\0".as_slice(),
+            b"? C:/drive\0".as_slice(),
+            b"? C:\\drive\0".as_slice(),
+            b"! ignored\0".as_slice(),
+            b"2 R. N... 100644 100644 100644 100644 100644 ".as_slice(),
+            b"? truncated".as_slice(),
+            b"? duplicate\0? duplicate\0".as_slice(),
+        ] {
+            assert!(parse_status_porcelain_v2_z(bytes).is_err());
+        }
+        let invalid = format!("1 ZZ N... 100644 100644 100644 {OID} {OID} bad\0");
+        assert!(parse_status_porcelain_v2_z(invalid.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn status_inventory_rejects_rooted_windows_spellings_but_preserves_internal_backslashes() {
+        for path in [
+            "\\Windows\\file",
+            "\\rooted",
+            "\\device\\name",
+            "\\??\\C:\\file",
+            "\\\\server\\share",
+            "\\\\?\\C:\\file",
+            "\\\\.\\PhysicalDrive0",
+        ] {
+            assert!(parse_repository_relative_path(path.as_bytes()).is_err());
+            let record = format!("? {path}\0");
+            assert!(parse_status_porcelain_v2_z(record.as_bytes()).is_err());
+        }
+        let files = parse_status_porcelain_v2_z(b"? folder\\name.txt\0").unwrap();
+        assert_eq!(files[0].path.as_str(), "folder\\name.txt");
+    }
+
+    #[test]
+    fn status_inventory_rejects_clean_ordinary_records_without_returning_partial_files() {
+        let clean_record = ordinary("..", "not-a-change");
+        assert!(parse_status_porcelain_v2_z(&clean_record).is_err());
+
+        let mut mixed = ordinary("M.", "valid-change");
+        mixed.extend_from_slice(&clean_record);
+        assert!(parse_status_porcelain_v2_z(&mixed).is_err());
+        assert!(parse_status_porcelain_v2_z(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_inventory_rejects_oversized_and_invalid_utf8_paths() {
+        let large = format!("? {}\0", "x".repeat(MAX_REPOSITORY_RELATIVE_PATH_BYTES + 1));
+        assert!(parse_status_porcelain_v2_z(large.as_bytes()).is_err());
+        assert!(parse_status_porcelain_v2_z(&[b'?', b' ', 0xff, 0]).is_err());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod inspection_tests {
     use super::*;
@@ -1183,6 +1608,26 @@ mod inspection_tests {
             }
         }
         assert_eq!(decode_output(output.stdout).expect("output"), "false");
+    }
+
+    #[tokio::test]
+    async fn inventory_operation_uses_its_fixed_read_only_arguments_and_optional_lock_guard() {
+        let (directory, executable) = fixture_executable(
+            "#!/bin/sh\n[ \"$GIT_OPTIONAL_LOCKS\" = 0 ] || exit 10\n[ \"$#\" = 11 ] || exit 11\n[ \"$1\" = --no-optional-locks ] || exit 12\n[ \"$2\" = -c ] || exit 13\n[ \"$3\" = core.fsmonitor=false ] || exit 14\n[ \"$4\" = -c ] || exit 15\n[ \"$5\" = core.untrackedCache=false ] || exit 16\n[ \"$6\" = status ] || exit 17\n[ \"$7\" = --porcelain=v2 ] || exit 18\n[ \"$8\" = -z ] || exit 19\n[ \"$9\" = --untracked-files=all ] || exit 20\n[ \"${10}\" = --ignore-submodules=none ] || exit 21\n[ \"${11}\" = --no-renames ] || exit 22\n",
+        );
+        let output = run_git_with_limits(
+            &executable,
+            directory.path(),
+            STATUS_INVENTORY_ARGS,
+            GIT_TIMEOUT,
+            MAX_STATUS_STDOUT,
+            MAX_STATUS_STDERR,
+            true,
+        )
+        .await
+        .expect("fixed inventory command");
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
     }
 
     #[tokio::test]
