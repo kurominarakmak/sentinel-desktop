@@ -67,6 +67,21 @@ const STATUS_INVENTORY_ARGS: [&str; 11] = [
     "--ignore-submodules=none",
     "--no-renames",
 ];
+pub const MAX_NUMSTAT_STDOUT: usize = 32 * 1024;
+pub const MAX_NUMSTAT_STDERR: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextEligibleMetadata {
+    pub additions: u32,
+    pub deletions: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumstatClassification {
+    NoChanges,
+    TextEligible(TextEligibleMetadata),
+    Binary,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RepositoryRelativePath(String);
@@ -535,12 +550,144 @@ pub async fn inspect_worktree_changes(worktree: &Path) -> Result<Vec<ChangedFile
         MAX_STATUS_STDOUT,
         MAX_STATUS_STDERR,
         true,
+        false,
     )
     .await?;
     if !output.status.success() {
         return Err(GitError::Command("status failed".into()));
     }
     parse_status_porcelain_v2_z(&output.stdout)
+}
+
+/// Runs one fixed, literal-pathspec numstat operation for a caller-verified
+/// linked worktree. It returns metadata only; no file content is interpreted.
+pub async fn inspect_worktree_numstat(
+    worktree: &Path,
+    path: &RepositoryRelativePath,
+    base_commit: Option<&str>,
+) -> Result<NumstatClassification, GitError> {
+    if let Some(base_commit) = base_commit {
+        if !valid_oid(base_commit.as_bytes()) {
+            return Err(GitError::MetadataInvalid);
+        }
+    }
+    let inspection = inspect_repository(worktree).await?;
+    if inspection.is_primary {
+        return Err(GitError::MetadataInvalid);
+    }
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let path = path.as_str();
+    let output = if let Some(base_commit) = base_commit {
+        run_git_with_limits(
+            &executable,
+            &inspection.repository_root,
+            [
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "color.ui=false",
+                "diff",
+                "--cached",
+                "--numstat",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                base_commit,
+                "--",
+                path,
+            ],
+            GIT_TIMEOUT,
+            MAX_NUMSTAT_STDOUT,
+            MAX_NUMSTAT_STDERR,
+            true,
+            true,
+        )
+        .await?
+    } else {
+        run_git_with_limits(
+            &executable,
+            &inspection.repository_root,
+            [
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "color.ui=false",
+                "diff",
+                "--numstat",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                "--",
+                path,
+            ],
+            GIT_TIMEOUT,
+            MAX_NUMSTAT_STDOUT,
+            MAX_NUMSTAT_STDERR,
+            true,
+            true,
+        )
+        .await?
+    };
+    if !output.status.success() {
+        return Err(GitError::Command("numstat failed".into()));
+    }
+    parse_numstat_z(&output.stdout, path)
+}
+
+/// Strict parser for one fixed `git diff --numstat -z -- <literal-path>`
+/// record. Empty output is represented explicitly; multiple records are never
+/// accepted for a one-path request.
+pub fn parse_numstat_z(
+    bytes: &[u8],
+    expected_path: &str,
+) -> Result<NumstatClassification, GitError> {
+    if bytes.is_empty() {
+        return Ok(NumstatClassification::NoChanges);
+    }
+    if !bytes.ends_with(&[0]) {
+        return Err(GitError::StatusMalformed);
+    }
+    let records: Vec<_> = bytes[..bytes.len() - 1].split(|byte| *byte == 0).collect();
+    if records.len() != 1 || records[0].is_empty() {
+        return Err(GitError::StatusMalformed);
+    }
+    let mut fields = records[0].splitn(3, |byte| *byte == b'\t');
+    let added = fields.next().ok_or(GitError::StatusMalformed)?;
+    let deleted = fields.next().ok_or(GitError::StatusMalformed)?;
+    let path = fields.next().ok_or(GitError::StatusMalformed)?;
+    let path = parse_repository_relative_path(path)?;
+    if path.as_str() != expected_path {
+        return Err(GitError::StatusMalformed);
+    }
+    if added == b"-" && deleted == b"-" {
+        return Ok(NumstatClassification::Binary);
+    }
+    if added == b"-" || deleted == b"-" {
+        return Err(GitError::StatusMalformed);
+    }
+    let parse_count = |value: &[u8]| {
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return Err(GitError::StatusMalformed);
+        }
+        let value = std::str::from_utf8(value).map_err(|_| GitError::StatusMalformed)?;
+        value.parse::<u32>().map_err(|_| GitError::StatusMalformed)
+    };
+    Ok(NumstatClassification::TextEligible(TextEligibleMetadata {
+        additions: parse_count(added)?,
+        deletions: parse_count(deleted)?,
+    }))
 }
 
 /// Strict parser for the fixed Phase 3C-A porcelain-v2, NUL-delimited status
@@ -1088,10 +1235,12 @@ async fn run_git_with_timeout<const N: usize>(
         MAX_GIT_OUTPUT,
         MAX_GIT_OUTPUT,
         false,
+        false,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_git_with_limits<const N: usize>(
     executable: &ResolvedGitExecutable,
     directory: &Path,
@@ -1100,6 +1249,7 @@ async fn run_git_with_limits<const N: usize>(
     stdout_limit: usize,
     stderr_limit: usize,
     read_only: bool,
+    literal_pathspecs: bool,
 ) -> Result<GitCommandOutput, GitError> {
     let mut command = TokioCommand::new(&executable.0);
     command
@@ -1119,6 +1269,9 @@ async fn run_git_with_limits<const N: usize>(
         .kill_on_drop(true);
     if read_only {
         command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    if literal_pathspecs {
+        command.env("GIT_LITERAL_PATHSPECS", "1");
     }
     let mut child = command.spawn().map_err(|_| GitError::GitDiscoveryFailed)?;
     let stdout = child.stdout.take().ok_or(GitError::MetadataInvalid)?;
@@ -1561,10 +1714,73 @@ mod status_inventory_tests {
     }
 }
 
+#[cfg(test)]
+mod numstat_tests {
+    use super::*;
+
+    #[test]
+    fn numstat_parser_accepts_one_text_or_binary_record_with_literal_paths() {
+        let path = " :(glob)*.txt\nname";
+        let text = format!("12\t3\t{path}\0");
+        assert_eq!(
+            parse_numstat_z(text.as_bytes(), path).unwrap(),
+            NumstatClassification::TextEligible(TextEligibleMetadata {
+                additions: 12,
+                deletions: 3,
+            })
+        );
+        let binary = b"-\t-\tfolder\\name.bin\0";
+        assert_eq!(
+            parse_numstat_z(binary, "folder\\name.bin").unwrap(),
+            NumstatClassification::Binary
+        );
+        assert_eq!(
+            parse_numstat_z(b"", "file.txt").unwrap(),
+            NumstatClassification::NoChanges
+        );
+    }
+
+    #[test]
+    fn numstat_parser_rejects_malformed_or_non_single_output_without_partial_results() {
+        for bytes in [
+            b"1\t2\tfile.txt".as_slice(),
+            b"1\t2\t\0".as_slice(),
+            b"-\t2\tfile.txt\0".as_slice(),
+            b"+1\t2\tfile.txt\0".as_slice(),
+            b"1\t2\t../escape\0".as_slice(),
+            b"1\t2\tfile.txt\x001\t2\tother.txt\0".as_slice(),
+        ] {
+            assert!(parse_numstat_z(bytes, "file.txt").is_err());
+        }
+        assert!(parse_numstat_z(b"1\t2\tother.txt\0", "file.txt").is_err());
+    }
+}
+
 #[cfg(all(test, unix))]
 mod inspection_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn fixture_git(directory: &Path, args: &[&str]) {
+        let mut command = Command::new("/usr/bin/git");
+        command.args(args).current_dir(directory);
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ASKPASS",
+            "PAGER",
+        ] {
+            command.env_remove(key);
+        }
+        let output = command.output().expect("fixture git process");
+        assert!(
+            output.status.success(),
+            "fixture git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn fixture_executable(script: &str) -> (tempfile::TempDir, ResolvedGitExecutable) {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1623,11 +1839,152 @@ mod inspection_tests {
             MAX_STATUS_STDOUT,
             MAX_STATUS_STDERR,
             true,
+            false,
         )
         .await
         .expect("fixed inventory command");
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
+    }
+
+    #[tokio::test]
+    async fn numstat_operation_uses_fixed_literal_pathspec_arguments_and_environment() {
+        let (directory, executable) = fixture_executable(
+            "#!/bin/sh\n[ \"$GIT_OPTIONAL_LOCKS\" = 0 ] || exit 10\n[ \"$GIT_LITERAL_PATHSPECS\" = 1 ] || exit 11\n[ \"$1\" = --no-optional-locks ] || exit 12\n[ \"$2\" = --literal-pathspecs ] || exit 13\n[ \"$3\" = -c ] || exit 14\n[ \"$4\" = core.fsmonitor=false ] || exit 15\n[ \"$5\" = -c ] || exit 16\n[ \"$6\" = core.untrackedCache=false ] || exit 17\n[ \"$7\" = -c ] || exit 18\n[ \"$8\" = color.ui=false ] || exit 19\n[ \"$9\" = diff ] || exit 20\n[ \"${10}\" = --numstat ] || exit 21\n[ \"${11}\" = -z ] || exit 22\n[ \"${12}\" = --no-ext-diff ] || exit 23\n[ \"${13}\" = --no-textconv ] || exit 24\n[ \"${14}\" = --no-color ] || exit 25\n[ \"${15}\" = --no-renames ] || exit 26\n[ \"${16}\" = -- ] || exit 27\n[ \"${17}\" = ':(glob)*.txt' ] || exit 28\nprintf '1\\t2\\t:(glob)*.txt\\0'\n",
+        );
+        let output = run_git_with_limits(
+            &executable,
+            directory.path(),
+            [
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "color.ui=false",
+                "diff",
+                "--numstat",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                "--",
+                ":(glob)*.txt",
+            ],
+            GIT_TIMEOUT,
+            MAX_NUMSTAT_STDOUT,
+            MAX_NUMSTAT_STDERR,
+            true,
+            true,
+        )
+        .await
+        .expect("fixed numstat command");
+        assert!(output.status.success());
+        assert_eq!(
+            parse_numstat_z(&output.stdout, ":(glob)*.txt").unwrap(),
+            NumstatClassification::TextEligible(TextEligibleMetadata {
+                additions: 1,
+                deletions: 2,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn numstat_operation_treats_pathspec_looking_fixture_names_as_one_literal_path() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let primary = fixture.path().join("primary");
+        let worktree = fixture.path().join("linked");
+        fs::create_dir(&primary).expect("primary directory");
+        fixture_git(&primary, &["init"]);
+        fixture_git(&primary, &["config", "user.email", "tests@example.invalid"]);
+        fixture_git(&primary, &["config", "user.name", "Tests"]);
+        for name in [
+            ":(glob)*.txt",
+            ":(literal)exact.txt",
+            ":!excluded.txt",
+            ":^excluded.txt",
+            ":/rooted.txt",
+            "*.txt",
+            "file?.txt",
+            "file[1].txt",
+            "-leading.txt",
+            "name with spaces.txt",
+            "ünicode.txt",
+            "newline\nname.txt",
+            "folder\\name.txt",
+        ] {
+            let path = primary.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("fixture parent");
+            }
+            fs::write(path, "before\n").expect("fixture file");
+        }
+        fixture_git(&primary, &["add", "."]);
+        fixture_git(&primary, &["commit", "-m", "fixture"]);
+        let base = resolve_exact_head(&primary).await.expect("base commit");
+        add_detached_worktree(&primary, &worktree, &base)
+            .await
+            .expect("linked worktree");
+        for name in [
+            ":(glob)*.txt",
+            ":(literal)exact.txt",
+            ":!excluded.txt",
+            ":^excluded.txt",
+            ":/rooted.txt",
+            "*.txt",
+            "file?.txt",
+            "file[1].txt",
+            "-leading.txt",
+            "name with spaces.txt",
+            "ünicode.txt",
+            "newline\nname.txt",
+            "folder\\name.txt",
+        ] {
+            let path = worktree.join(name);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("changed fixture parent");
+            }
+            fs::write(path, "after\n").expect("changed fixture file");
+        }
+        fixture_git(&worktree, &["add", "."]);
+        let inventory = inspect_worktree_changes(&worktree)
+            .await
+            .expect("trusted inventory");
+        assert_eq!(inventory.len(), 13);
+        for name in [
+            ":(glob)*.txt",
+            ":(literal)exact.txt",
+            ":!excluded.txt",
+            ":^excluded.txt",
+            ":/rooted.txt",
+            "*.txt",
+            "file?.txt",
+            "file[1].txt",
+            "-leading.txt",
+            "name with spaces.txt",
+            "ünicode.txt",
+            "newline\nname.txt",
+            "folder\\name.txt",
+        ] {
+            let path = inventory
+                .iter()
+                .find(|file| file.path.as_str() == name)
+                .expect("exact inventory path")
+                .path
+                .clone();
+            assert_eq!(
+                inspect_worktree_numstat(&worktree, &path, Some(&base))
+                    .await
+                    .expect("literal numstat"),
+                NumstatClassification::TextEligible(TextEligibleMetadata {
+                    additions: 1,
+                    deletions: 1,
+                })
+            );
+        }
     }
 
     #[tokio::test]

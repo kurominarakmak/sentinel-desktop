@@ -9,9 +9,10 @@ use sentinel_core::{
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
     add_detached_worktree, inspect_repository, inspect_worktree_changes,
-    inspect_worktree_destination_no_follow, remove_detached_worktree, resolve_exact_head,
-    worktree_is_clean, worktree_metadata_lookup, ChangedFile, GitError, RepositoryInspection,
-    RepositoryState, WorktreeDestinationState, WorktreeMetadataLookup,
+    inspect_worktree_destination_no_follow, inspect_worktree_numstat, remove_detached_worktree,
+    resolve_exact_head, worktree_is_clean, worktree_metadata_lookup, ChangedFile, GitError,
+    NumstatClassification, RepositoryInspection, RepositoryMode, RepositoryRelativePath,
+    RepositoryState, TextEligibleMetadata, WorktreeDestinationState, WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,8 @@ struct DesktopState {
     worktree_projects: Arc<tokio::sync::Mutex<HashSet<ProjectId>>>,
     #[cfg(test)]
     reconciliation_test_hooks: Option<ReconciliationTestHooks>,
+    #[cfg(test)]
+    b1_test_hooks: Option<B1TestHooks>,
 }
 #[cfg(test)]
 #[derive(Clone)]
@@ -61,6 +64,12 @@ struct ReconciliationTestHooks {
     fail_leaf_canonicalization: bool,
     failure_reached: Option<Arc<tokio::sync::Notify>>,
     resume_failure: Option<Arc<tokio::sync::Notify>>,
+}
+#[cfg(test)]
+#[derive(Clone)]
+struct B1TestHooks {
+    post_numstat_reached: Arc<tokio::sync::Notify>,
+    resume_post_numstat: Arc<tokio::sync::Notify>,
 }
 #[derive(Clone)]
 struct ProtectedRepository {
@@ -141,6 +150,33 @@ struct WorktreeChangeInventory {
     worktree_id: WorktreeId,
     clean: bool,
     files: Vec<ChangedFile>,
+}
+
+/// Internal Phase 3C-B1 result. It deliberately contains classification
+/// metadata only and is not a bridge DTO.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+struct FileDiffClassification {
+    worktree_id: WorktreeId,
+    path: RepositoryRelativePath,
+    staged: DiffSectionClassification,
+    unstaged: DiffSectionClassification,
+    mode_head: Option<RepositoryMode>,
+    mode_index: Option<RepositoryMode>,
+    mode_worktree: Option<RepositoryMode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiffSectionClassification {
+    NotApplicable,
+    TextEligible(TextEligibleMetadata),
+    Binary,
+    ModeOnly,
+    SymlinkMetadataOnly,
+    SubmoduleMetadataOnly,
+    UntrackedContentDeferred,
+    ConflictContentDeferred,
+    UnsupportedType,
 }
 const RUN_EVENT: &str = "phase2-run-event";
 
@@ -744,6 +780,17 @@ async fn pause_before_reconciliation_failure_transition(state: &DesktopState) {
     }
 }
 
+/// Test-only coordination point for proving that B1's final locked inventory
+/// validation rejects a lifecycle transition made after all numstat commands.
+#[cfg(test)]
+async fn pause_after_b1_numstat(state: &DesktopState) {
+    let Some(hooks) = state.b1_test_hooks.as_ref() else {
+        return;
+    };
+    hooks.post_numstat_reached.notify_one();
+    hooks.resume_post_numstat.notified().await;
+}
+
 fn post_remove_state(
     leaf: Result<ManagedLeafState, SafeError>,
     metadata: Result<WorktreeMetadataLookup, GitError>,
@@ -846,99 +893,353 @@ async fn inspect_worktree_changes_impl(
         })?;
     acquire_project_worktree_lock(state, &initial.project_id).await?;
     let project_id = initial.project_id.clone();
+    let result = inspect_worktree_changes_locked(state, &worktree_id, &project_id).await;
+    release_project_worktree_lock(state, &project_id).await;
+    result
+}
+
+/// The lock-owning callers above and in Phase 3C-B1 share this exact
+/// inventory/ownership orchestration. Keeping it locked avoids recursive
+/// ProjectId acquisition while preserving the Phase 3C-A validation sequence.
+async fn inspect_worktree_changes_locked(
+    state: &DesktopState,
+    worktree_id: &WorktreeId,
+    project_id: &ProjectId,
+) -> Result<WorktreeChangeInventory, SafeError> {
+    let row = state
+        .repository
+        .get_worktree(worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    if row.project_id != *project_id || !inventory_eligible(row.state) {
+        return Err(SafeError {
+            code: "worktree_not_ready",
+            message: "This worktree is not available for inspection.",
+        });
+    }
+    let project = strict_project_for_worktree(state, project_id).await?;
+    let stored = PathBuf::from(&row.path);
+    let leaf = validate_managed_leaf(&state.worktree_root, project_id, &row.id, &stored).map_err(
+        |_| SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        },
+    )?;
+    let inspection = inspect_repository(&leaf).await.map_err(inventory_error)?;
+    if inspection.is_primary
+        || inspection.identity != row.repository_identity
+        || inspection.fingerprint.as_str() != row.repository_fingerprint
+        || inspection.head.as_deref() != Some(row.base_commit.as_str())
+        || !matches!(
+            worktree_metadata_lookup(Path::new(&project.repository_root), &leaf).await,
+            Ok(WorktreeMetadataLookup::Present)
+        )
+    {
+        return Err(SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        });
+    }
+    // Repeat exact no-follow validation immediately before the only
+    // path-following Phase 3C-A Git status operation.
+    let leaf = validate_managed_leaf(&state.worktree_root, project_id, &row.id, &stored).map_err(
+        |_| SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        },
+    )?;
+    let files = inspect_worktree_changes(&leaf)
+        .await
+        .map_err(inventory_error)?;
+    let after_leaf = validate_managed_leaf(&state.worktree_root, project_id, &row.id, &stored)
+        .map_err(|_| SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        })?;
+    let after_inspection = inspect_repository(&after_leaf)
+        .await
+        .map_err(inventory_error)?;
+    if after_inspection.is_primary
+        || after_inspection.identity != row.repository_identity
+        || after_inspection.fingerprint.as_str() != row.repository_fingerprint
+        || after_inspection.head.as_deref() != Some(row.base_commit.as_str())
+        || !matches!(
+            worktree_metadata_lookup(Path::new(&project.repository_root), &after_leaf).await,
+            Ok(WorktreeMetadataLookup::Present)
+        )
+    {
+        return Err(SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        });
+    }
+    let after = state
+        .repository
+        .get_worktree(worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    if after_leaf != leaf
+        || after.project_id != *project_id
+        || after.state != row.state
+        || after.base_commit != row.base_commit
+        || after.repository_identity != row.repository_identity
+        || after.repository_fingerprint != row.repository_fingerprint
+    {
+        return Err(SafeError {
+            code: "recovery_required",
+            message: "The managed worktree changed during inspection.",
+        });
+    }
+    Ok(WorktreeChangeInventory {
+        worktree_id: worktree_id.clone(),
+        clean: files.is_empty(),
+        files,
+    })
+}
+
+fn change_not_found_error() -> SafeError {
+    SafeError {
+        code: "change_not_found",
+        message: "The selected change is no longer available.",
+    }
+}
+
+fn change_stale_error() -> SafeError {
+    SafeError {
+        code: "change_stale",
+        message: "The selected change changed during inspection.",
+    }
+}
+
+fn section_modes(
+    file: &ChangedFile,
+    staged: bool,
+) -> (Option<RepositoryMode>, Option<RepositoryMode>) {
+    if staged {
+        (file.mode_head, file.mode_index)
+    } else {
+        (file.mode_index, file.mode_worktree)
+    }
+}
+
+fn section_has_change(file: &ChangedFile, staged: bool) -> bool {
+    if staged {
+        file.index_change.is_some()
+    } else {
+        file.worktree_change.is_some()
+    }
+}
+
+fn is_regular_or_absent(mode: Option<RepositoryMode>) -> bool {
+    matches!(
+        mode,
+        Some(RepositoryMode::Absent | RepositoryMode::Regular | RepositoryMode::Executable)
+    )
+}
+
+fn classify_without_numstat(file: &ChangedFile, staged: bool) -> Option<DiffSectionClassification> {
+    if file.untracked {
+        return Some(if staged {
+            DiffSectionClassification::NotApplicable
+        } else {
+            DiffSectionClassification::UntrackedContentDeferred
+        });
+    }
+    if file.conflict.is_some() {
+        return Some(DiffSectionClassification::ConflictContentDeferred);
+    }
+    if !section_has_change(file, staged) {
+        return Some(DiffSectionClassification::NotApplicable);
+    }
+    let (before, after) = section_modes(file, staged);
+    if file.submodule.is_some()
+        || matches!(before, Some(RepositoryMode::Gitlink))
+        || matches!(after, Some(RepositoryMode::Gitlink))
+    {
+        return Some(DiffSectionClassification::SubmoduleMetadataOnly);
+    }
+    if matches!(before, Some(RepositoryMode::SymbolicLink))
+        || matches!(after, Some(RepositoryMode::SymbolicLink))
+    {
+        return Some(DiffSectionClassification::SymlinkMetadataOnly);
+    }
+    if !is_regular_or_absent(before) || !is_regular_or_absent(after) {
+        return Some(DiffSectionClassification::UnsupportedType);
+    }
+    None
+}
+
+async fn validated_numstat_context(
+    state: &DesktopState,
+    worktree_id: &WorktreeId,
+    project_id: &ProjectId,
+) -> Result<(ManagedWorktree, PathBuf), SafeError> {
+    let row = state
+        .repository
+        .get_worktree(worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    if row.project_id != *project_id || !inventory_eligible(row.state) {
+        return Err(SafeError {
+            code: "worktree_not_ready",
+            message: "This worktree is not available for inspection.",
+        });
+    }
+    let project = strict_project_for_worktree(state, project_id).await?;
+    let stored = PathBuf::from(&row.path);
+    let leaf = validate_managed_leaf(&state.worktree_root, project_id, &row.id, &stored).map_err(
+        |_| SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        },
+    )?;
+    let inspection = inspect_repository(&leaf).await.map_err(inventory_error)?;
+    if inspection.is_primary
+        || inspection.identity != row.repository_identity
+        || inspection.fingerprint.as_str() != row.repository_fingerprint
+        || inspection.head.as_deref() != Some(row.base_commit.as_str())
+        || !matches!(
+            worktree_metadata_lookup(Path::new(&project.repository_root), &leaf).await,
+            Ok(WorktreeMetadataLookup::Present)
+        )
+    {
+        return Err(SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        });
+    }
+    Ok((row, leaf))
+}
+
+async fn classify_section_locked(
+    state: &DesktopState,
+    worktree_id: &WorktreeId,
+    project_id: &ProjectId,
+    expected_file: &ChangedFile,
+    staged: bool,
+) -> Result<DiffSectionClassification, SafeError> {
+    if let Some(classification) = classify_without_numstat(expected_file, staged) {
+        return Ok(classification);
+    }
+    // Re-run the complete Phase 3C-A orchestration before each path-following
+    // command, then use only its freshly generated path entry.
+    let fresh = inspect_worktree_changes_locked(state, worktree_id, project_id).await?;
+    let fresh_file = fresh
+        .files
+        .iter()
+        .find(|file| file.path == expected_file.path)
+        .ok_or_else(change_stale_error)?;
+    if fresh_file != expected_file {
+        return Err(change_stale_error());
+    }
+    let (row, leaf) = validated_numstat_context(state, worktree_id, project_id).await?;
+    let result = inspect_worktree_numstat(
+        &leaf,
+        &fresh_file.path,
+        if staged {
+            Some(row.base_commit.as_str())
+        } else {
+            None
+        },
+    )
+    .await
+    .map_err(inventory_error)?;
+    match result {
+        NumstatClassification::TextEligible(metadata) => {
+            let (before, after) = section_modes(fresh_file, staged);
+            if metadata.additions == 0
+                && metadata.deletions == 0
+                && matches!(
+                    before,
+                    Some(RepositoryMode::Regular | RepositoryMode::Executable)
+                )
+                && matches!(
+                    after,
+                    Some(RepositoryMode::Regular | RepositoryMode::Executable)
+                )
+                && before != after
+            {
+                Ok(DiffSectionClassification::ModeOnly)
+            } else {
+                Ok(DiffSectionClassification::TextEligible(metadata))
+            }
+        }
+        NumstatClassification::Binary => Ok(DiffSectionClassification::Binary),
+        NumstatClassification::NoChanges => {
+            let (before, after) = section_modes(fresh_file, staged);
+            if matches!(
+                before,
+                Some(RepositoryMode::Regular | RepositoryMode::Executable)
+            ) && matches!(
+                after,
+                Some(RepositoryMode::Regular | RepositoryMode::Executable)
+            ) && before != after
+            {
+                Ok(DiffSectionClassification::ModeOnly)
+            } else {
+                Err(change_stale_error())
+            }
+        }
+    }
+}
+
+/// Internal Phase 3C-B1 orchestration. The candidate is typed but gains
+/// authority only by exact matching against a fresh locked Phase 3C-A result.
+#[allow(dead_code)]
+async fn inspect_worktree_file_diff_classification_impl(
+    state: &DesktopState,
+    worktree_id: WorktreeId,
+    selected_path: RepositoryRelativePath,
+) -> Result<FileDiffClassification, SafeError> {
+    let initial = state
+        .repository
+        .get_worktree(&worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    acquire_project_worktree_lock(state, &initial.project_id).await?;
+    let project_id = initial.project_id.clone();
     let result = async {
-        let row = state
-            .repository
-            .get_worktree(&worktree_id)
-            .await
-            .map_err(|_| SafeError {
-                code: "worktree_not_found",
-                message: "The managed worktree was not found.",
-            })?;
-        if row.project_id != project_id || !inventory_eligible(row.state) {
-            return Err(SafeError {
-                code: "worktree_not_ready",
-                message: "This worktree is not available for inspection.",
-            });
+        let inventory = inspect_worktree_changes_locked(state, &worktree_id, &project_id).await?;
+        let file = inventory
+            .files
+            .iter()
+            .find(|file| file.path == selected_path)
+            .cloned()
+            .ok_or_else(change_not_found_error)?;
+        let staged = classify_section_locked(state, &worktree_id, &project_id, &file, true).await?;
+        let unstaged =
+            classify_section_locked(state, &worktree_id, &project_id, &file, false).await?;
+        #[cfg(test)]
+        pause_after_b1_numstat(state).await;
+        let after = inspect_worktree_changes_locked(state, &worktree_id, &project_id).await?;
+        let after_file = after
+            .files
+            .iter()
+            .find(|candidate| candidate.path == file.path)
+            .ok_or_else(change_stale_error)?;
+        if after_file != &file {
+            return Err(change_stale_error());
         }
-        let project = strict_project_for_worktree(state, &project_id).await?;
-        let stored = PathBuf::from(&row.path);
-        let leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &stored)
-            .map_err(|_| SafeError {
-                code: "ownership_validation_failed",
-                message: "The managed worktree could not be verified.",
-            })?;
-        let inspection = inspect_repository(&leaf).await.map_err(inventory_error)?;
-        if inspection.is_primary
-            || inspection.identity != row.repository_identity
-            || inspection.fingerprint.as_str() != row.repository_fingerprint
-            || inspection.head.as_deref() != Some(row.base_commit.as_str())
-            || !matches!(
-                worktree_metadata_lookup(Path::new(&project.repository_root), &leaf).await,
-                Ok(WorktreeMetadataLookup::Present)
-            )
-        {
-            return Err(SafeError {
-                code: "ownership_validation_failed",
-                message: "The managed worktree could not be verified.",
-            });
-        }
-        // Repeat exact no-follow validation immediately before the only
-        // path-following Phase 3C-A Git status operation.
-        let leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &stored)
-            .map_err(|_| SafeError {
-                code: "ownership_validation_failed",
-                message: "The managed worktree could not be verified.",
-            })?;
-        let files = inspect_worktree_changes(&leaf)
-            .await
-            .map_err(inventory_error)?;
-        let after_leaf = validate_managed_leaf(&state.worktree_root, &project_id, &row.id, &stored)
-            .map_err(|_| SafeError {
-                code: "ownership_validation_failed",
-                message: "The managed worktree could not be verified.",
-            })?;
-        let after_inspection = inspect_repository(&after_leaf)
-            .await
-            .map_err(inventory_error)?;
-        if after_inspection.is_primary
-            || after_inspection.identity != row.repository_identity
-            || after_inspection.fingerprint.as_str() != row.repository_fingerprint
-            || after_inspection.head.as_deref() != Some(row.base_commit.as_str())
-            || !matches!(
-                worktree_metadata_lookup(Path::new(&project.repository_root), &after_leaf).await,
-                Ok(WorktreeMetadataLookup::Present)
-            )
-        {
-            return Err(SafeError {
-                code: "ownership_validation_failed",
-                message: "The managed worktree could not be verified.",
-            });
-        }
-        let after = state
-            .repository
-            .get_worktree(&worktree_id)
-            .await
-            .map_err(|_| SafeError {
-                code: "worktree_not_found",
-                message: "The managed worktree was not found.",
-            })?;
-        if after_leaf != leaf
-            || after.project_id != project_id
-            || after.state != row.state
-            || after.base_commit != row.base_commit
-            || after.repository_identity != row.repository_identity
-            || after.repository_fingerprint != row.repository_fingerprint
-        {
-            return Err(SafeError {
-                code: "recovery_required",
-                message: "The managed worktree changed during inspection.",
-            });
-        }
-        Ok(WorktreeChangeInventory {
+        Ok(FileDiffClassification {
             worktree_id,
-            clean: files.is_empty(),
-            files,
+            path: file.path,
+            staged,
+            unstaged,
+            mode_head: file.mode_head,
+            mode_index: file.mode_index,
+            mode_worktree: file.mode_worktree,
         })
     }
     .await;
@@ -1602,6 +1903,8 @@ fn main() {
                 worktree_projects: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
                 #[cfg(test)]
                 reconciliation_test_hooks: None,
+                #[cfg(test)]
+                b1_test_hooks: None,
             });
             app.global_shortcut()
                 .on_shortcut(DEFAULT_GLOBAL_SHORTCUT, |app, _, event| {
@@ -1906,6 +2209,349 @@ mod bridge_tests {
         }
     }
 
+    #[tokio::test]
+    async fn production_b1_classification_uses_fresh_inventory_and_preserves_both_worktrees() {
+        let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        let primary = fixture.path().join("primary");
+        let marker = fixture.path().join("b1-fsmonitor-marker");
+        let helper = fixture.path().join("b1-fsmonitor-helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf invoked > {}\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+        }
+        std::fs::write(leaf.join("README.md"), "staged managed modification").unwrap();
+        fixture_git(&leaf, &["add", "README.md"]);
+        std::fs::write(leaf.join("README.md"), "unstaged managed modification").unwrap();
+        fixture_git(
+            &primary,
+            &["config", "core.fsmonitor", helper.to_str().unwrap()],
+        );
+        fixture_git(
+            &primary,
+            &["config", "diff.external", helper.to_str().unwrap()],
+        );
+        fixture_git(
+            &primary,
+            &["config", "diff.fixture.command", helper.to_str().unwrap()],
+        );
+        fixture_git(
+            &primary,
+            &["config", "diff.fixture.textconv", helper.to_str().unwrap()],
+        );
+        std::fs::write(leaf.join(".gitattributes"), "README.md diff=fixture\n").unwrap();
+        let managed_before = inventory_snapshot(&leaf, "untracked file").await;
+        let primary_before = inventory_snapshot(&primary, "untracked file").await;
+        let selected_path = inspect_worktree_changes(&leaf)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        assert!(!marker.exists());
+        let classification = inspect_worktree_file_diff_classification_impl(
+            &state,
+            row.id.clone(),
+            selected_path.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(classification.path, selected_path);
+        assert_eq!(
+            classification.staged,
+            DiffSectionClassification::TextEligible(TextEligibleMetadata {
+                additions: 1,
+                deletions: 1,
+            })
+        );
+        assert_eq!(
+            classification.unstaged,
+            DiffSectionClassification::TextEligible(TextEligibleMetadata {
+                additions: 1,
+                deletions: 1,
+            })
+        );
+        assert!(!marker.exists());
+        let managed_after = inventory_snapshot(&leaf, "untracked file").await;
+        let primary_after = inventory_snapshot(&primary, "untracked file").await;
+        assert_eq!(managed_after.head, managed_before.head);
+        assert_eq!(managed_after.branch, managed_before.branch);
+        assert_eq!(managed_after.index, managed_before.index);
+        assert_eq!(managed_after.status, managed_before.status);
+        assert_eq!(managed_after.readme, managed_before.readme);
+        assert_eq!(managed_after.untracked, managed_before.untracked);
+        assert!(!managed_after.index_lock_exists);
+        assert_eq!(primary_after.head, primary_before.head);
+        assert_eq!(primary_after.branch, primary_before.branch);
+        assert_eq!(primary_after.index, primary_before.index);
+        assert_eq!(primary_after.status, primary_before.status);
+        assert_eq!(primary_after.readme, primary_before.readme);
+        assert_eq!(primary_after.untracked, primary_before.untracked);
+        assert!(!primary_after.index_lock_exists);
+        assert_eq!(
+            state.repository.get_worktree(&row.id).await.unwrap().state,
+            ManagedWorktreeState::Ready
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_project_worktree_lock(&state, &row.project_id),
+        )
+        .await
+        .expect("classification must not leak the project lock")
+        .unwrap();
+        release_project_worktree_lock(&state, &row.project_id).await;
+    }
+
+    #[tokio::test]
+    async fn production_b1_rejects_a_lifecycle_transition_after_numstat_before_final_validation() {
+        let test_timeout = std::time::Duration::from_secs(5);
+        let (fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        let primary = fixture.path().join("primary");
+        std::fs::write(leaf.join("README.md"), "staged race fixture").unwrap();
+        fixture_git(&leaf, &["add", "README.md"]);
+        let managed_before = inventory_snapshot(&leaf, "untracked file").await;
+        let primary_before = inventory_snapshot(&primary, "untracked file").await;
+        let selected_path = inspect_worktree_changes(&leaf)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .expect("staged path is inventoried")
+            .path;
+
+        let post_numstat_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_post_numstat = Arc::new(tokio::sync::Notify::new());
+        state.b1_test_hooks = Some(B1TestHooks {
+            post_numstat_reached: post_numstat_reached.clone(),
+            resume_post_numstat: resume_post_numstat.clone(),
+        });
+        let reached = post_numstat_reached.notified();
+        let service_state = state.clone();
+        let worktree_id = row.id.clone();
+        let mut classification = tokio::spawn(async move {
+            inspect_worktree_file_diff_classification_impl(
+                &service_state,
+                worktree_id,
+                selected_path,
+            )
+            .await
+        });
+
+        if tokio::time::timeout(test_timeout, reached).await.is_err() {
+            resume_post_numstat.notify_one();
+            if tokio::time::timeout(test_timeout, &mut classification)
+                .await
+                .is_err()
+            {
+                classification.abort();
+                let _ = classification.await;
+            }
+            panic!("B1 service did not complete numstat before its final validation");
+        }
+
+        // This typed conditional transition intentionally bypasses the in-memory
+        // lock: it models a separately authorised persisted lifecycle change.
+        let transition = state
+            .repository
+            .transition_worktree(
+                &row.id,
+                ManagedWorktreeState::Ready,
+                ManagedWorktreeState::Removing,
+                None,
+            )
+            .await;
+        // Always unblock the state-local hook before asserting transition
+        // success, so a failed test setup cannot leave a detached B1 task.
+        resume_post_numstat.notify_one();
+        let transitioned = match transition {
+            Ok(row) => row,
+            Err(error) => {
+                if tokio::time::timeout(test_timeout, &mut classification)
+                    .await
+                    .is_err()
+                {
+                    classification.abort();
+                    let _ = classification.await;
+                }
+                panic!("typed lifecycle transition failed: {error:?}");
+            }
+        };
+        assert_eq!(transitioned.state, ManagedWorktreeState::Removing);
+
+        let result = match tokio::time::timeout(test_timeout, &mut classification).await {
+            Ok(joined) => joined.expect("B1 task must not panic"),
+            Err(_) => {
+                classification.abort();
+                let _ = classification.await;
+                panic!("B1 service did not resume after the post-numstat pause");
+            }
+        };
+        let error = result.expect_err("a stale classification must not escape");
+        assert_eq!(error.code, "worktree_not_ready");
+        assert_eq!(
+            error.message,
+            "This worktree is not available for inspection."
+        );
+        assert!(!error.message.contains(&row.path));
+        assert!(!error.message.contains(&row.base_commit));
+
+        assert_eq!(
+            state.repository.get_worktree(&row.id).await.unwrap().state,
+            ManagedWorktreeState::Removing
+        );
+        let managed_after = inventory_snapshot(&leaf, "untracked file").await;
+        let primary_after = inventory_snapshot(&primary, "untracked file").await;
+        assert_eq!(managed_after.head, managed_before.head);
+        assert_eq!(managed_after.branch, managed_before.branch);
+        assert_eq!(managed_after.index, managed_before.index);
+        assert_eq!(managed_after.status, managed_before.status);
+        assert_eq!(managed_after.readme, managed_before.readme);
+        assert_eq!(managed_after.untracked, managed_before.untracked);
+        assert!(!managed_after.index_lock_exists);
+        assert_eq!(primary_after.head, primary_before.head);
+        assert_eq!(primary_after.branch, primary_before.branch);
+        assert_eq!(primary_after.index, primary_before.index);
+        assert_eq!(primary_after.status, primary_before.status);
+        assert_eq!(primary_after.readme, primary_before.readme);
+        assert_eq!(primary_after.untracked, primary_before.untracked);
+        assert!(!primary_after.index_lock_exists);
+
+        tokio::time::timeout(
+            test_timeout,
+            acquire_project_worktree_lock(&state, &row.project_id),
+        )
+        .await
+        .expect("stale B1 request must release the original project lock")
+        .unwrap();
+        release_project_worktree_lock(&state, &row.project_id).await;
+    }
+
+    #[test]
+    fn b1_metadata_only_policies_defer_untracked_conflict_symlink_and_gitlink_content() {
+        const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+        let untracked = sentinel_git::parse_status_porcelain_v2_z(b"? untracked\0")
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            classify_without_numstat(&untracked, true),
+            Some(DiffSectionClassification::NotApplicable)
+        );
+        assert_eq!(
+            classify_without_numstat(&untracked, false),
+            Some(DiffSectionClassification::UntrackedContentDeferred)
+        );
+        let conflict = sentinel_git::parse_status_porcelain_v2_z(
+            format!("u UU N... 100644 100644 100644 100644 {OID} {OID} {OID} conflict\0")
+                .as_bytes(),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            classify_without_numstat(&conflict, true),
+            Some(DiffSectionClassification::ConflictContentDeferred)
+        );
+        assert_eq!(
+            classify_without_numstat(&conflict, false),
+            Some(DiffSectionClassification::ConflictContentDeferred)
+        );
+        let symlink = sentinel_git::parse_status_porcelain_v2_z(
+            format!("1 M. N... 120000 120000 120000 {OID} {OID} link\0").as_bytes(),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            classify_without_numstat(&symlink, true),
+            Some(DiffSectionClassification::SymlinkMetadataOnly)
+        );
+        let gitlink = sentinel_git::parse_status_porcelain_v2_z(
+            format!("1 M. SC.. 160000 160000 160000 {OID} {OID} module\0").as_bytes(),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            classify_without_numstat(&gitlink, true),
+            Some(DiffSectionClassification::SubmoduleMetadataOnly)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_b1_service_classifies_binary_mode_symlink_and_untracked_without_content() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        let external_target = fixture.path().join("external-target");
+        std::fs::write(&external_target, "outside managed worktree").unwrap();
+        let mut permissions = std::fs::metadata(leaf.join("README.md"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(leaf.join("README.md"), permissions).unwrap();
+        std::os::unix::fs::symlink(&external_target, leaf.join("managed-link")).unwrap();
+        std::fs::write(leaf.join("binary.bin"), [0_u8, 0x9f, 0x92, 0x96]).unwrap();
+        std::fs::write(leaf.join("untracked.txt"), "deferred").unwrap();
+        fixture_git(&leaf, &["add", "README.md", "managed-link", "binary.bin"]);
+        let inventory = inspect_worktree_changes(&leaf).await.unwrap();
+        for (name, staged, unstaged) in [
+            (
+                "README.md",
+                DiffSectionClassification::ModeOnly,
+                DiffSectionClassification::NotApplicable,
+            ),
+            (
+                "managed-link",
+                DiffSectionClassification::SymlinkMetadataOnly,
+                DiffSectionClassification::NotApplicable,
+            ),
+            (
+                "binary.bin",
+                DiffSectionClassification::Binary,
+                DiffSectionClassification::NotApplicable,
+            ),
+            (
+                "untracked.txt",
+                DiffSectionClassification::NotApplicable,
+                DiffSectionClassification::UntrackedContentDeferred,
+            ),
+        ] {
+            let path = inventory
+                .iter()
+                .find(|file| file.path.as_str() == name)
+                .unwrap()
+                .path
+                .clone();
+            let classification =
+                inspect_worktree_file_diff_classification_impl(&state, row.id.clone(), path)
+                    .await
+                    .unwrap();
+            assert_eq!(classification.staged, staged);
+            assert_eq!(classification.unstaged, unstaged);
+        }
+        assert_eq!(
+            state.repository.get_worktree(&row.id).await.unwrap().state,
+            ManagedWorktreeState::Ready
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            acquire_project_worktree_lock(&state, &row.project_id),
+        )
+        .await
+        .expect("all metadata-only outcomes release the project lock")
+        .unwrap();
+        release_project_worktree_lock(&state, &row.project_id).await;
+    }
+
     #[cfg(unix)]
     #[test]
     fn managed_root_rejects_a_configured_symlink_before_canonicalization() {
@@ -2021,6 +2667,7 @@ mod bridge_tests {
             worktree_root,
             worktree_projects: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             reconciliation_test_hooks: hooks,
+            b1_test_hooks: None,
         }
     }
 
