@@ -282,7 +282,8 @@ async fn canonicalizes_symlinks_and_unicode_paths() {
 }
 
 #[tokio::test]
-async fn detached_worktrees_are_exact_commit_isolated_and_cleanly_removable() {
+async fn detached_worktrees_are_exact_commit_isolated_and_removal_fails_closed_without_cleanliness()
+{
     let primary = repository();
     let root = tempfile::tempdir().expect("trusted worktree root");
     let commit = resolve_exact_head(primary.path())
@@ -320,26 +321,20 @@ async fn detached_worktrees_are_exact_commit_isolated_and_cleanly_removable() {
     assert!(!primary.path().join("only-second.txt").exists());
     assert!(!first.join("primary-untracked.txt").exists());
     assert!(!second.join("primary-untracked.txt").exists());
-    assert!(!worktree_is_clean(&first).await.expect("first status"));
+    assert!(matches!(
+        worktree_is_clean(&first).await,
+        Err(GitError::CleanlinessUnavailable)
+    ));
     assert!(matches!(
         remove_detached_worktree(primary.path(), &first).await,
-        Err(GitError::DirtyWorktree(_))
+        Err(GitError::CleanlinessUnavailable)
     ));
-    std::fs::remove_file(first.join("only-first.txt")).expect("restore first");
-    assert!(worktree_is_clean(&first).await.expect("clean first"));
-    remove_detached_worktree(primary.path(), &first)
-        .await
-        .expect("remove first");
-    std::fs::remove_file(second.join("only-second.txt")).expect("restore second");
-    remove_detached_worktree(primary.path(), &second)
-        .await
-        .expect("remove second");
-    assert!(!first.exists() && !second.exists());
+    assert!(first.exists() && second.exists());
     assert_eq!(
         worktree_metadata_lookup(primary.path(), &first)
             .await
             .expect("removed metadata"),
-        WorktreeMetadataLookup::Absent
+        WorktreeMetadataLookup::Present
     );
     std::fs::remove_file(primary.path().join("primary-untracked.txt")).expect("restore primary");
 }

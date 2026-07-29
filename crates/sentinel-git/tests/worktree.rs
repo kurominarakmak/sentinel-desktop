@@ -31,9 +31,15 @@ fn validates_and_creates_a_separate_worktree() {
     let worktree = create_worktree(repo.path(), root.path()).unwrap();
     assert!(worktree.path.exists());
     assert!(worktree.branch.starts_with("agent-sentinel/spike-"));
-    assert!(changed_files(&worktree.path).unwrap().is_empty());
-    remove_clean_worktree(repo.path(), &worktree).unwrap();
-    assert!(!worktree.path.exists());
+    assert!(matches!(
+        changed_files(&worktree.path),
+        Err(GitError::InventoryUnavailable)
+    ));
+    assert!(matches!(
+        remove_clean_worktree(repo.path(), &worktree),
+        Err(GitError::CleanlinessUnavailable)
+    ));
+    assert!(worktree.path.exists());
 }
 
 #[test]
@@ -44,6 +50,6 @@ fn refuses_to_remove_a_dirty_worktree() {
     fs::write(worktree.path.join("changed.txt"), "uncommitted\n").unwrap();
     assert!(matches!(
         remove_clean_worktree(repo.path(), &worktree),
-        Err(GitError::DirtyWorktree(_))
+        Err(GitError::CleanlinessUnavailable)
     ));
 }

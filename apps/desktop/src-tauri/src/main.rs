@@ -8,11 +8,12 @@ use sentinel_core::{
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
-    add_detached_worktree, inspect_repository, inspect_worktree_changes,
-    inspect_worktree_destination_no_follow, inspect_worktree_numstat, remove_detached_worktree,
-    resolve_exact_head, worktree_is_clean, worktree_metadata_lookup, ChangedFile, GitError,
-    NumstatClassification, RepositoryInspection, RepositoryMode, RepositoryRelativePath,
-    RepositoryState, TextEligibleMetadata, WorktreeDestinationState, WorktreeMetadataLookup,
+    add_detached_worktree, inspect_repository, inspect_worktree_destination_no_follow,
+    inspect_worktree_filter_attribute, inspect_worktree_numstat, remove_detached_worktree,
+    resolve_exact_head, worktree_is_clean, worktree_metadata_lookup, ChangedFile,
+    FilterAttributeState, GitError, NumstatClassification, RepositoryInspection, RepositoryMode,
+    RepositoryRelativePath, RepositoryState, TextEligibleMetadata, WorktreeDestinationState,
+    WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -176,6 +177,7 @@ enum DiffSectionClassification {
     SubmoduleMetadataOnly,
     UntrackedContentDeferred,
     ConflictContentDeferred,
+    ExternalFilterDeferred,
     UnsupportedType,
 }
 const RUN_EVENT: &str = "phase2-run-event";
@@ -226,6 +228,14 @@ fn project_error(error: &GitError) -> SafeError {
         GitError::GitNotAvailable => SafeError {
             code: "git_not_available",
             message: "Git is not available on this device.",
+        },
+        GitError::InventoryUnavailable => SafeError {
+            code: "inventory_unavailable",
+            message: "A filter-free worktree inventory is not available yet.",
+        },
+        GitError::CleanlinessUnavailable => SafeError {
+            code: "worktree_cleanliness_unavailable",
+            message: "The worktree cannot be safely verified for removal.",
         },
         GitError::GitDiscoveryFailed => SafeError {
             code: "git_discovery_failed",
@@ -943,63 +953,12 @@ async fn inspect_worktree_changes_locked(
             message: "The managed worktree could not be verified.",
         });
     }
-    // Repeat exact no-follow validation immediately before the only
-    // path-following Phase 3C-A Git status operation.
-    let leaf = validate_managed_leaf(&state.worktree_root, project_id, &row.id, &stored).map_err(
-        |_| SafeError {
-            code: "ownership_validation_failed",
-            message: "The managed worktree could not be verified.",
-        },
-    )?;
-    let files = inspect_worktree_changes(&leaf)
-        .await
-        .map_err(inventory_error)?;
-    let after_leaf = validate_managed_leaf(&state.worktree_root, project_id, &row.id, &stored)
-        .map_err(|_| SafeError {
-            code: "ownership_validation_failed",
-            message: "The managed worktree could not be verified.",
-        })?;
-    let after_inspection = inspect_repository(&after_leaf)
-        .await
-        .map_err(inventory_error)?;
-    if after_inspection.is_primary
-        || after_inspection.identity != row.repository_identity
-        || after_inspection.fingerprint.as_str() != row.repository_fingerprint
-        || after_inspection.head.as_deref() != Some(row.base_commit.as_str())
-        || !matches!(
-            worktree_metadata_lookup(Path::new(&project.repository_root), &after_leaf).await,
-            Ok(WorktreeMetadataLookup::Present)
-        )
-    {
-        return Err(SafeError {
-            code: "ownership_validation_failed",
-            message: "The managed worktree could not be verified.",
-        });
-    }
-    let after = state
-        .repository
-        .get_worktree(worktree_id)
-        .await
-        .map_err(|_| SafeError {
-            code: "worktree_not_found",
-            message: "The managed worktree was not found.",
-        })?;
-    if after_leaf != leaf
-        || after.project_id != *project_id
-        || after.state != row.state
-        || after.base_commit != row.base_commit
-        || after.repository_identity != row.repository_identity
-        || after.repository_fingerprint != row.repository_fingerprint
-    {
-        return Err(SafeError {
-            code: "recovery_required",
-            message: "The managed worktree changed during inspection.",
-        });
-    }
-    Ok(WorktreeChangeInventory {
-        worktree_id: worktree_id.clone(),
-        clean: files.is_empty(),
-        files,
+    // AH1 deliberately stops here. Stock Git status can execute repository
+    // clean/process filters; a check-attr preflight cannot close that race.
+    // AH2 will replace this with a complete filter-free pipeline.
+    Err(SafeError {
+        code: "inventory_unavailable",
+        message: "A filter-free worktree inventory is not available yet.",
     })
 }
 
@@ -1141,6 +1100,20 @@ async fn classify_section_locked(
     if fresh_file != expected_file {
         return Err(change_stale_error());
     }
+    let (_row, leaf) = validated_numstat_context(state, worktree_id, project_id).await?;
+    let filter_state = if staged {
+        None
+    } else {
+        let attribute_state = inspect_worktree_filter_attribute(&leaf, &fresh_file.path)
+            .await
+            .map_err(inventory_error)?;
+        if attribute_state == FilterAttributeState::Deferred {
+            return Ok(DiffSectionClassification::ExternalFilterDeferred);
+        }
+        Some(attribute_state)
+    };
+    // Repeat exact managed-leaf/identity validation immediately before the
+    // path-following numstat command after attribute inspection.
     let (row, leaf) = validated_numstat_context(state, worktree_id, project_id).await?;
     let result = inspect_worktree_numstat(
         &leaf,
@@ -1153,6 +1126,14 @@ async fn classify_section_locked(
     )
     .await
     .map_err(inventory_error)?;
+    if let Some(filter_state) = filter_state {
+        let after_filter = inspect_worktree_filter_attribute(&leaf, &fresh_file.path)
+            .await
+            .map_err(inventory_error)?;
+        if after_filter != filter_state {
+            return Err(change_stale_error());
+        }
+    }
     match result {
         NumstatClassification::TextEligible(metadata) => {
             let (before, after) = section_modes(fresh_file, staged);
@@ -1430,10 +1411,24 @@ async fn remove_project_worktree(
         // Validate before each path-following operation and again immediately
         // before the mutating Git invocation.
         let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)?;
-        if !worktree_is_clean(&leaf)
-            .await
-            .map_err(|error| project_error(&error))?
-        {
+        let clean = match worktree_is_clean(&leaf).await {
+            Ok(clean) => clean,
+            Err(GitError::CleanlinessUnavailable) => {
+                return state
+                    .repository
+                    .transition_worktree(
+                        &row.id,
+                        ManagedWorktreeState::Removing,
+                        ManagedWorktreeState::RetainedDirty,
+                        Some("worktree_cleanliness_unavailable"),
+                    )
+                    .await
+                    .map(worktree_dto)
+                    .map_err(worktree_error);
+            }
+            Err(error) => return Err(project_error(&error)),
+        };
+        if !clean {
             return state
                 .repository
                 .transition_worktree(
@@ -1966,8 +1961,9 @@ mod bridge_tests {
         CoreError, ProjectId, ProjectRegistration, ProjectValidationState, RunStatus, SafeRunError,
     };
     use sentinel_git::RepositoryFingerprint;
+    use sentinel_git::{inspect_staged_index_changes, parse_status_porcelain_v2_z};
     use serde_json::json;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use tempfile::tempdir;
 
     fn fixture_git(directory: &Path, args: &[&str]) {
@@ -2004,6 +2000,137 @@ mod bridge_tests {
         std::fs::read(fixture_git_path(directory, "index")).unwrap()
     }
 
+    #[cfg(unix)]
+    struct StagedFilterFixture {
+        _temporary_root: tempfile::TempDir,
+        primary: PathBuf,
+        managed: PathBuf,
+        base_commit: String,
+        managed_index: PathBuf,
+        managed_index_lock: PathBuf,
+    }
+
+    /// Builds a linked-worktree index fixture whose filter driver is deliberately
+    /// configured only after all content-sensitive setup has completed.
+    #[cfg(unix)]
+    fn staged_filter_fixture() -> StagedFilterFixture {
+        let temporary_root = tempdir().unwrap();
+        let primary = temporary_root.path().join("primary");
+        let managed = temporary_root.path().join("managed");
+        std::fs::create_dir(&primary).unwrap();
+        fixture_git(&primary, &["init"]);
+        fixture_git(&primary, &["config", "user.email", "tests@example.invalid"]);
+        fixture_git(&primary, &["config", "user.name", "Tests"]);
+        std::fs::write(
+            primary.join(".gitattributes"),
+            "file.txt filter=sentinel-marker\n",
+        )
+        .unwrap();
+        std::fs::write(primary.join("file.txt"), "before\n").unwrap();
+        fixture_git(&primary, &["add", ".gitattributes", "file.txt"]);
+        fixture_git(&primary, &["commit", "-m", "filter fixture"]);
+        fixture_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                managed.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let base_commit = String::from_utf8(fixture_git_output(&managed, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let managed_index = fixture_git_path(&managed, "index");
+        let managed_index_lock = fixture_git_path(&managed, "index.lock");
+
+        // This is intentionally the last content-sensitive setup operation.
+        std::fs::write(managed.join("file.txt"), "after\n").unwrap();
+        fixture_git(&managed, &["add", "file.txt"]);
+
+        StagedFilterFixture {
+            _temporary_root: temporary_root,
+            primary,
+            managed,
+            base_commit,
+            managed_index,
+            managed_index_lock,
+        }
+    }
+
+    #[cfg(unix)]
+    fn install_filter_marker(fixture: &StagedFilterFixture, kind: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = fixture
+            .primary
+            .parent()
+            .unwrap()
+            .join(format!("{kind}-target-marker"));
+        let helper = fixture
+            .primary
+            .parent()
+            .unwrap()
+            .join(format!("{kind}-target-helper"));
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf launched > {}\ncat\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        fixture_git(
+            &fixture.primary,
+            &[
+                "config",
+                &format!("filter.sentinel-marker.{kind}"),
+                helper.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !marker.exists(),
+            "the unique target marker must not exist before the target command"
+        );
+        (marker, helper)
+    }
+
+    #[cfg(unix)]
+    fn direct_staged_diff_index(fixture: &StagedFilterFixture) -> std::process::Output {
+        Command::new("/usr/bin/git")
+            .args([
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "diff-index",
+                "--cached",
+                "--raw",
+                "-z",
+                "--no-renames",
+                fixture.base_commit.as_str(),
+                "--",
+            ])
+            .current_dir(&fixture.managed)
+            .env_clear()
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "never")
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    }
+
     fn fixture_readonly_status(directory: &Path) -> Vec<u8> {
         fixture_git_output(
             directory,
@@ -2021,6 +2148,12 @@ mod bridge_tests {
                 "--no-renames",
             ],
         )
+    }
+
+    /// Test-only legacy control. AH1 production code must never invoke this
+    /// stock-status command because it can execute repository filters.
+    fn legacy_unsafe_status_control(directory: &Path) -> Vec<ChangedFile> {
+        parse_status_porcelain_v2_z(&fixture_readonly_status(directory)).unwrap()
     }
 
     struct InventorySnapshot {
@@ -2173,14 +2306,10 @@ mod bridge_tests {
             let managed_before = inventory_snapshot(&leaf, "untracked file").await;
             let primary_before = inventory_snapshot(&primary, "untracked file").await;
             assert!(!marker.exists());
-            let inventory = inspect_worktree_changes_impl(&state, row.id.clone())
+            let error = inspect_worktree_changes_impl(&state, row.id.clone())
                 .await
-                .unwrap();
-            assert_eq!(inventory.worktree_id, row.id);
-            assert!(!inventory.clean);
-            assert_eq!(inventory.files.len(), 2);
-            assert_eq!(inventory.files[0].path.as_str(), "README.md");
-            assert_eq!(inventory.files[1].path.as_str(), "untracked file");
+                .unwrap_err();
+            assert_eq!(error.code, "inventory_unavailable");
             assert!(!marker.exists());
             let managed_after = inventory_snapshot(&leaf, "untracked file").await;
             let primary_after = inventory_snapshot(&primary, "untracked file").await;
@@ -2210,6 +2339,7 @@ mod bridge_tests {
     }
 
     #[tokio::test]
+    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_classification_uses_fresh_inventory_and_preserves_both_worktrees() {
         let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
         let leaf = PathBuf::from(&row.path);
@@ -2250,9 +2380,7 @@ mod bridge_tests {
         std::fs::write(leaf.join(".gitattributes"), "README.md diff=fixture\n").unwrap();
         let managed_before = inventory_snapshot(&leaf, "untracked file").await;
         let primary_before = inventory_snapshot(&primary, "untracked file").await;
-        let selected_path = inspect_worktree_changes(&leaf)
-            .await
-            .unwrap()
+        let selected_path = legacy_unsafe_status_control(&leaf)
             .into_iter()
             .find(|file| file.path.as_str() == "README.md")
             .unwrap()
@@ -2311,7 +2439,378 @@ mod bridge_tests {
         release_project_worktree_lock(&state, &row.project_id).await;
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn disposable_control_confirms_unprotected_unstaged_diff_executes_a_clean_filter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempdir().unwrap();
+        let repository = fixture.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        fixture_git(&repository, &["init"]);
+        fixture_git(
+            &repository,
+            &["config", "user.email", "tests@example.invalid"],
+        );
+        fixture_git(&repository, &["config", "user.name", "Tests"]);
+        std::fs::write(repository.join("file.txt"), "before\n").unwrap();
+        std::fs::write(
+            repository.join(".gitattributes"),
+            "file.txt filter=sentinel-marker\n",
+        )
+        .unwrap();
+        fixture_git(&repository, &["add", "file.txt", ".gitattributes"]);
+        fixture_git(&repository, &["commit", "-m", "fixture"]);
+        let marker = fixture.path().join("clean-filter-marker");
+        let helper = fixture.path().join("clean-filter-helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf invoked > {}\ncat\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        std::fs::write(repository.join("file.txt"), "after\n").unwrap();
+        // Install the driver only after all content-sensitive fixture setup.
+        // The following legacy diff control is therefore solely responsible
+        // for any target-marker creation.
+        fixture_git(
+            &repository,
+            &[
+                "config",
+                "filter.sentinel-marker.clean",
+                helper.to_str().unwrap(),
+            ],
+        );
+        assert!(!marker.exists());
+        let _ = fixture_git_output(&repository, &["diff", "--numstat", "--", "file.txt"]);
+        assert!(
+            marker.exists(),
+            "control demonstrates Git clean-filter execution"
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
+    async fn production_b1_defers_clean_and_process_filters_without_launching_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (kind, config_key) in [
+            ("clean", "filter.sentinel-marker.clean"),
+            ("process", "filter.sentinel-marker.process"),
+        ] {
+            let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+            let leaf = PathBuf::from(&row.path);
+            let primary = fixture.path().join("primary");
+            let marker = fixture.path().join(format!("{kind}-filter-marker"));
+            let helper = fixture.path().join(format!("{kind}-filter-helper"));
+            std::fs::write(
+                &helper,
+                format!("#!/bin/sh\nprintf invoked > {}\ncat\n", marker.display()),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+            std::fs::write(
+                leaf.join(".gitattributes"),
+                "README.md filter=sentinel-marker\n",
+            )
+            .unwrap();
+            fixture_git(&leaf, &["add", ".gitattributes"]);
+            fixture_git(&primary, &["config", config_key, helper.to_str().unwrap()]);
+            std::fs::write(leaf.join("README.md"), format!("{kind} filtered change")).unwrap();
+            let managed_before = inventory_snapshot(&leaf, "untracked file").await;
+            let primary_before = inventory_snapshot(&primary, "untracked file").await;
+            let selected_path = legacy_unsafe_status_control(&leaf)
+                .into_iter()
+                .find(|file| file.path.as_str() == "README.md")
+                .unwrap()
+                .path;
+            // Phase 3C-A status must not enter the filter conversion boundary.
+            assert!(!marker.exists());
+            let classification = inspect_worktree_file_diff_classification_impl(
+                &state,
+                row.id.clone(),
+                selected_path,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                classification.staged,
+                DiffSectionClassification::NotApplicable
+            );
+            assert_eq!(
+                classification.unstaged,
+                DiffSectionClassification::ExternalFilterDeferred
+            );
+            assert!(!marker.exists(), "{kind} helper must not be launched");
+            let managed_after = inventory_snapshot(&leaf, "untracked file").await;
+            let primary_after = inventory_snapshot(&primary, "untracked file").await;
+            assert_eq!(managed_after.head, managed_before.head);
+            assert_eq!(managed_after.branch, managed_before.branch);
+            assert_eq!(managed_after.index, managed_before.index);
+            assert_eq!(managed_after.status, managed_before.status);
+            assert_eq!(managed_after.readme, managed_before.readme);
+            assert_eq!(primary_after.head, primary_before.head);
+            assert_eq!(primary_after.branch, primary_before.branch);
+            assert_eq!(primary_after.index, primary_before.index);
+            assert_eq!(primary_after.status, primary_before.status);
+            assert!(!managed_after.index_lock_exists);
+            assert!(!primary_after.index_lock_exists);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                acquire_project_worktree_lock(&state, &row.project_id),
+            )
+            .await
+            .expect("deferred filter request must release the project lock")
+            .unwrap();
+            release_project_worktree_lock(&state, &row.project_id).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_status_control_confirms_clean_filter_execution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, _state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        let primary = fixture.path().join("primary");
+        let marker = fixture.path().join("staged-filter-marker");
+        let helper = fixture.path().join("staged-filter-helper");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\nprintf invoked > {}\ncat\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        std::fs::write(
+            leaf.join(".gitattributes"),
+            "README.md filter=sentinel-marker\n",
+        )
+        .unwrap();
+        fixture_git(&leaf, &["add", ".gitattributes"]);
+        std::fs::write(leaf.join("README.md"), "staged filtered change").unwrap();
+        fixture_git(&leaf, &["add", "README.md"]);
+        fixture_git(
+            &primary,
+            &[
+                "config",
+                "filter.sentinel-marker.clean",
+                helper.to_str().unwrap(),
+            ],
+        );
+        let _path = legacy_unsafe_status_control(&leaf)
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        assert!(
+            marker.exists(),
+            "legacy stock status launches a clean filter"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_status_control_confirms_process_filter_launchability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempdir().unwrap();
+        let repository = fixture.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        fixture_git(&repository, &["init"]);
+        fixture_git(
+            &repository,
+            &["config", "user.email", "tests@example.invalid"],
+        );
+        fixture_git(&repository, &["config", "user.name", "Tests"]);
+        std::fs::write(repository.join("file.txt"), "before\n").unwrap();
+        std::fs::write(
+            repository.join(".gitattributes"),
+            "file.txt filter=sentinel-process-marker\n",
+        )
+        .unwrap();
+        fixture_git(&repository, &["add", "file.txt", ".gitattributes"]);
+        fixture_git(&repository, &["commit", "-m", "fixture"]);
+        let marker = fixture.path().join("process-filter-marker");
+        let helper = fixture.path().join("process-filter-helper");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf launched > {}\nexit 1\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        std::fs::write(repository.join("file.txt"), "after\n").unwrap();
+        fixture_git(&repository, &["add", "file.txt"]);
+        fixture_git(
+            &repository,
+            &[
+                "config",
+                "filter.sentinel-process-marker.process",
+                helper.to_str().unwrap(),
+            ],
+        );
+        let _ = Command::new("/usr/bin/git")
+            .args([
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+                "--no-renames",
+            ])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "legacy stock status reaches the configured process helper"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_diff_index_filter_markers_are_attributable_to_the_exact_target() {
+        for kind in ["clean", "process"] {
+            let fixture = staged_filter_fixture();
+            let before_index = std::fs::read(&fixture.managed_index).unwrap();
+            let before_head = fixture_git_output(&fixture.managed, &["rev-parse", "HEAD"]);
+            let (marker, _helper) = install_filter_marker(&fixture, kind);
+
+            let direct = direct_staged_diff_index(&fixture);
+            assert!(
+                direct.status.success(),
+                "direct {kind} control must succeed"
+            );
+            assert!(
+                !direct.stdout.is_empty(),
+                "direct {kind} control must report the staged modification"
+            );
+            assert!(
+                !marker.exists(),
+                "the direct diff-index control must not launch the {kind} filter"
+            );
+            assert_eq!(before_index, std::fs::read(&fixture.managed_index).unwrap());
+            assert_eq!(
+                before_head,
+                fixture_git_output(&fixture.managed, &["rev-parse", "HEAD"])
+            );
+            assert!(!fixture.managed_index_lock.exists());
+        }
+
+        for kind in ["clean", "process"] {
+            let fixture = staged_filter_fixture();
+            let before_index = std::fs::read(&fixture.managed_index).unwrap();
+            let before_head = fixture_git_output(&fixture.managed, &["rev-parse", "HEAD"]);
+            let (marker, _helper) = install_filter_marker(&fixture, kind);
+
+            let changes = inspect_staged_index_changes(&fixture.managed, &fixture.base_commit)
+                .await
+                .expect("filter-free staged metadata");
+            assert!(changes
+                .iter()
+                .any(|change| change.path.as_str() == "file.txt"));
+            assert!(
+                !marker.exists(),
+                "the sentinel-git diff-index operation must not launch the {kind} filter"
+            );
+            assert_eq!(before_index, std::fs::read(&fixture.managed_index).unwrap());
+            assert_eq!(
+                before_head,
+                fixture_git_output(&fixture.managed, &["rev-parse", "HEAD"])
+            );
+            assert!(!fixture.managed_index_lock.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn production_inventory_unavailable_path_does_not_launch_filter_markers() {
+        for kind in ["clean", "process"] {
+            let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+            let leaf = PathBuf::from(&row.path);
+            let primary = fixture.path().join("primary");
+            let marker = fixture.path().join(format!("inventory-{kind}-marker"));
+            let helper = fixture.path().join(format!("inventory-{kind}-helper"));
+            std::fs::write(
+                &helper,
+                format!("#!/bin/sh\nprintf launched > {}\ncat\n", marker.display()),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&helper, permissions).unwrap();
+
+            // Complete all content-sensitive fixture work before installing the
+            // driver. The production request below must be the first operation
+            // allowed to observe the configured filter.
+            std::fs::write(
+                leaf.join(".gitattributes"),
+                "README.md filter=sentinel-marker\n",
+            )
+            .unwrap();
+            std::fs::write(leaf.join("README.md"), "staged inventory fixture\n").unwrap();
+            fixture_git(&leaf, &["add", ".gitattributes", "README.md"]);
+            let managed_index_before = fixture_index_bytes(&leaf);
+            let primary_index_before = fixture_index_bytes(&primary);
+            let managed_head_before = fixture_git_output(&leaf, &["rev-parse", "HEAD"]);
+            let primary_head_before = fixture_git_output(&primary, &["rev-parse", "HEAD"]);
+            fixture_git(
+                &primary,
+                &[
+                    "config",
+                    &format!("filter.sentinel-marker.{kind}"),
+                    helper.to_str().unwrap(),
+                ],
+            );
+            assert!(!marker.exists());
+
+            let error = inspect_worktree_changes_impl(&state, row.id.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "inventory_unavailable");
+            assert!(
+                !marker.exists(),
+                "the production unavailable inventory path must not launch the {kind} filter"
+            );
+            assert_eq!(managed_index_before, fixture_index_bytes(&leaf));
+            assert_eq!(primary_index_before, fixture_index_bytes(&primary));
+            assert_eq!(
+                managed_head_before,
+                fixture_git_output(&leaf, &["rev-parse", "HEAD"])
+            );
+            assert_eq!(
+                primary_head_before,
+                fixture_git_output(&primary, &["rev-parse", "HEAD"])
+            );
+            assert!(!fixture_git_path(&leaf, "index.lock").exists());
+            assert!(!fixture_git_path(&primary, "index.lock").exists());
+            acquire_project_worktree_lock(&state, &row.project_id)
+                .await
+                .unwrap();
+            release_project_worktree_lock(&state, &row.project_id).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_rejects_a_lifecycle_transition_after_numstat_before_final_validation() {
         let test_timeout = std::time::Duration::from_secs(5);
         let (fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
@@ -2321,9 +2820,7 @@ mod bridge_tests {
         fixture_git(&leaf, &["add", "README.md"]);
         let managed_before = inventory_snapshot(&leaf, "untracked file").await;
         let primary_before = inventory_snapshot(&primary, "untracked file").await;
-        let selected_path = inspect_worktree_changes(&leaf)
-            .await
-            .unwrap()
+        let selected_path = legacy_unsafe_status_control(&leaf)
             .into_iter()
             .find(|file| file.path.as_str() == "README.md")
             .expect("staged path is inventoried")
@@ -2486,6 +2983,7 @@ mod bridge_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_service_classifies_binary_mode_symlink_and_untracked_without_content() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2502,7 +3000,7 @@ mod bridge_tests {
         std::fs::write(leaf.join("binary.bin"), [0_u8, 0x9f, 0x92, 0x96]).unwrap();
         std::fs::write(leaf.join("untracked.txt"), "deferred").unwrap();
         fixture_git(&leaf, &["add", "README.md", "managed-link", "binary.bin"]);
-        let inventory = inspect_worktree_changes(&leaf).await.unwrap();
+        let inventory = legacy_unsafe_status_control(&leaf);
         for (name, staged, unstaged) in [
             (
                 "README.md",

@@ -1,36 +1,86 @@
 # Phase 3C-A — Trusted Read-Only Change Inventory
 
-Phase 3C-A adds on-demand, read-only inventory for a verified Sentinel-managed
-worktree. It uses a fixed `git --no-optional-locks -c core.fsmonitor=false -c
-core.untrackedCache=false status --porcelain=v2 -z --untracked-files=all
---ignore-submodules=none --no-renames` operation through the trusted Git
-runner. The runner also sets `GIT_OPTIONAL_LOCKS=0`, clears its environment,
-uses null stdin, disables prompts and pagers, bounds streams, times out, kills,
-and reaps children.
+Phase 3C-A is reopened. The former stock `git status --porcelain=v2` inventory
+and Phase 3B stock-status cleanliness check are not production-reachable: a
+repository-configured clean or process filter can execute while Git compares a
+working-tree file. `--no-optional-locks`, fsmonitor suppression, a clean child
+environment, and bounded execution do not prevent that code execution.
 
-The inventory is complete-or-error: 256 KiB stdout, 16 KiB stderr, 1,000
-records, and 4 KiB valid UTF-8 repository-relative paths are maximums. No
-partial inventory is returned. Porcelain-v2 records `1`, `u`, and `?` are
-strictly parsed; rename/copy (`2`), ignored (`!`), headers, malformed data,
-invalid UTF-8, and path aliases fail closed. Rename detection is disabled;
-staged and unstaged changes remain distinct, untracked contents are not read,
-binary contents are not classified or returned, and submodules are represented
-only by bounded status metadata without recursive inspection.
+AH1 fails inventory and cleanliness decisions closed with fixed unavailable
+errors after the existing ownership/lifecycle validation. It never represents
+that condition as an empty or clean inventory, and B1 is blocked because it
+requires a complete inventory. The retained stock-status invocation is a
+test-only disposable regression control. AH1 also introduces non-authoritative
+base-to-index `diff-index --cached --raw -z --no-renames` plumbing; it is not a
+complete inventory and makes no unstaged or clean claim. Marker tests are
+required before any new command becomes production-reachable.
 
-Repository-relative paths reject every leading-backslash spelling on every
-platform, including Windows rooted, UNC, device, and verbatim forms. Internal,
-non-leading backslashes remain ordinary filename bytes under the documented
-Unix-safe policy. An ordinary `1` record with `XY == ".."` is malformed: the
-only valid clean inventory is completely empty status output.
+A corrected disposable forensic fixture stages the base-to-index change before
+installing a unique clean or process driver, then invokes only the exact
+`diff-index` command. On the tested Unix/macOS target, both the direct fixed
+command and the sentinel-git wrapper leave those markers absent. The earlier
+staged-foundation marker failure was fixture contamination: its read-only
+snapshot invoked the retained test-only stock-status control after filter
+configuration. The AH1 desktop inventory path does not invoke the staged
+foundation; it stops at `inventory_unavailable`. This evidence keeps the
+staged foundation non-authoritative and does not restore complete inventory.
 
-Inspection accepts no frontend path or Git configuration. It reuses Phase 3B
-backend-owned exact leaf validation, project identity/fingerprint verification,
-linked/non-primary protection, exact worktree metadata checks, and the
-per-project operation lock. Only `ready` and `retained_dirty` rows are eligible;
-the leaf and row are revalidated after status before returning an inventory.
-Absolute paths, raw Git output, executable paths, fingerprints, and repository
-metadata never enter the future bridge shape. Inventories are not persisted and
-there is no Tauri command or React control in this batch.
+The generic trusted-runner audit uses a disposable direct helper and a
+fixture-local, test-only `FixtureProcessSupervisor`. Before any descendant can
+launch, the helper becomes leader of a dedicated process group, reports a
+strict, bounded FIFO GroupReady frame, and blocks at a launch gate. The
+supervisor binds that event to the actual trusted test-runner `Child::id()`
+before arming its PGID. The disposable descendant is itself an owned test
+`Child`; its `Child::id()` is the sole source for `DescendantLaunched`, so a
+different live PID in the same group is rejected. The supervisor verifies that
+PID is live, distinct, and in the armed group with `getpgid`. It observes zero
+launches before release and exactly one launch after release. The deterministic
+SIGTERM-ignoring fixture emits `TermIgnoreReady` only after that owned child
+successfully installs `SIG_IGN`; fallback evidence requires ordered SIGTERM,
+a bounded Alive group probe, SIGKILL, and final ESRCH absence. Group SIGTERM
+and SIGKILL remain its only emergency cleanup authority. Only ESRCH proves group absence; EPERM
+and unexpected syscall errors retain cleanup failure and armed ownership. PID
+files, manifests, and ready markers are fallible protocol-under-test data;
+their absence, malformation, or duplication cannot determine cleanup. The
+post-gate broken publication regression proves the group is still cleaned and
+the same runner handle terminally joined. Successful group cleanup disarms the
+PGID before the Drop-only fallback. On tested macOS/aarch64, the production runner still kills
+and waits for its direct child while a descendant remains alive immediately
+afterward; the supervisor's process group is test containment only and is not a
+production runner change. Diagnostic join deadlines retain the same handle
+across multiple barrier releases; cleanup runs before the controlled terminal
+cancellation join.
+Timeout and stdout/stderr overflow converge on the same direct-child
+`start_kill` plus `wait` code path. No process group is created and no
+descendant containment is claimed. This is a separate generic-runner hardening
+issue, not an AH1 blocker: the AH1 production boundary prevents
+repository-controlled clean/process helpers from launching in the first place.
+
+During AH1, production does not run porcelain status and does not return a
+`WorktreeChangeInventory`, an empty inventory, or `clean=true`. It first
+performs the established backend-owned leaf, project identity/fingerprint,
+linked/non-primary ownership, exact worktree metadata, lifecycle, and
+per-project-lock validation, then returns fixed `InventoryUnavailable`. No
+changed path is silently omitted as clean, and B1 cannot select a path or run
+classification while this prerequisite is unavailable.
+
+The former porcelain-v2 parser and its complete-or-error record contract remain
+only as retired parser/test-control reference. They must not be read as a
+current production inventory claim. AH2 must replace them with a complete
+filter-free pipeline before ordinary staged, unstaged, untracked, conflict, or
+clean outcomes can be returned again. The AH1 staged `diff-index` foundation
+is bounded and strict, but it is base-to-index metadata only: it cannot imply
+complete worktree cleanliness, absence of unstaged changes, or absence of
+untracked files.
+
+Repository-relative path validation, including rejection of every
+leading-backslash Windows-rooted, UNC, device, and verbatim spelling, remains
+part of the retained parser/reference and future safe-inventory contract.
+Internal, non-leading backslashes remain ordinary filename bytes under the
+documented Unix-safe policy. Absolute paths, raw Git output, executable paths,
+fingerprints, and repository metadata never enter the future bridge shape.
+Inventories are not persisted and there is no Tauri command or React control in
+this batch.
 
 Disposable integration fixtures exercise the actual trusted operation through
 the desktop service and prove managed and primary index bytes, HEAD/branch,
@@ -47,8 +97,20 @@ remain target-gated; Linux strong-fingerprint registration remains fail-closed.
 The documented same-user filesystem TOCTOU boundary remains; descriptor-relative
 atomic protection is not claimed.
 
-Phase 3C-A is complete. Final aarch64-apple-darwin evidence is 124 passing
-Rust tests, 92 passing frontend tests, `cargo fmt --all --check`, workspace
-Clippy with warnings denied, the frontend production build, and the Tauri
-no-bundle build. Focused reviews found no remaining P1/P2 issues. Windows-native
-path and reparse validation remains target-gated and was not run locally.
+Phase 3C-AH2 must supply the complete filter-free pipeline before inventory is
+available again. A same-user filesystem TOCTOU boundary remains documented;
+preflight plus status is explicitly rejected and descriptor-relative atomic
+protection is not claimed. Windows-native path/reparse validation remains
+target-gated and Linux strong-fingerprint registration remains fail-closed.
+
+## AH1 freeze and test-harness scope
+
+AH1 freezes only the production fail-closed boundary. Its Unix fixture
+supervisor, FIFO observations, process-group cleanup, descendant identity
+checks, and SIGTERM/SIGKILL fallback evidence are test-only proof machinery;
+they neither add production containment nor change the trusted runner's
+direct-child-only termination contract. Further test-proof strengthening is
+non-blocking unless it changes the final Phase 3C-A production conclusion, and
+is deferred to the holistic Phase 3C-A review. AH2 does not depend on
+repository-controlled helper execution: AH1 prevents that execution while the
+complete inventory is unavailable.

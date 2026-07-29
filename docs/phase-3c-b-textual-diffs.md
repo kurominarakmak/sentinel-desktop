@@ -1,6 +1,8 @@
 # Phase 3C-B1 — Trusted Per-File Diff Classification
 
-Phase 3C-B1 is an internal, read-only classification step for exactly one
+Phase 3C-B1 is reopened and blocked by the Phase 3C-A filter-free inventory
+prerequisite. It will remain unavailable until AH2 provides a complete safe
+inventory. Phase 3C-B1 is an internal, read-only classification step for exactly one
 repository-relative path in a verified Sentinel-managed worktree. It does not
 return a textual patch or any file content. Phase 3C-B2 remains responsible for
 any future bounded textual extraction.
@@ -67,7 +69,10 @@ fingerprint registration remains fail-closed. The documented same-user
 filesystem TOCTOU boundary remains, and descriptor-relative atomic protection
 is not claimed.
 
-Phase 3C-B remains in progress. Phase 3C-B1 is complete: on
+Phase 3C-B remains in progress. The prior B1 commit remains in history but is
+not currently available: stock-status inventory can execute repository filters.
+Phase 3C-B1H is deferred pending AH2. Previously recorded evidence was for the
+now-retired prerequisite and does not close this execution boundary. On
 aarch64-apple-darwin, 132 Rust tests and 92 frontend tests passed, along with
 `cargo fmt --all --check`, workspace Clippy with warnings denied, the frontend
 production build, and the Tauri no-bundle build. Focused reviews found no
