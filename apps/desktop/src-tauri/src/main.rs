@@ -8,12 +8,12 @@ use sentinel_core::{
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
-    add_detached_worktree, inspect_repository, inspect_worktree_destination_no_follow,
-    inspect_worktree_filter_attribute, inspect_worktree_numstat, remove_detached_worktree,
-    resolve_exact_head, worktree_is_clean, worktree_metadata_lookup, ChangedFile,
-    FilterAttributeState, GitError, NumstatClassification, RepositoryInspection, RepositoryMode,
-    RepositoryRelativePath, RepositoryState, TextEligibleMetadata, WorktreeDestinationState,
-    WorktreeMetadataLookup,
+    add_detached_worktree, inspect_repository, inspect_worktree_changes_at_base,
+    inspect_worktree_destination_no_follow, inspect_worktree_filter_attribute,
+    inspect_worktree_numstat, resolve_exact_head, with_inventory_operation_deadline,
+    worktree_metadata_lookup, ChangedFile, FilterAttributeState, GitError, NumstatClassification,
+    RepositoryInspection, RepositoryMode, RepositoryRelativePath, RepositoryState,
+    TextEligibleMetadata, WorktreeDestinationState, WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -801,6 +801,7 @@ async fn pause_after_b1_numstat(state: &DesktopState) {
     hooks.resume_post_numstat.notified().await;
 }
 
+#[cfg(test)]
 fn post_remove_state(
     leaf: Result<ManagedLeafState, SafeError>,
     metadata: Result<WorktreeMetadataLookup, GitError>,
@@ -903,7 +904,12 @@ async fn inspect_worktree_changes_impl(
         })?;
     acquire_project_worktree_lock(state, &initial.project_id).await?;
     let project_id = initial.project_id.clone();
-    let result = inspect_worktree_changes_locked(state, &worktree_id, &project_id).await;
+    let result = with_inventory_operation_deadline(inspect_worktree_changes_locked(
+        state,
+        &worktree_id,
+        &project_id,
+    ))
+    .await;
     release_project_worktree_lock(state, &project_id).await;
     result
 }
@@ -953,12 +959,28 @@ async fn inspect_worktree_changes_locked(
             message: "The managed worktree could not be verified.",
         });
     }
-    // AH1 deliberately stops here. Stock Git status can execute repository
-    // clean/process filters; a check-attr preflight cannot close that race.
-    // AH2 will replace this with a complete filter-free pipeline.
-    Err(SafeError {
-        code: "inventory_unavailable",
-        message: "A filter-free worktree inventory is not available yet.",
+    let files = inspect_worktree_changes_at_base(&leaf, &row.base_commit)
+        .await
+        .map_err(inventory_error)?;
+    let final_inspection = inspect_repository(&leaf).await.map_err(inventory_error)?;
+    if final_inspection.is_primary
+        || final_inspection.identity != row.repository_identity
+        || final_inspection.fingerprint.as_str() != row.repository_fingerprint
+        || final_inspection.head.as_deref() != Some(row.base_commit.as_str())
+        || !matches!(
+            worktree_metadata_lookup(Path::new(&project.repository_root), &leaf).await,
+            Ok(WorktreeMetadataLookup::Present)
+        )
+    {
+        return Err(SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        });
+    }
+    Ok(WorktreeChangeInventory {
+        worktree_id: row.id,
+        clean: files.is_empty(),
+        files,
     })
 }
 
@@ -1408,80 +1430,20 @@ async fn remove_project_worktree(
             )
             .await
             .map_err(worktree_error)?;
-        // Validate before each path-following operation and again immediately
-        // before the mutating Git invocation.
-        let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)?;
-        let clean = match worktree_is_clean(&leaf).await {
-            Ok(clean) => clean,
-            Err(GitError::CleanlinessUnavailable) => {
-                return state
-                    .repository
-                    .transition_worktree(
-                        &row.id,
-                        ManagedWorktreeState::Removing,
-                        ManagedWorktreeState::RetainedDirty,
-                        Some("worktree_cleanliness_unavailable"),
-                    )
-                    .await
-                    .map(worktree_dto)
-                    .map_err(worktree_error);
-            }
-            Err(error) => return Err(project_error(&error)),
-        };
-        if !clean {
-            return state
-                .repository
-                .transition_worktree(
-                    &row.id,
-                    ManagedWorktreeState::Removing,
-                    ManagedWorktreeState::RetainedDirty,
-                    Some("worktree_dirty"),
-                )
-                .await
-                .map(worktree_dto)
-                .map_err(worktree_error);
-        }
-        let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path)?;
-        match remove_detached_worktree(Path::new(&project.repository_root), &leaf).await {
-            Ok(()) => {
-                let metadata =
-                    worktree_metadata_lookup(Path::new(&project.repository_root), &path).await;
-                let next = post_remove_state(
-                    inspect_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &path),
-                    metadata,
-                );
-                let error = (next != ManagedWorktreeState::Removed).then_some("recovery_required");
-                state
-                    .repository
-                    .transition_worktree(&row.id, ManagedWorktreeState::Removing, next, error)
-                    .await
-                    .map(worktree_dto)
-                    .map_err(worktree_error)
-            }
-            Err(GitError::DirtyWorktree(_)) => state
-                .repository
-                .transition_worktree(
-                    &row.id,
-                    ManagedWorktreeState::Removing,
-                    ManagedWorktreeState::RetainedDirty,
-                    Some("worktree_dirty"),
-                )
-                .await
-                .map(worktree_dto)
-                .map_err(worktree_error),
-            Err(error) => {
-                let _ = state
-                    .repository
-                    .transition_worktree(
-                        &row.id,
-                        ManagedWorktreeState::Removing,
-                        ManagedWorktreeState::Failed,
-                        Some("worktree_remove_failed"),
-                    )
-                    .await;
-                Err(project_error(&error))
-            }
-        }
+        // AH2 restores a safe inventory only. Managed-worktree deletion stays
+        // deferred until the holistic Phase 3C-A review approves the complete
+        // boundary, so no successful clean result can trigger removal here.
+        return state
+            .repository
+            .transition_worktree(
+                &row.id,
+                ManagedWorktreeState::Removing,
+                ManagedWorktreeState::RetainedDirty,
+                Some("worktree_removal_deferred"),
+            )
+            .await
+            .map(worktree_dto)
+            .map_err(worktree_error);
     }
     .await;
     release_project_worktree_lock(&state, &project_id).await;
@@ -2306,10 +2268,18 @@ mod bridge_tests {
             let managed_before = inventory_snapshot(&leaf, "untracked file").await;
             let primary_before = inventory_snapshot(&primary, "untracked file").await;
             assert!(!marker.exists());
-            let error = inspect_worktree_changes_impl(&state, row.id.clone())
+            let inventory = inspect_worktree_changes_impl(&state, row.id.clone())
                 .await
-                .unwrap_err();
-            assert_eq!(error.code, "inventory_unavailable");
+                .unwrap();
+            assert!(!inventory.clean);
+            assert!(inventory
+                .files
+                .iter()
+                .any(|file| file.path.as_str() == "README.md"));
+            assert!(inventory
+                .files
+                .iter()
+                .any(|file| file.path.as_str() == "untracked file" && file.untracked));
             assert!(!marker.exists());
             let managed_after = inventory_snapshot(&leaf, "untracked file").await;
             let primary_after = inventory_snapshot(&primary, "untracked file").await;
@@ -2741,7 +2711,7 @@ mod bridge_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn production_inventory_unavailable_path_does_not_launch_filter_markers() {
+    async fn production_inventory_path_does_not_launch_filter_markers() {
         for kind in ["clean", "process"] {
             let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
             let leaf = PathBuf::from(&row.path);
@@ -2782,13 +2752,13 @@ mod bridge_tests {
             );
             assert!(!marker.exists());
 
-            let error = inspect_worktree_changes_impl(&state, row.id.clone())
+            let inventory = inspect_worktree_changes_impl(&state, row.id.clone())
                 .await
-                .unwrap_err();
-            assert_eq!(error.code, "inventory_unavailable");
+                .unwrap();
+            assert!(!inventory.clean);
             assert!(
                 !marker.exists(),
-                "the production unavailable inventory path must not launch the {kind} filter"
+                "the production inventory path must not launch the {kind} filter"
             );
             assert_eq!(managed_index_before, fixture_index_bytes(&leaf));
             assert_eq!(primary_index_before, fixture_index_bytes(&primary));

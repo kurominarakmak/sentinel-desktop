@@ -1,6 +1,6 @@
 # Phase 3C-A — Trusted Read-Only Change Inventory
 
-Phase 3C-A is reopened. The former stock `git status --porcelain=v2` inventory
+Phase 3C-A is **COMPLETE**. The former stock `git status --porcelain=v2` inventory
 and Phase 3B stock-status cleanliness check are not production-reachable: a
 repository-configured clean or process filter can execute while Git compares a
 working-tree file. `--no-optional-locks`, fsmonitor suppression, a clean child
@@ -73,11 +73,10 @@ is bounded and strict, but it is base-to-index metadata only: it cannot imply
 complete worktree cleanliness, absence of unstaged changes, or absence of
 untracked files.
 
-Repository-relative path validation, including rejection of every
-leading-backslash Windows-rooted, UNC, device, and verbatim spelling, remains
-part of the retained parser/reference and future safe-inventory contract.
-Internal, non-leading backslashes remain ordinary filename bytes under the
-documented Unix-safe policy. Absolute paths, raw Git output, executable paths,
+Repository-relative path validation rejects Windows-rooted, UNC, device,
+verbatim, drive-relative, and every backslash-containing lookup spelling on
+Windows. Internal non-leading backslashes remain ordinary filename bytes only
+under the Unix-safe policy. Absolute paths, raw Git output, executable paths,
 fingerprints, and repository metadata never enter the future bridge shape.
 Inventories are not persisted and there is no Tauri command or React control in
 this batch.
@@ -97,11 +96,41 @@ remain target-gated; Linux strong-fingerprint registration remains fail-closed.
 The documented same-user filesystem TOCTOU boundary remains; descriptor-relative
 atomic protection is not claimed.
 
-Phase 3C-AH2 must supply the complete filter-free pipeline before inventory is
-available again. A same-user filesystem TOCTOU boundary remains documented;
-preflight plus status is explicitly rejected and descriptor-relative atomic
-protection is not claimed. Windows-native path/reparse validation remains
-target-gated and Linux strong-fingerprint registration remains fail-closed.
+AH2 supplies the authoritative filter-free inventory and is completed by the
+Phase 3C-A authoritative-inventory commit. The final holistic review found no
+remaining production P1/P2 issues. It collects two matching bounded
+snapshots: staged changes come from `diff-index --cached --raw -z
+--no-renames <base>`, untracked paths from `ls-files --others
+--exclude-standard -z`, and unmerged stages from `ls-files --unmerged -z`.
+Tracked worktree state comes from `ls-files --stage -z` plus per-path `hash-object
+--no-filters`, not `diff-files` or status, because raw `diff-files` can still
+trigger a configured clean filter. Every command has fixed argv, a cleared
+environment, a trusted empty HOME/XDG/global-config context, literal path
+semantics, disabled fsmonitor/untracked cache, NUL framing, output bounds, and
+strict raw-byte parsers. Lookup paths are lexically validated immediately
+before filesystem and `hash-object` access: Windows rejects backslashes,
+drive, UNC, device, rooted, and traversal spellings; Unix retains literal
+backslashes only where they remain ordinary filename bytes. `ls-files -t -z`
+detects skip-worktree entries, which currently fail closed as
+`InventoryUnavailable` rather than being misreported as deletions. Index
+snapshots, command results, repository identity/fingerprint, repository root,
+and base must agree twice before merge; otherwise inventory is unavailable.
+Gitlinks are currently fail-closed rather than flattened into an incomplete
+nested-submodule claim.
+Successful empty output is clean only after every component and both snapshots
+agree. One 15-second monotonic inventory deadline spans both snapshots and all
+sequential `hash-object` calls; each child timeout is capped by the remaining
+shared budget, and deadline exhaustion returns neither partial nor clean
+output. Managed-worktree removal remains disabled even with an authoritative
+inventory. B1 is reopened and unblocked by the completed prerequisite; its
+formerly prerequisite-blocked tests remain for the next B1H boundary.
+
+Every authoritative invocation also pins `GIT_WORK_TREE` to the already
+validated managed leaf, overriding repository-local `core.worktree`; linked
+worktree discovery still selects its own `.git` indirection and index. The
+outer locked desktop inspection establishes the same 15-second deadline before
+its initial validation and retains it through final validation; nested inventory
+helpers reuse that absolute deadline rather than allocating a fresh budget.
 
 ## AH1 freeze and test-harness scope
 

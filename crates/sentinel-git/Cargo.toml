@@ -8,12 +8,10 @@ license.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

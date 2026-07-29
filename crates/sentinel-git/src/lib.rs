@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -78,6 +78,8 @@ pub const MAX_STAGED_RAW_STDOUT: usize = 256 * 1024;
 pub const MAX_STAGED_RAW_STDERR: usize = 16 * 1024;
 pub const MAX_FILTER_ATTRIBUTE_STDOUT: usize = 16 * 1024;
 pub const MAX_FILTER_ATTRIBUTE_STDERR: usize = 16 * 1024;
+pub const MAX_INVENTORY_STDOUT: usize = 256 * 1024;
+pub const MAX_INVENTORY_STDERR: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextEligibleMetadata {
@@ -390,6 +392,59 @@ fn windows_machine_git_candidates_with(
 
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const MAX_GIT_OUTPUT: usize = 8_192;
+/// The complete authoritative inventory, including both snapshots, has one
+/// shared budget. Per-command limits are still applied, but may never reset
+/// this operation-level deadline.
+const INVENTORY_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+tokio::task_local! {
+    static INVENTORY_DEADLINE: std::time::Instant;
+}
+
+tokio::task_local! {
+    static INVENTORY_GIT_ENVIRONMENT: InventoryGitEnvironment;
+}
+
+/// Runs a caller-owned authoritative inventory operation under one monotonic
+/// budget. Nested inventory helpers observe this scope and never allocate a
+/// replacement deadline.
+pub async fn with_inventory_operation_deadline<T>(
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    INVENTORY_DEADLINE
+        .scope(
+            std::time::Instant::now() + INVENTORY_OPERATION_TIMEOUT,
+            future,
+        )
+        .await
+}
+
+/// Test-independent, application-owned Git configuration isolation retained
+/// for one complete inventory operation. It is outside the repository and is
+/// kept alive until every command has finished.
+struct InventoryGitEnvironment {
+    home: tempfile::TempDir,
+    global_config: PathBuf,
+}
+
+impl InventoryGitEnvironment {
+    fn create() -> Result<Self, GitError> {
+        let home = tempfile::Builder::new()
+            .prefix("agent-sentinel-git-home-")
+            .tempdir()
+            .map_err(|_| GitError::InventoryUnavailable)?;
+        let global_config = home.path().join("global.gitconfig");
+        std::fs::File::create(&global_config).map_err(|_| GitError::InventoryUnavailable)?;
+        Ok(Self {
+            home,
+            global_config,
+        })
+    }
+
+    fn home(&self) -> &Path {
+        self.home.path()
+    }
+}
 
 /// Inspects a local worktree through fixed, read-only Git commands only.
 pub async fn inspect_repository(path: &Path) -> Result<RepositoryInspection, GitError> {
@@ -545,9 +600,8 @@ pub async fn add_detached_worktree(
 
 pub async fn worktree_is_clean(worktree: &Path) -> Result<bool, GitError> {
     let _ = worktree;
-    // Stock status can execute repository-configured clean/process filters.
-    // AH1 intentionally refuses cleanup until AH2 provides a complete
-    // filter-free comparison.
+    // Inventory is now authoritative, but managed-worktree deletion remains
+    // deliberately blocked until the holistic Phase 3C-A review.
     Err(GitError::CleanlinessUnavailable)
 }
 
@@ -555,10 +609,77 @@ pub async fn worktree_is_clean(worktree: &Path) -> Result<bool, GitError> {
 /// linked worktree.  The caller owns exact managed-leaf validation; this crate
 /// deliberately accepts only a backend-provided directory and fixed arguments.
 pub async fn inspect_worktree_changes(worktree: &Path) -> Result<Vec<ChangedFile>, GitError> {
-    let _ = worktree;
-    // Do not replace this with a check-attr preflight followed by status: a
-    // repository can alter attributes/configuration between those operations.
-    Err(GitError::InventoryUnavailable)
+    let environment = InventoryGitEnvironment::create()?;
+    let deadline = std::time::Instant::now() + INVENTORY_OPERATION_TIMEOUT;
+    INVENTORY_GIT_ENVIRONMENT
+        .scope(
+            environment,
+            INVENTORY_DEADLINE.scope(deadline, async {
+                let inspection = inspect_repository(worktree)
+                    .await
+                    .map_err(|_| GitError::InventoryUnavailable)?;
+                let base = inspection.head.ok_or(GitError::InventoryUnavailable)?;
+                inspect_worktree_changes_at_base_in_context(worktree, &base).await
+            }),
+        )
+        .await
+}
+
+/// Produces a complete, filter-free inventory for a linked worktree whose
+/// caller has already recorded the expected immutable base commit. Two exact
+/// snapshots must agree before a successful result is returned; ambiguity is
+/// deliberately represented as `InventoryUnavailable`, never as clean.
+pub async fn inspect_worktree_changes_at_base(
+    worktree: &Path,
+    expected_base: &str,
+) -> Result<Vec<ChangedFile>, GitError> {
+    let environment = InventoryGitEnvironment::create()?;
+    let operation =
+        async { inspect_worktree_changes_at_base_in_context(worktree, expected_base).await };
+    if INVENTORY_DEADLINE.try_with(|_| ()).is_ok() {
+        INVENTORY_GIT_ENVIRONMENT
+            .scope(environment, operation)
+            .await
+    } else {
+        INVENTORY_GIT_ENVIRONMENT
+            .scope(environment, with_inventory_operation_deadline(operation))
+            .await
+    }
+}
+
+async fn inspect_worktree_changes_at_base_in_context(
+    worktree: &Path,
+    expected_base: &str,
+) -> Result<Vec<ChangedFile>, GitError> {
+    if !valid_oid(expected_base.as_bytes()) {
+        return Err(GitError::InventoryUnavailable);
+    }
+    let before = inspect_repository(worktree)
+        .await
+        .map_err(|_| GitError::InventoryUnavailable)?;
+    if before.is_primary || before.head.as_deref() != Some(expected_base) {
+        return Err(GitError::InventoryUnavailable);
+    }
+    let executable = TrustedGitExecutableResolver
+        .resolve()
+        .map_err(|_| GitError::InventoryUnavailable)?;
+    let first =
+        collect_inventory_snapshot(&executable, &before.repository_root, expected_base).await?;
+    let second =
+        collect_inventory_snapshot(&executable, &before.repository_root, expected_base).await?;
+    let after = inspect_repository(worktree)
+        .await
+        .map_err(|_| GitError::InventoryUnavailable)?;
+    if after.is_primary
+        || after.identity != before.identity
+        || after.fingerprint != before.fingerprint
+        || after.repository_root != before.repository_root
+        || after.head.as_deref() != Some(expected_base)
+        || first != second
+    {
+        return Err(GitError::InventoryUnavailable);
+    }
+    merge_inventory_snapshot(first)
 }
 
 /// Test-only control preserving the security regression. Production code must
@@ -630,6 +751,459 @@ pub async fn inspect_staged_index_changes(
         return Err(GitError::Command("staged raw metadata failed".into()));
     }
     parse_staged_raw_z(&output.stdout)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InventorySnapshot {
+    index_before: Vec<u8>,
+    staged: Vec<u8>,
+    unstaged: Vec<StagedIndexChange>,
+    untracked: Vec<u8>,
+    unmerged: Vec<u8>,
+    index_after: Vec<u8>,
+}
+
+async fn inventory_output<const N: usize>(
+    executable: &ResolvedGitExecutable,
+    directory: &Path,
+    args: [&str; N],
+) -> Result<Vec<u8>, GitError> {
+    ensure_inventory_deadline()?;
+    let output = run_git_with_limits(
+        executable,
+        directory,
+        args,
+        GIT_TIMEOUT,
+        MAX_INVENTORY_STDOUT,
+        MAX_INVENTORY_STDERR,
+        true,
+        true,
+    )
+    .await
+    .map_err(|_| GitError::InventoryUnavailable)?;
+    if !output.status.success() {
+        return Err(GitError::InventoryUnavailable);
+    }
+    ensure_inventory_deadline()?;
+    Ok(output.stdout)
+}
+
+fn ensure_inventory_deadline() -> Result<(), GitError> {
+    match INVENTORY_DEADLINE
+        .try_with(|deadline| (std::time::Instant::now() < *deadline).then_some(()))
+    {
+        Ok(Some(())) | Err(_) => Ok(()),
+        Ok(None) => Err(GitError::InventoryUnavailable),
+    }
+}
+
+fn cap_timeout_to_inventory_deadline(
+    timeout: std::time::Duration,
+) -> Result<std::time::Duration, GitError> {
+    match INVENTORY_DEADLINE
+        .try_with(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+    {
+        Ok(remaining) if remaining.is_zero() => Err(GitError::TimedOut),
+        Ok(remaining) => Ok(timeout.min(remaining)),
+        Err(_) => Ok(timeout),
+    }
+}
+
+async fn collect_inventory_snapshot(
+    executable: &ResolvedGitExecutable,
+    directory: &Path,
+    base: &str,
+) -> Result<InventorySnapshot, GitError> {
+    ensure_inventory_deadline()?;
+    let index_flags = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "ls-files",
+            "-t",
+            "-z",
+            "--",
+        ],
+    )
+    .await?;
+    if has_skip_worktree(&index_flags)? {
+        return Err(GitError::InventoryUnavailable);
+    }
+    let index_before = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+        ],
+    )
+    .await?;
+    let staged = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "color.ui=false",
+            "diff-index",
+            "--cached",
+            "--raw",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-renames",
+            "--ignore-submodules=none",
+            base,
+            "--",
+        ],
+    )
+    .await?;
+    let unstaged = collect_worktree_changes(executable, directory, &index_before).await?;
+    let untracked = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
+    )
+    .await?;
+    let unmerged = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "ls-files",
+            "--unmerged",
+            "-z",
+            "--",
+        ],
+    )
+    .await?;
+    let index_after = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "ls-files",
+            "--stage",
+            "-z",
+            "--",
+        ],
+    )
+    .await?;
+    if index_before != index_after {
+        return Err(GitError::InventoryUnavailable);
+    }
+    Ok(InventorySnapshot {
+        index_before,
+        staged,
+        unstaged,
+        untracked,
+        unmerged,
+        index_after,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct IndexStageEntry {
+    path: RepositoryRelativePath,
+    mode: RepositoryMode,
+    oid: String,
+    stage: u8,
+}
+
+fn parse_index_stage_z(bytes: &[u8]) -> Result<Vec<IndexStageEntry>, GitError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(&[0]) {
+        return Err(GitError::StatusMalformed);
+    }
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        let mut record = raw.splitn(2, |byte| *byte == b'\t');
+        let (Some(header), Some(path)) = (record.next(), record.next()) else {
+            return Err(GitError::StatusMalformed);
+        };
+        let fields: Vec<_> = header.split(|byte| *byte == b' ').collect();
+        if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) || !valid_oid(fields[1])
+        {
+            return Err(GitError::StatusMalformed);
+        }
+        let stage = match fields[2] {
+            b"0" => 0,
+            b"1" => 1,
+            b"2" => 2,
+            b"3" => 3,
+            _ => return Err(GitError::StatusMalformed),
+        };
+        let path = parse_repository_relative_path(path)?;
+        if !seen.insert((path.0.clone(), stage)) || entries.len() == MAX_STATUS_RECORDS {
+            return Err(GitError::StatusTooManyRecords);
+        }
+        entries.push(IndexStageEntry {
+            path,
+            mode: parse_mode(fields[0])?,
+            oid: std::str::from_utf8(fields[1])
+                .map_err(|_| GitError::StatusMalformed)?
+                .to_owned(),
+            stage,
+        });
+    }
+    Ok(entries)
+}
+
+async fn hash_worktree_path(
+    executable: &ResolvedGitExecutable,
+    directory: &Path,
+    path: &RepositoryRelativePath,
+) -> Result<String, GitError> {
+    validate_inventory_lookup_path(path.as_str(), current_lookup_path_semantics())
+        .map_err(|_| GitError::InventoryUnavailable)?;
+    let output = inventory_output(
+        executable,
+        directory,
+        [
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "hash-object",
+            "--no-filters",
+            "--",
+            path.as_str(),
+        ],
+    )
+    .await?;
+    let Some(oid) = output.strip_suffix(b"\n") else {
+        return Err(GitError::InventoryUnavailable);
+    };
+    if !valid_oid(oid) {
+        return Err(GitError::InventoryUnavailable);
+    }
+    std::str::from_utf8(oid)
+        .map(|value| value.to_owned())
+        .map_err(|_| GitError::InventoryUnavailable)
+}
+
+fn worktree_mode(metadata: &fs::Metadata) -> Result<RepositoryMode, GitError> {
+    if metadata.file_type().is_symlink() {
+        return Ok(RepositoryMode::SymbolicLink);
+    }
+    if !metadata.is_file() {
+        return Err(GitError::InventoryUnavailable);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(if metadata.permissions().mode() & 0o111 == 0 {
+            RepositoryMode::Regular
+        } else {
+            RepositoryMode::Executable
+        })
+    }
+    #[cfg(not(unix))]
+    Ok(RepositoryMode::Regular)
+}
+
+async fn collect_worktree_changes(
+    executable: &ResolvedGitExecutable,
+    directory: &Path,
+    index: &[u8],
+) -> Result<Vec<StagedIndexChange>, GitError> {
+    let mut changes = Vec::new();
+    for entry in parse_index_stage_z(index).map_err(|_| GitError::InventoryUnavailable)? {
+        if entry.stage != 0 {
+            continue;
+        }
+        if entry.mode == RepositoryMode::Gitlink {
+            // A generic linked submodule's nested state needs a separate
+            // snapshot contract. Do not silently flatten it into a file.
+            return Err(GitError::InventoryUnavailable);
+        }
+        validate_inventory_lookup_path(entry.path.as_str(), current_lookup_path_semantics())
+            .map_err(|_| GitError::InventoryUnavailable)?;
+        ensure_inventory_deadline()?;
+        let path = directory.join(entry.path.as_str());
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                changes.push(StagedIndexChange {
+                    path: entry.path,
+                    old_mode: Some(entry.mode),
+                    new_mode: None,
+                    status: ChangeKind::Deleted,
+                });
+                continue;
+            }
+            Err(_) => return Err(GitError::InventoryUnavailable),
+        };
+        if metadata.is_dir() {
+            // A tracked file replaced by a directory is represented as a
+            // tracked deletion; any descendants are independently returned by
+            // the untracked component.
+            changes.push(StagedIndexChange {
+                path: entry.path,
+                old_mode: Some(entry.mode),
+                new_mode: None,
+                status: ChangeKind::Deleted,
+            });
+            continue;
+        }
+        let actual_mode = worktree_mode(&metadata)?;
+        let actual_oid = hash_worktree_path(executable, directory, &entry.path).await?;
+        let status = if actual_mode != entry.mode {
+            ChangeKind::TypeChanged
+        } else if actual_oid != entry.oid {
+            ChangeKind::Modified
+        } else {
+            continue;
+        };
+        changes.push(StagedIndexChange {
+            path: entry.path,
+            old_mode: Some(entry.mode),
+            new_mode: Some(actual_mode),
+            status,
+        });
+    }
+    Ok(changes)
+}
+
+fn merge_inventory_snapshot(snapshot: InventorySnapshot) -> Result<Vec<ChangedFile>, GitError> {
+    let staged =
+        parse_staged_raw_z(&snapshot.staged).map_err(|_| GitError::InventoryUnavailable)?;
+    let untracked =
+        parse_untracked_paths_z(&snapshot.untracked).map_err(|_| GitError::InventoryUnavailable)?;
+    let conflicts =
+        parse_unmerged_paths_z(&snapshot.unmerged).map_err(|_| GitError::InventoryUnavailable)?;
+    let mut files: HashMap<String, ChangedFile> = HashMap::new();
+    for change in staged {
+        let key = change.path.0.clone();
+        let file = files
+            .entry(key)
+            .or_insert_with(|| empty_changed_file(change.path.clone()));
+        if file.index_change.replace(change.status).is_some() {
+            return Err(GitError::InventoryUnavailable);
+        }
+        file.mode_head = change.old_mode;
+        file.mode_index = change.new_mode;
+        note_gitlink(file, change.old_mode, change.new_mode);
+    }
+    for change in snapshot.unstaged {
+        let key = change.path.0.clone();
+        let file = files
+            .entry(key)
+            .or_insert_with(|| empty_changed_file(change.path.clone()));
+        if file.worktree_change.replace(change.status).is_some() {
+            return Err(GitError::InventoryUnavailable);
+        }
+        if file.mode_index.is_none() {
+            file.mode_index = change.old_mode;
+        }
+        file.mode_worktree = change.new_mode;
+        note_gitlink(file, change.old_mode, change.new_mode);
+    }
+    for path in untracked {
+        let key = path.0.clone();
+        if files.contains_key(&key) {
+            return Err(GitError::InventoryUnavailable);
+        }
+        let mut file = empty_changed_file(path);
+        file.untracked = true;
+        files.insert(key, file);
+    }
+    for (path, conflict, head_mode, index_mode) in conflicts {
+        let key = path.0.clone();
+        let file = files.entry(key).or_insert_with(|| empty_changed_file(path));
+        if file.conflict.replace(conflict).is_some() || file.untracked {
+            return Err(GitError::InventoryUnavailable);
+        }
+        if file.mode_head.is_none() {
+            file.mode_head = head_mode;
+        }
+        if file.mode_index.is_none() {
+            file.mode_index = index_mode;
+        }
+    }
+    if files.len() > MAX_STATUS_RECORDS {
+        return Err(GitError::InventoryUnavailable);
+    }
+    let mut files: Vec<_> = files.into_values().collect();
+    files.sort_by(|left, right| left.path.0.as_bytes().cmp(right.path.0.as_bytes()));
+    Ok(files)
+}
+
+fn empty_changed_file(path: RepositoryRelativePath) -> ChangedFile {
+    ChangedFile {
+        path,
+        index_change: None,
+        worktree_change: None,
+        conflict: None,
+        untracked: false,
+        submodule: None,
+        mode_head: None,
+        mode_index: None,
+        mode_worktree: None,
+    }
+}
+
+fn note_gitlink(
+    file: &mut ChangedFile,
+    old_mode: Option<RepositoryMode>,
+    new_mode: Option<RepositoryMode>,
+) {
+    if matches!(old_mode, Some(RepositoryMode::Gitlink))
+        || matches!(new_mode, Some(RepositoryMode::Gitlink))
+    {
+        file.submodule = Some(SubmoduleStatus {
+            commit_changed: true,
+            modified: file.worktree_change.is_some(),
+            untracked: false,
+        });
+    }
 }
 
 /// Runs one fixed, literal-pathspec numstat operation for a caller-verified
@@ -870,6 +1444,10 @@ pub fn parse_staged_raw_z(bytes: &[u8]) -> Result<Vec<StagedIndexChange>, GitErr
             "M" => ChangeKind::Modified,
             "D" => ChangeKind::Deleted,
             "T" => ChangeKind::TypeChanged,
+            // Unmerged entries are represented completely by the separately
+            // parsed `ls-files --unmerged` stage set below. Raw diff's `U`
+            // marker carries no safe conflict classification on its own.
+            "U" => continue,
             _ => return Err(GitError::StatusMalformed),
         };
         changes.push(StagedIndexChange {
@@ -880,6 +1458,84 @@ pub fn parse_staged_raw_z(bytes: &[u8]) -> Result<Vec<StagedIndexChange>, GitErr
         });
     }
     Ok(changes)
+}
+
+fn parse_untracked_paths_z(bytes: &[u8]) -> Result<Vec<RepositoryRelativePath>, GitError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(&[0]) {
+        return Err(GitError::StatusMalformed);
+    }
+    let mut paths = HashSet::new();
+    let mut result = Vec::new();
+    for raw in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        let path = parse_repository_relative_path(raw)?;
+        if !paths.insert(path.0.clone()) || result.len() == MAX_STATUS_RECORDS {
+            return Err(GitError::StatusTooManyRecords);
+        }
+        result.push(path);
+    }
+    Ok(result)
+}
+
+type UnmergedPath = (
+    RepositoryRelativePath,
+    ConflictKind,
+    Option<RepositoryMode>,
+    Option<RepositoryMode>,
+);
+
+fn parse_unmerged_paths_z(bytes: &[u8]) -> Result<Vec<UnmergedPath>, GitError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !bytes.ends_with(&[0]) {
+        return Err(GitError::StatusMalformed);
+    }
+    let mut stages: HashMap<String, (RepositoryRelativePath, [Option<RepositoryMode>; 3])> =
+        HashMap::new();
+    for raw in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        let mut record = raw.splitn(2, |byte| *byte == b'\t');
+        let (Some(header), Some(path)) = (record.next(), record.next()) else {
+            return Err(GitError::StatusMalformed);
+        };
+        let fields: Vec<_> = header.split(|byte| *byte == b' ').collect();
+        if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) || !valid_oid(fields[1])
+        {
+            return Err(GitError::StatusMalformed);
+        }
+        let mode = parse_mode(fields[0])?;
+        let stage = match fields[2] {
+            b"1" => 0,
+            b"2" => 1,
+            b"3" => 2,
+            _ => return Err(GitError::StatusMalformed),
+        };
+        let path = parse_repository_relative_path(path)?;
+        let entry = stages
+            .entry(path.0.clone())
+            .or_insert_with(|| (path.clone(), [None, None, None]));
+        if entry.1[stage].replace(mode).is_some() || stages.len() > MAX_STATUS_RECORDS {
+            return Err(GitError::StatusTooManyRecords);
+        }
+    }
+    let mut result = Vec::with_capacity(stages.len());
+    for (_, (path, stages)) in stages {
+        let present = stages.map(|stage| stage.is_some());
+        let conflict = match present {
+            [true, false, false] => ConflictKind::BothDeleted,
+            [false, true, false] => ConflictKind::AddedByUs,
+            [true, false, true] => ConflictKind::DeletedByThem,
+            [false, false, true] => ConflictKind::AddedByThem,
+            [true, true, false] => ConflictKind::DeletedByUs,
+            [false, true, true] => ConflictKind::BothAdded,
+            [true, true, true] => ConflictKind::BothModified,
+            [false, false, false] => return Err(GitError::StatusMalformed),
+        };
+        result.push((path, conflict, stages[0], stages[1].or(stages[2])));
+    }
+    Ok(result)
 }
 
 /// Strict parser for the fixed Phase 3C-A porcelain-v2, NUL-delimited status
@@ -1051,17 +1707,35 @@ fn valid_oid(value: &[u8]) -> bool {
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
-fn parse_repository_relative_path(value: &[u8]) -> Result<RepositoryRelativePath, GitError> {
-    if value.is_empty() || value.len() > MAX_REPOSITORY_RELATIVE_PATH_BYTES {
-        return Err(GitError::StatusMalformed);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LookupPathSemantics {
+    Unix,
+    Windows,
+}
+
+fn current_lookup_path_semantics() -> LookupPathSemantics {
+    #[cfg(windows)]
+    {
+        LookupPathSemantics::Windows
     }
-    let text = std::str::from_utf8(value).map_err(|_| GitError::StatusMalformed)?;
-    // A leading backslash is rooted on Windows, including device and verbatim
-    // namespaces.  Reject it on every host so this bridge-safe relative-path
-    // type can never be reinterpreted as absolute by a future Windows client.
-    // Non-leading backslashes remain ordinary filename bytes under the
-    // documented Unix-safe policy.
-    if text.contains('\0')
+    #[cfg(not(windows))]
+    {
+        LookupPathSemantics::Unix
+    }
+}
+
+/// Validates the lexical spelling before a repository-controlled path reaches
+/// either the host filesystem or a Git path argument. Git tree paths always
+/// use forward slashes; backslashes are retained on Unix as literal filename
+/// bytes but are never safe lookup bytes on Windows.
+fn validate_inventory_lookup_path(
+    text: &str,
+    semantics: LookupPathSemantics,
+) -> Result<(), GitError> {
+    if text.is_empty()
+        || text.len() > MAX_REPOSITORY_RELATIVE_PATH_BYTES
+        || text.contains('\0')
         || text.starts_with('/')
         || text.starts_with('\\')
         || (text.len() >= 2
@@ -1073,7 +1747,48 @@ fn parse_repository_relative_path(value: &[u8]) -> Result<RepositoryRelativePath
     {
         return Err(GitError::StatusMalformed);
     }
+    if semantics == LookupPathSemantics::Windows && text.contains('\\') {
+        return Err(GitError::StatusMalformed);
+    }
+    Ok(())
+}
+
+fn parse_repository_relative_path(value: &[u8]) -> Result<RepositoryRelativePath, GitError> {
+    if value.is_empty() || value.len() > MAX_REPOSITORY_RELATIVE_PATH_BYTES {
+        return Err(GitError::StatusMalformed);
+    }
+    let text = std::str::from_utf8(value).map_err(|_| GitError::StatusMalformed)?;
+    validate_inventory_lookup_path(text, current_lookup_path_semantics())?;
     Ok(RepositoryRelativePath(text.to_owned()))
+}
+
+/// `git ls-files -t -z` emits one `<tag><space><path>` NUL record per index
+/// entry. `S` is the documented skip-worktree tag. Any unfamiliar framing or
+/// tag is unsafe because a sparse index cannot be represented by AH2 yet.
+fn has_skip_worktree(bytes: &[u8]) -> Result<bool, GitError> {
+    if bytes.is_empty() {
+        return Ok(false);
+    }
+    if !bytes.ends_with(&[0]) {
+        return Err(GitError::StatusMalformed);
+    }
+    let mut seen = HashSet::new();
+    let mut skip = false;
+    for record in bytes[..bytes.len() - 1].split(|byte| *byte == 0) {
+        if record.len() < 3 || record[1] != b' ' {
+            return Err(GitError::StatusMalformed);
+        }
+        let tag = record[0];
+        if !matches!(tag, b'H' | b'S' | b'M' | b'R' | b'C' | b'K') {
+            return Err(GitError::StatusMalformed);
+        }
+        let path = parse_repository_relative_path(&record[2..])?;
+        if !seen.insert(path.0) || seen.len() > MAX_STATUS_RECORDS {
+            return Err(GitError::StatusTooManyRecords);
+        }
+        skip |= tag == b'S';
+    }
+    Ok(skip)
 }
 
 /// Inspects exactly the configured entry without following symbolic links or
@@ -1515,6 +2230,7 @@ async fn run_git_with_limits_observer<const N: usize>(
     literal_pathspecs: bool,
     child_observer: ChildSpawnObserver,
 ) -> Result<GitCommandOutput, GitError> {
+    let timeout = cap_timeout_to_inventory_deadline(timeout)?;
     let mut command = TokioCommand::new(&executable.0);
     command
         .args(args)
@@ -1531,6 +2247,26 @@ async fn run_git_with_limits_observer<const N: usize>(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if INVENTORY_DEADLINE.try_with(|_| ()).is_ok() {
+        // This trusted directory is supplied by the desktop managed-leaf
+        // validator. GIT_WORK_TREE overrides any repository-local
+        // core.worktree and pins every authoritative Git path lookup to it.
+        command.env("GIT_WORK_TREE", directory);
+    }
+    if let Ok((home, global_config)) = INVENTORY_GIT_ENVIRONMENT.try_with(|environment| {
+        (
+            environment.home().to_path_buf(),
+            environment.global_config.clone(),
+        )
+    }) {
+        // GIT_CONFIG_GLOBAL wins over HOME/XDG discovery. HOME and XDG are
+        // also redirected into the same trusted empty directory so no account
+        // configuration can become a fallback source.
+        command
+            .env("GIT_CONFIG_GLOBAL", global_config)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home);
+    }
     if read_only {
         command.env("GIT_OPTIONAL_LOCKS", "0");
     }
@@ -4664,6 +5400,283 @@ mod inspection_tests {
             }),
             Err(GitError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
         ));
+    }
+    #[test]
+    fn authoritative_inventory_parsers_reject_truncation_and_merge_unmerged_stages() {
+        assert_eq!(
+            parse_untracked_paths_z(b"nested/file\0name with space\0")
+                .expect("strict untracked paths")
+                .len(),
+            2
+        );
+        assert!(parse_untracked_paths_z(b"unterminated").is_err());
+        let conflicts = parse_unmerged_paths_z(
+            b"100644 1111111111111111111111111111111111111111 1\tconflict\x00100644 2222222222222222222222222222222222222222 2\tconflict\x00100644 3333333333333333333333333333333333333333 3\tconflict\0",
+        )
+        .expect("strict unmerged records");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].1, ConflictKind::BothModified);
+        assert!(parse_unmerged_paths_z(b"100644 bad 1\tconflict\0").is_err());
+    }
+
+    #[test]
+    fn inventory_lookup_paths_apply_target_specific_windows_semantics() {
+        for path in [
+            r"tracked\..\outside",
+            r"dir\file",
+            r"..\outside",
+            r"C:\outside",
+            r"C:outside",
+            r"\\server\share\file",
+            r"\\?\C:\outside",
+            "/absolute",
+            "../outside",
+            "a/../../outside",
+        ] {
+            assert!(validate_inventory_lookup_path(path, LookupPathSemantics::Windows).is_err());
+        }
+        assert!(
+            validate_inventory_lookup_path("nested/file", LookupPathSemantics::Windows).is_ok()
+        );
+        assert!(validate_inventory_lookup_path("folder\\name", LookupPathSemantics::Unix).is_ok());
+    }
+
+    #[test]
+    fn skip_worktree_records_are_strict_and_never_normalized_to_deletions() {
+        assert!(!has_skip_worktree(b"H tracked.txt\0").expect("ordinary tracked record"));
+        assert!(has_skip_worktree(b"S sparse/file.txt\0").expect("skip-worktree record"));
+        for bytes in [
+            b"S missing terminator".as_slice(),
+            b"? unknown\0".as_slice(),
+            b"S ../escape\0".as_slice(),
+            b"S duplicate\0S duplicate\0".as_slice(),
+        ] {
+            assert!(has_skip_worktree(bytes).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn inventory_environment_isolates_global_config_from_host_process() {
+        let environment = InventoryGitEnvironment::create().expect("trusted empty environment");
+        let home = environment.home().to_path_buf();
+        let config = environment.global_config.clone();
+        INVENTORY_GIT_ENVIRONMENT
+            .scope(environment, async move {
+                let scoped = INVENTORY_GIT_ENVIRONMENT
+                    .try_with(|current| {
+                        current.home() == home.as_path() && current.global_config == config
+                    })
+                    .expect("inventory environment scope");
+                assert!(
+                    scoped,
+                    "inventory commands use the trusted empty home/config context"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn inventory_environment_ignores_a_hostile_global_config() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let hostile_home = fixture.path().join("hostile-home");
+        fs::create_dir(&hostile_home).expect("hostile home");
+        let outside = fixture.path().join("outside");
+        let included = fixture.path().join("included-hostile.gitconfig");
+        fs::write(
+            &included,
+            format!(
+                "[core]\nworktree = {}\n[diff]\nexternal = /definitely/not/a-helper\n",
+                outside.display()
+            ),
+        )
+        .expect("hostile included config");
+        fs::write(
+            hostile_home.join(".gitconfig"),
+            format!("[include]\npath = {}\n", included.display()),
+        )
+        .expect("hostile global config");
+        let control = Command::new("git")
+            .env("HOME", &hostile_home)
+            .args(["config", "--global", "--includes", "--get", "core.worktree"])
+            .output()
+            .expect("unisolated control");
+        assert!(
+            control.status.success(),
+            "control must load hostile included global config"
+        );
+
+        let environment = InventoryGitEnvironment::create().expect("trusted empty environment");
+        let executable = TrustedGitExecutableResolver.resolve().expect("trusted git");
+        let isolated = INVENTORY_GIT_ENVIRONMENT
+            .scope(environment, async {
+                run_git_with_limits(
+                    &executable,
+                    fixture.path(),
+                    ["config", "--global", "--get", "core.worktree"],
+                    GIT_TIMEOUT,
+                    MAX_GIT_OUTPUT,
+                    MAX_GIT_OUTPUT,
+                    true,
+                    false,
+                )
+                .await
+            })
+            .await
+            .expect("isolated config query");
+        assert!(
+            !isolated.status.success() && isolated.stdout.is_empty(),
+            "inventory isolation must not load an account-global core.worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_deadline_caps_commands_and_fails_closed_when_expired() {
+        let now = std::time::Instant::now();
+        let capped = INVENTORY_DEADLINE
+            .scope(now + std::time::Duration::from_millis(5), async {
+                cap_timeout_to_inventory_deadline(std::time::Duration::from_secs(3))
+            })
+            .await
+            .expect("remaining operation budget");
+        assert!(capped <= std::time::Duration::from_millis(5));
+        let expired = INVENTORY_DEADLINE
+            .scope(now, async {
+                cap_timeout_to_inventory_deadline(GIT_TIMEOUT)
+            })
+            .await;
+        assert!(matches!(expired, Err(GitError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn sparse_skip_worktree_fails_closed_before_filesystem_comparison() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let primary = fixture.path().join("primary");
+        let worktree = fixture.path().join("linked");
+        fs::create_dir(&primary).expect("primary directory");
+        fixture_git(&primary, &["init"]);
+        fixture_git(&primary, &["config", "user.email", "tests@example.invalid"]);
+        fixture_git(&primary, &["config", "user.name", "Tests"]);
+        fs::write(primary.join("sparse.txt"), "base\n").expect("tracked file");
+        fixture_git(&primary, &["add", "sparse.txt"]);
+        fixture_git(&primary, &["commit", "-m", "base"]);
+        let base = resolve_exact_head(&primary).await.expect("base");
+        add_detached_worktree(&primary, &worktree, &base)
+            .await
+            .expect("linked worktree");
+        fixture_git(
+            &worktree,
+            &["update-index", "--skip-worktree", "sparse.txt"],
+        );
+        fs::remove_file(worktree.join("sparse.txt")).expect("intentionally absent sparse path");
+        assert!(matches!(
+            inspect_worktree_changes_at_base(&worktree, &base).await,
+            Err(GitError::InventoryUnavailable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_inventory_pins_the_managed_worktree_against_local_core_worktree() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let primary = fixture.path().join("primary");
+        let worktree = fixture.path().join("linked");
+        let external = fixture.path().join("external");
+        fs::create_dir(&primary).expect("primary directory");
+        fs::create_dir(&external).expect("external directory");
+        fixture_git(&primary, &["init"]);
+        fixture_git(&primary, &["config", "user.email", "tests@example.invalid"]);
+        fixture_git(&primary, &["config", "user.name", "Tests"]);
+        fs::write(primary.join("tracked.txt"), "base\n").expect("tracked file");
+        fixture_git(&primary, &["add", "tracked.txt"]);
+        fixture_git(&primary, &["commit", "-m", "base"]);
+        let base = resolve_exact_head(&primary).await.expect("base");
+        add_detached_worktree(&primary, &worktree, &base)
+            .await
+            .expect("linked worktree");
+        fs::write(external.join("tracked.txt"), "base\n").expect("external index match");
+        fs::write(worktree.join("tracked.txt"), "managed modification\n")
+            .expect("managed modification");
+        fixture_git(
+            &worktree,
+            &[
+                "config",
+                "core.worktree",
+                external.to_str().expect("external path"),
+            ],
+        );
+        let inventory = inspect_worktree_changes_at_base(&worktree, &base)
+            .await
+            .expect("pinned inventory");
+        assert!(inventory.iter().any(|file| {
+            file.path.as_str() == "tracked.txt"
+                && file.worktree_change == Some(ChangeKind::Modified)
+        }));
+    }
+
+    #[tokio::test]
+    async fn authoritative_inventory_merges_staged_unstaged_untracked_and_ignores_filters() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let primary = fixture.path().join("primary");
+        let worktree = fixture.path().join("linked");
+        fs::create_dir(&primary).expect("primary directory");
+        fixture_git(&primary, &["init"]);
+        fixture_git(&primary, &["config", "user.email", "tests@example.invalid"]);
+        fixture_git(&primary, &["config", "user.name", "Tests"]);
+        fs::write(primary.join("tracked.txt"), "base\n").expect("tracked file");
+        fixture_git(&primary, &["add", "tracked.txt"]);
+        fixture_git(&primary, &["commit", "-m", "base"]);
+        let base = resolve_exact_head(&primary).await.expect("base");
+        add_detached_worktree(&primary, &worktree, &base)
+            .await
+            .expect("linked worktree");
+        fs::write(worktree.join("tracked.txt"), "staged\n").expect("staged change");
+        fixture_git(&worktree, &["add", "tracked.txt"]);
+        fs::write(worktree.join("tracked.txt"), "unstaged\n").expect("unstaged change");
+        fs::write(worktree.join("untracked name.txt"), "new\n").expect("untracked file");
+        let marker = fixture.path().join("filter-ran");
+        let helper = fixture.path().join("filter-helper");
+        fs::write(
+            &helper,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("helper");
+        let mut permissions = fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions).expect("helper permissions");
+        fs::write(worktree.join(".gitattributes"), "*.txt filter=hostile\n").expect("attributes");
+        fixture_git(
+            &worktree,
+            &[
+                "config",
+                "filter.hostile.clean",
+                helper.to_str().expect("helper path"),
+            ],
+        );
+        fixture_git(
+            &worktree,
+            &[
+                "config",
+                "filter.hostile.smudge",
+                helper.to_str().expect("helper path"),
+            ],
+        );
+        let inventory = inspect_worktree_changes_at_base(&worktree, &base)
+            .await
+            .expect("authoritative inventory");
+        let tracked = inventory
+            .iter()
+            .find(|file| file.path.as_str() == "tracked.txt")
+            .expect("tracked change");
+        assert_eq!(tracked.index_change, Some(ChangeKind::Modified));
+        assert_eq!(tracked.worktree_change, Some(ChangeKind::Modified));
+        assert!(inventory
+            .iter()
+            .any(|file| file.path.as_str() == "untracked name.txt" && file.untracked));
+        assert!(
+            !marker.exists(),
+            "safe inventory must not launch configured filters"
+        );
     }
 }
 
