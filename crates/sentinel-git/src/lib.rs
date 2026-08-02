@@ -419,6 +419,18 @@ pub async fn with_inventory_operation_deadline<T>(
         .await
 }
 
+/// Runs a caller-owned read-only operation with the same trusted Git
+/// configuration isolation and absolute deadline used by authoritative
+/// inventory. This is the only supported context for B1 metadata commands.
+pub async fn with_inventory_operation_context<T>(
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, GitError> {
+    let environment = InventoryGitEnvironment::create()?;
+    Ok(INVENTORY_GIT_ENVIRONMENT
+        .scope(environment, with_inventory_operation_deadline(future))
+        .await)
+}
+
 /// Test-independent, application-owned Git configuration isolation retained
 /// for one complete inventory operation. It is outside the repository and is
 /// kept alive until every command has finished.

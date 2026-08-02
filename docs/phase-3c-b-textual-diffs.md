@@ -1,9 +1,8 @@
 # Phase 3C-B1 — Trusted Per-File Diff Classification
 
-Phase 3C-B1 is reopened and unblocked by the completed Phase 3C-A filter-free
-inventory prerequisite. Its implementation and formerly prerequisite-blocked
-tests remain for the next B1H boundary; this completion does not activate B1
-production execution. Phase 3C-B1 is an internal, read-only classification step for exactly one
+Phase 3C-B1 and B1H are complete. The final holistic B1 re-review is clean,
+with no remaining production P1/P2 findings. B1 activates the existing
+internal, read-only classification step for exactly one
 repository-relative path in a verified Sentinel-managed worktree. It does not
 return a textual patch or any file content. Phase 3C-B2 remains responsible for
 any future bounded textual extraction.
@@ -49,10 +48,40 @@ Before inventory and immediately before each metadata command, the service
 revalidates the exact no-follow managed leaf, trusted-root containment,
 linked-worktree/non-primary ownership, project identity and fingerprint, exact
 metadata presence, detached persisted base commit, and lifecycle eligibility.
-After classification it repeats validation and rejects changed rows. Only
+It collects three complete classification-evidence passes: authoritative
+inventories A, B, and C must match, independently collected C1/C2 evidence
+must match, and a final C3 pass from Inventory C must exactly match C2.
+Evidence includes path/surface identity, numstat counts or binary state, mode
+evidence, filter deferral, and final classification. This rejects a post-C2
+content change that leaves coarse inventory state unchanged when C3 observes
+different evidence. After C3, B1 reloads the persisted project and
+worktree records, requires unchanged ownership/path/repository/fingerprint/base
+identity and eligible lifecycle state, and performs final Git validation using
+those refreshed records. No partial result is returned. Only
 `ready` and `retained_dirty` rows are eligible. The existing ProjectId lock is
 released on success, omission, and every error path; no cache, migration,
 Tauri command, React control, or persistence is added.
+
+The active bounded request-local `cfg(test)` regressions consume the
+production-path observation stream rather than inferring coherence from the
+final result. Final-validation events now bracket the refreshed acceptance
+validation after Inventory C and C3: start is immediately before the real
+repository/worktree validation using refreshed persisted records, and
+completion is emitted only after those checks succeed. The former synthetic
+outer event pair was removed. The stable companion observes matching C1/C2/C3 2-addition/1-deletion
+evidence, InventoryCompleted(C), refreshed persisted-state acceptance, real
+final validation start/completion, and only then the successful metadata-only
+DTO. A post-C2 content-race regression changes a disposable file after C2
+equality and proves C3's real numstat evidence differs and returns
+`change_stale`; a late disposable Ready-to-Removing transition is observed by
+the refreshed persisted-state check and fails before final-validation
+completion. The transient test directly
+observes matching A/B inventory observations, two independent real numstat
+observations with differing C1/C2 counts, comparison failure, and
+`change_stale`; fail-fast mismatch intentionally stops before C and its final
+validation. A disposable validation-failure regression reaches the refreshed
+final validation boundary and proves that failure emits no completion and
+returns no DTO.
 
 Tests use disposable repositories and managed worktrees. They cover strict
 numstat parsing, literal pathspec-looking names, fixed arguments/environment,
@@ -70,13 +99,14 @@ fingerprint registration remains fail-closed. The documented same-user
 filesystem TOCTOU boundary remains, and descriptor-relative atomic protection
 is not claimed.
 
-Phase 3C-B remains in progress. The prior B1 commit remains in history but its
-reopened boundary, including unignoring and updating its four formerly
-prerequisite-blocked tests, belongs to B1H. Phase 3C-B1H remains **NOT STARTED**.
-Previously recorded evidence
-was for the now-retired prerequisite and does not close this execution boundary. On
-aarch64-apple-darwin, 132 Rust tests and 92 frontend tests passed, along with
+Phase 3C-B remains in progress. The prior B1 baseline remains in history and
+the completed B1H boundary consumes only fresh authoritative inventory under
+the same operation-scoped Git isolation and deadline context. The formerly
+prerequisite-blocked tests and C3/lifecycle coherence regressions are active.
+Phase 3C-B1H is **COMPLETE**; the final holistic B1 re-review is clean with no
+remaining production P1/P2 findings. On
+aarch64-apple-darwin, 178 Rust tests and 92 frontend tests passed, along with
 `cargo fmt --all --check`, workspace Clippy with warnings denied, the frontend
 production build, and the Tauri no-bundle build. Focused reviews found no
-remaining P1/P2 issues. Phase 3C-B2, Phase 3C-C, and Phase 3C-D are not
-started.
+remaining P1/P2 issues. Phase 3C-B2, Phase 3C-C, and Phase 3C-D are **NOT
+STARTED**.

@@ -122,8 +122,10 @@ agree. One 15-second monotonic inventory deadline spans both snapshots and all
 sequential `hash-object` calls; each child timeout is capped by the remaining
 shared budget, and deadline exhaustion returns neither partial nor clean
 output. Managed-worktree removal remains disabled even with an authoritative
-inventory. B1 is reopened and unblocked by the completed prerequisite; its
-formerly prerequisite-blocked tests remain for the next B1H boundary.
+inventory. B1 is complete under B1H: its classification boundary consumes only
+this inventory, requires C1=C2=C3 repeated evidence, constructs success from
+C3, and reloads persisted eligibility before final acceptance. B2 remains **NOT
+STARTED**.
 
 Every authoritative invocation also pins `GIT_WORK_TREE` to the already
 validated managed leaf, overriding repository-local `core.worktree`; linked

@@ -10,10 +10,10 @@ use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
     add_detached_worktree, inspect_repository, inspect_worktree_changes_at_base,
     inspect_worktree_destination_no_follow, inspect_worktree_filter_attribute,
-    inspect_worktree_numstat, resolve_exact_head, with_inventory_operation_deadline,
-    worktree_metadata_lookup, ChangedFile, FilterAttributeState, GitError, NumstatClassification,
-    RepositoryInspection, RepositoryMode, RepositoryRelativePath, RepositoryState,
-    TextEligibleMetadata, WorktreeDestinationState, WorktreeMetadataLookup,
+    inspect_worktree_numstat, resolve_exact_head, with_inventory_operation_context,
+    with_inventory_operation_deadline, worktree_metadata_lookup, ChangedFile, FilterAttributeState,
+    GitError, NumstatClassification, RepositoryInspection, RepositoryMode, RepositoryRelativePath,
+    RepositoryState, TextEligibleMetadata, WorktreeDestinationState, WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,105 @@ struct ReconciliationTestHooks {
 struct B1TestHooks {
     post_numstat_reached: Arc<tokio::sync::Notify>,
     resume_post_numstat: Arc<tokio::sync::Notify>,
+    post_c2_equality_reached: Option<Arc<tokio::sync::Notify>>,
+    resume_post_c2_equality: Option<Arc<tokio::sync::Notify>>,
+    final_validation_reached: Option<Arc<tokio::sync::Notify>>,
+    resume_final_validation: Option<Arc<tokio::sync::Notify>>,
+    final_persisted_reload_reached: Option<Arc<tokio::sync::Notify>>,
+    resume_final_persisted_reload: Option<Arc<tokio::sync::Notify>>,
+    observations: Option<tokio::sync::mpsc::Sender<B1TestEvent>>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum B1TestPass {
+    C1,
+    C2,
+    C3,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum B1TestInventoryStage {
+    A,
+    B,
+    C,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum B1TestSurface {
+    Staged,
+    Unstaged,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct B1TestInventoryObservation {
+    file_count: usize,
+    digest: u64,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct B1TestSectionObservation {
+    kind: u8,
+    additions: Option<u32>,
+    deletions: Option<u32>,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct B1TestEvidenceObservation {
+    entry_count: usize,
+    normalized_path_keys: Vec<u8>,
+    staged: B1TestSectionObservation,
+    unstaged: B1TestSectionObservation,
+    mode_head: u8,
+    mode_index: u8,
+    mode_worktree: u8,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum B1TestEvent {
+    InventoryCompleted {
+        stage: B1TestInventoryStage,
+        observation: B1TestInventoryObservation,
+    },
+    ClassificationPassStarted {
+        pass: B1TestPass,
+    },
+    NumstatCompleted {
+        pass: B1TestPass,
+        path_key: u8,
+        surface: B1TestSurface,
+        additions: Option<u32>,
+        deletions: Option<u32>,
+        binary: bool,
+        mode_only: bool,
+    },
+    ClassificationPassCompleted {
+        pass: B1TestPass,
+        observation: B1TestEvidenceObservation,
+    },
+    EvidenceComparisonCompleted {
+        equal: bool,
+    },
+    FinalEvidenceComparisonCompleted {
+        equal: bool,
+    },
+    FinalPersistedStateReloadStarted,
+    FinalPersistedStateReloadCompleted {
+        lifecycle: B1TestLifecycle,
+        accepted: bool,
+    },
+    FinalValidationStarted {
+        stage: B1TestInventoryStage,
+    },
+    FinalValidationCompleted {
+        stage: B1TestInventoryStage,
+    },
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum B1TestLifecycle {
+    Eligible,
+    Removing,
+    Other,
 }
 #[derive(Clone)]
 struct ProtectedRepository {
@@ -798,7 +897,249 @@ async fn pause_after_b1_numstat(state: &DesktopState) {
         return;
     };
     hooks.post_numstat_reached.notify_one();
-    hooks.resume_post_numstat.notified().await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        hooks.resume_post_numstat.notified(),
+    )
+    .await;
+}
+
+#[cfg(test)]
+async fn pause_after_b1_c2_equality(state: &DesktopState) {
+    let Some(hooks) = state.b1_test_hooks.as_ref() else {
+        return;
+    };
+    if let Some(reached) = &hooks.post_c2_equality_reached {
+        reached.notify_one();
+    }
+    if let Some(resume) = &hooks.resume_post_c2_equality {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), resume.notified()).await;
+    }
+}
+#[cfg(test)]
+fn observe_b1(state: &DesktopState, event: B1TestEvent) {
+    if let Some(sender) = state
+        .b1_test_hooks
+        .as_ref()
+        .and_then(|hooks| hooks.observations.as_ref())
+    {
+        let _ = sender.try_send(event);
+    }
+}
+
+/// Test-only coordination point at the real post-inventory validation boundary.
+#[cfg(test)]
+async fn pause_before_b1_final_validation(state: &DesktopState) {
+    let Some(hooks) = state.b1_test_hooks.as_ref() else {
+        return;
+    };
+    if let Some(reached) = &hooks.final_validation_reached {
+        reached.notify_one();
+    }
+    if let Some(resume) = &hooks.resume_final_validation {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), resume.notified()).await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_before_b1_final_persisted_reload(state: &DesktopState) {
+    let Some(hooks) = state.b1_test_hooks.as_ref() else {
+        return;
+    };
+    if let Some(reached) = &hooks.final_persisted_reload_reached {
+        reached.notify_one();
+    }
+    if let Some(resume) = &hooks.resume_final_persisted_reload {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), resume.notified()).await;
+    }
+}
+
+#[cfg(test)]
+fn b1_test_inventory_observation(
+    inventory: &WorktreeChangeInventory,
+) -> B1TestInventoryObservation {
+    // FNV-1a produces a deterministic, path-sanitising digest of precisely the
+    // inventory fields the production equality check compares.
+    let mut digest = 0xcbf29ce484222325_u64;
+    for file in &inventory.files {
+        for byte in file.path.as_str().as_bytes() {
+            digest ^= u64::from(*byte);
+            digest = digest.wrapping_mul(0x100000001b3);
+        }
+        for value in [
+            b1_test_change_kind(file.index_change),
+            b1_test_change_kind(file.worktree_change),
+            b1_test_conflict_kind(file.conflict),
+            u8::from(file.untracked),
+            b1_test_mode(file.mode_head),
+            b1_test_mode(file.mode_index),
+            b1_test_mode(file.mode_worktree),
+        ] {
+            digest ^= u64::from(value);
+            digest = digest.wrapping_mul(0x100000001b3);
+        }
+        digest ^= u64::from(u8::from(file.submodule.is_some()));
+        digest = digest.wrapping_mul(0x100000001b3);
+        if let Some(submodule) = file.submodule {
+            for value in [
+                u8::from(submodule.commit_changed),
+                u8::from(submodule.modified),
+                u8::from(submodule.untracked),
+            ] {
+                digest ^= u64::from(value);
+                digest = digest.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    B1TestInventoryObservation {
+        file_count: inventory.files.len(),
+        digest,
+    }
+}
+
+#[cfg(test)]
+fn b1_test_change_kind(kind: Option<sentinel_git::ChangeKind>) -> u8 {
+    match kind {
+        None => 0,
+        Some(sentinel_git::ChangeKind::Added) => 1,
+        Some(sentinel_git::ChangeKind::Modified) => 2,
+        Some(sentinel_git::ChangeKind::Deleted) => 3,
+        Some(sentinel_git::ChangeKind::TypeChanged) => 4,
+    }
+}
+
+#[cfg(test)]
+fn b1_test_conflict_kind(kind: Option<sentinel_git::ConflictKind>) -> u8 {
+    match kind {
+        None => 0,
+        Some(sentinel_git::ConflictKind::BothDeleted) => 1,
+        Some(sentinel_git::ConflictKind::AddedByUs) => 2,
+        Some(sentinel_git::ConflictKind::DeletedByThem) => 3,
+        Some(sentinel_git::ConflictKind::AddedByThem) => 4,
+        Some(sentinel_git::ConflictKind::DeletedByUs) => 5,
+        Some(sentinel_git::ConflictKind::BothAdded) => 6,
+        Some(sentinel_git::ConflictKind::BothModified) => 7,
+    }
+}
+
+#[cfg(test)]
+fn b1_test_mode(mode: Option<RepositoryMode>) -> u8 {
+    match mode {
+        None => 0,
+        Some(RepositoryMode::Absent) => 1,
+        Some(RepositoryMode::Regular) => 2,
+        Some(RepositoryMode::Executable) => 3,
+        Some(RepositoryMode::SymbolicLink) => 4,
+        Some(RepositoryMode::Gitlink) => 5,
+    }
+}
+
+#[cfg(test)]
+fn b1_test_section_observation(section: &DiffSectionClassification) -> B1TestSectionObservation {
+    match section {
+        DiffSectionClassification::NotApplicable => B1TestSectionObservation {
+            kind: 0,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::TextEligible(metadata) => B1TestSectionObservation {
+            kind: 1,
+            additions: Some(metadata.additions),
+            deletions: Some(metadata.deletions),
+        },
+        DiffSectionClassification::Binary => B1TestSectionObservation {
+            kind: 2,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::ModeOnly => B1TestSectionObservation {
+            kind: 3,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::SymlinkMetadataOnly => B1TestSectionObservation {
+            kind: 4,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::SubmoduleMetadataOnly => B1TestSectionObservation {
+            kind: 5,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::UntrackedContentDeferred => B1TestSectionObservation {
+            kind: 6,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::ConflictContentDeferred => B1TestSectionObservation {
+            kind: 7,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::ExternalFilterDeferred => B1TestSectionObservation {
+            kind: 8,
+            additions: None,
+            deletions: None,
+        },
+        DiffSectionClassification::UnsupportedType => B1TestSectionObservation {
+            kind: 9,
+            additions: None,
+            deletions: None,
+        },
+    }
+}
+
+#[cfg(test)]
+fn b1_test_evidence_observation(evidence: &FileDiffClassification) -> B1TestEvidenceObservation {
+    B1TestEvidenceObservation {
+        entry_count: 1,
+        normalized_path_keys: vec![0],
+        staged: b1_test_section_observation(&evidence.staged),
+        unstaged: b1_test_section_observation(&evidence.unstaged),
+        mode_head: b1_test_mode(evidence.mode_head),
+        mode_index: b1_test_mode(evidence.mode_index),
+        mode_worktree: b1_test_mode(evidence.mode_worktree),
+    }
+}
+
+#[cfg(test)]
+fn observe_b1_numstat(
+    state: &DesktopState,
+    pass: B1TestPass,
+    surface: B1TestSurface,
+    section: &DiffSectionClassification,
+) {
+    let (additions, deletions, binary, mode_only) = match section {
+        DiffSectionClassification::TextEligible(metadata) => (
+            Some(metadata.additions),
+            Some(metadata.deletions),
+            false,
+            false,
+        ),
+        DiffSectionClassification::Binary => (None, None, true, false),
+        DiffSectionClassification::ModeOnly => (None, None, false, true),
+        // These outcomes do not follow a completed numstat observation.
+        DiffSectionClassification::NotApplicable
+        | DiffSectionClassification::SymlinkMetadataOnly
+        | DiffSectionClassification::SubmoduleMetadataOnly
+        | DiffSectionClassification::UntrackedContentDeferred
+        | DiffSectionClassification::ConflictContentDeferred
+        | DiffSectionClassification::ExternalFilterDeferred
+        | DiffSectionClassification::UnsupportedType => return,
+    };
+    observe_b1(
+        state,
+        B1TestEvent::NumstatCompleted {
+            pass,
+            path_key: 0,
+            surface,
+            additions,
+            deletions,
+            binary,
+            mode_only,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -908,6 +1249,8 @@ async fn inspect_worktree_changes_impl(
         state,
         &worktree_id,
         &project_id,
+        #[cfg(test)]
+        None,
     ))
     .await;
     release_project_worktree_lock(state, &project_id).await;
@@ -921,7 +1264,10 @@ async fn inspect_worktree_changes_locked(
     state: &DesktopState,
     worktree_id: &WorktreeId,
     project_id: &ProjectId,
+    #[cfg(test)] b1_inventory_stage: Option<B1TestInventoryStage>,
 ) -> Result<WorktreeChangeInventory, SafeError> {
+    #[cfg(test)]
+    let _ = b1_inventory_stage;
     let row = state
         .repository
         .get_worktree(worktree_id)
@@ -984,6 +1330,118 @@ async fn inspect_worktree_changes_locked(
     })
 }
 
+fn same_b1_project(left: &Project, right: &Project) -> bool {
+    left.id == right.id
+        && left.repository_identity == right.repository_identity
+        && left.repository_fingerprint == right.repository_fingerprint
+        && left.fingerprint_scheme == right.fingerprint_scheme
+        && left.repository_root == right.repository_root
+        && left.primary_root == right.primary_root
+        && left.git_common_dir == right.git_common_dir
+        && left.validation_state == right.validation_state
+        && left.is_primary_worktree == right.is_primary_worktree
+}
+
+fn same_b1_worktree(left: &ManagedWorktree, right: &ManagedWorktree) -> bool {
+    left.id == right.id
+        && left.project_id == right.project_id
+        && left.path == right.path
+        && left.base_commit == right.base_commit
+        && left.repository_identity == right.repository_identity
+        && left.repository_fingerprint == right.repository_fingerprint
+}
+
+#[cfg(test)]
+fn b1_test_lifecycle(state: ManagedWorktreeState) -> B1TestLifecycle {
+    match state {
+        ManagedWorktreeState::Ready | ManagedWorktreeState::RetainedDirty => {
+            B1TestLifecycle::Eligible
+        }
+        ManagedWorktreeState::Removing => B1TestLifecycle::Removing,
+        _ => B1TestLifecycle::Other,
+    }
+}
+
+async fn refresh_b1_acceptance_state(
+    state: &DesktopState,
+    worktree_id: &WorktreeId,
+    project_id: &ProjectId,
+    expected_project: &Project,
+    expected_worktree: &ManagedWorktree,
+) -> Result<(Project, ManagedWorktree), SafeError> {
+    let project = strict_project_for_worktree(state, project_id).await?;
+    let row = state
+        .repository
+        .get_worktree(worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    #[cfg(test)]
+    {
+        let accepted = same_b1_project(&project, expected_project)
+            && same_b1_worktree(&row, expected_worktree)
+            && row.project_id == *project_id
+            && inventory_eligible(row.state);
+        observe_b1(
+            state,
+            B1TestEvent::FinalPersistedStateReloadCompleted {
+                lifecycle: b1_test_lifecycle(row.state),
+                accepted,
+            },
+        );
+    }
+    if !inventory_eligible(row.state) || row.project_id != *project_id {
+        return Err(SafeError {
+            code: "worktree_not_ready",
+            message: "This worktree is not available for inspection.",
+        });
+    }
+    if !same_b1_project(&project, expected_project) {
+        return Err(SafeError {
+            code: "project_identity_changed",
+            message: "The registered repository was replaced or changed identity.",
+        });
+    }
+    if !same_b1_worktree(&row, expected_worktree) {
+        return Err(SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        });
+    }
+    Ok((project, row))
+}
+
+async fn validate_b1_refreshed_repository_state(
+    state: &DesktopState,
+    project: &Project,
+    row: &ManagedWorktree,
+) -> Result<(), SafeError> {
+    let stored = PathBuf::from(&row.path);
+    let leaf = validate_managed_leaf(&state.worktree_root, &row.project_id, &row.id, &stored)
+        .map_err(|_| SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        })?;
+    let inspection = inspect_repository(&leaf).await.map_err(inventory_error)?;
+    if inspection.is_primary
+        || inspection.identity != row.repository_identity
+        || inspection.fingerprint.as_str() != row.repository_fingerprint
+        || inspection.head.as_deref() != Some(row.base_commit.as_str())
+        || !matches!(
+            worktree_metadata_lookup(Path::new(&project.repository_root), &leaf).await,
+            Ok(WorktreeMetadataLookup::Present)
+        )
+    {
+        return Err(SafeError {
+            code: "ownership_validation_failed",
+            message: "The managed worktree could not be verified.",
+        });
+    }
+    Ok(())
+}
+
 fn change_not_found_error() -> SafeError {
     SafeError {
         code: "change_not_found",
@@ -1020,7 +1478,7 @@ fn section_has_change(file: &ChangedFile, staged: bool) -> bool {
 fn is_regular_or_absent(mode: Option<RepositoryMode>) -> bool {
     matches!(
         mode,
-        Some(RepositoryMode::Absent | RepositoryMode::Regular | RepositoryMode::Executable)
+        None | Some(RepositoryMode::Absent | RepositoryMode::Regular | RepositoryMode::Executable)
     )
 }
 
@@ -1113,7 +1571,14 @@ async fn classify_section_locked(
     }
     // Re-run the complete Phase 3C-A orchestration before each path-following
     // command, then use only its freshly generated path entry.
-    let fresh = inspect_worktree_changes_locked(state, worktree_id, project_id).await?;
+    let fresh = inspect_worktree_changes_locked(
+        state,
+        worktree_id,
+        project_id,
+        #[cfg(test)]
+        None,
+    )
+    .await?;
     let fresh_file = fresh
         .files
         .iter()
@@ -1211,43 +1676,208 @@ async fn inspect_worktree_file_diff_classification_impl(
             code: "worktree_not_found",
             message: "The managed worktree was not found.",
         })?;
-    acquire_project_worktree_lock(state, &initial.project_id).await?;
     let project_id = initial.project_id.clone();
-    let result = async {
-        let inventory = inspect_worktree_changes_locked(state, &worktree_id, &project_id).await?;
-        let file = inventory
-            .files
-            .iter()
-            .find(|file| file.path == selected_path)
-            .cloned()
-            .ok_or_else(change_not_found_error)?;
-        let staged = classify_section_locked(state, &worktree_id, &project_id, &file, true).await?;
-        let unstaged =
-            classify_section_locked(state, &worktree_id, &project_id, &file, false).await?;
+    let initial_project = state
+        .repository
+        .get_project(&project_id)
+        .await
+        .map_err(project_storage_error)?;
+    acquire_project_worktree_lock(state, &project_id).await?;
+    let result = match with_inventory_operation_context(async {
+        let inventory_a = inspect_worktree_changes_locked(
+            state,
+            &worktree_id,
+            &project_id,
+            #[cfg(test)]
+            Some(B1TestInventoryStage::A),
+        )
+        .await?;
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::InventoryCompleted {
+                stage: B1TestInventoryStage::A,
+                observation: b1_test_inventory_observation(&inventory_a),
+            },
+        );
+        let evidence_one = collect_b1_classification_evidence(
+            state,
+            &worktree_id,
+            &project_id,
+            &selected_path,
+            &inventory_a,
+            #[cfg(test)]
+            B1TestPass::C1,
+        )
+        .await?;
         #[cfg(test)]
         pause_after_b1_numstat(state).await;
-        let after = inspect_worktree_changes_locked(state, &worktree_id, &project_id).await?;
-        let after_file = after
-            .files
-            .iter()
-            .find(|candidate| candidate.path == file.path)
-            .ok_or_else(change_stale_error)?;
-        if after_file != &file {
+        let inventory_b = inspect_worktree_changes_locked(
+            state,
+            &worktree_id,
+            &project_id,
+            #[cfg(test)]
+            Some(B1TestInventoryStage::B),
+        )
+        .await?;
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::InventoryCompleted {
+                stage: B1TestInventoryStage::B,
+                observation: b1_test_inventory_observation(&inventory_b),
+            },
+        );
+        if inventory_a.files != inventory_b.files {
             return Err(change_stale_error());
         }
-        Ok(FileDiffClassification {
-            worktree_id,
-            path: file.path,
-            staged,
-            unstaged,
-            mode_head: file.mode_head,
-            mode_index: file.mode_index,
-            mode_worktree: file.mode_worktree,
-        })
-    }
-    .await;
+        let evidence_two = collect_b1_classification_evidence(
+            state,
+            &worktree_id,
+            &project_id,
+            &selected_path,
+            &inventory_b,
+            #[cfg(test)]
+            B1TestPass::C2,
+        )
+        .await?;
+        if evidence_one != evidence_two {
+            #[cfg(test)]
+            observe_b1(
+                state,
+                B1TestEvent::EvidenceComparisonCompleted { equal: false },
+            );
+            return Err(change_stale_error());
+        }
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::EvidenceComparisonCompleted { equal: true },
+        );
+        #[cfg(test)]
+        pause_after_b1_c2_equality(state).await;
+        let inventory_c = inspect_worktree_changes_locked(
+            state,
+            &worktree_id,
+            &project_id,
+            #[cfg(test)]
+            Some(B1TestInventoryStage::C),
+        )
+        .await?;
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::InventoryCompleted {
+                stage: B1TestInventoryStage::C,
+                observation: b1_test_inventory_observation(&inventory_c),
+            },
+        );
+        if inventory_a.files != inventory_c.files || inventory_b.files != inventory_c.files {
+            return Err(change_stale_error());
+        }
+        let evidence_three = collect_b1_classification_evidence(
+            state,
+            &worktree_id,
+            &project_id,
+            &selected_path,
+            &inventory_c,
+            #[cfg(test)]
+            B1TestPass::C3,
+        )
+        .await?;
+        if evidence_two != evidence_three {
+            #[cfg(test)]
+            observe_b1(
+                state,
+                B1TestEvent::FinalEvidenceComparisonCompleted { equal: false },
+            );
+            return Err(change_stale_error());
+        }
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::FinalEvidenceComparisonCompleted { equal: true },
+        );
+        #[cfg(test)]
+        observe_b1(state, B1TestEvent::FinalPersistedStateReloadStarted);
+        #[cfg(test)]
+        pause_before_b1_final_persisted_reload(state).await;
+        let (project, row) = refresh_b1_acceptance_state(
+            state,
+            &worktree_id,
+            &project_id,
+            &initial_project,
+            &initial,
+        )
+        .await?;
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::FinalValidationStarted {
+                stage: B1TestInventoryStage::C,
+            },
+        );
+        #[cfg(test)]
+        pause_before_b1_final_validation(state).await;
+        validate_b1_refreshed_repository_state(state, &project, &row).await?;
+        #[cfg(test)]
+        observe_b1(
+            state,
+            B1TestEvent::FinalValidationCompleted {
+                stage: B1TestInventoryStage::C,
+            },
+        );
+        Ok(evidence_three)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(inventory_error(error)),
+    };
     release_project_worktree_lock(state, &project_id).await;
     result
+}
+
+async fn collect_b1_classification_evidence(
+    state: &DesktopState,
+    worktree_id: &WorktreeId,
+    project_id: &ProjectId,
+    selected_path: &RepositoryRelativePath,
+    inventory: &WorktreeChangeInventory,
+    #[cfg(test)] pass: B1TestPass,
+) -> Result<FileDiffClassification, SafeError> {
+    #[cfg(test)]
+    observe_b1(state, B1TestEvent::ClassificationPassStarted { pass });
+    let file = inventory
+        .files
+        .iter()
+        .find(|file| file.path == *selected_path)
+        .cloned()
+        .ok_or_else(change_not_found_error)?;
+    let staged = classify_section_locked(state, worktree_id, project_id, &file, true).await?;
+    #[cfg(test)]
+    observe_b1_numstat(state, pass, B1TestSurface::Staged, &staged);
+    let unstaged = classify_section_locked(state, worktree_id, project_id, &file, false).await?;
+    #[cfg(test)]
+    observe_b1_numstat(state, pass, B1TestSurface::Unstaged, &unstaged);
+    let evidence = FileDiffClassification {
+        worktree_id: worktree_id.clone(),
+        path: file.path,
+        staged,
+        unstaged,
+        mode_head: file.mode_head,
+        mode_index: file.mode_index,
+        mode_worktree: file.mode_worktree,
+    };
+    #[cfg(test)]
+    observe_b1(
+        state,
+        B1TestEvent::ClassificationPassCompleted {
+            pass,
+            observation: b1_test_evidence_observation(&evidence),
+        },
+    );
+    Ok(evidence)
 }
 #[tauri::command]
 async fn create_project_worktree(
@@ -1928,6 +2558,55 @@ mod bridge_tests {
     use std::process::{Command, Stdio};
     use tempfile::tempdir;
 
+    const B1_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn collect_b1_events(
+        receiver: &mut tokio::sync::mpsc::Receiver<B1TestEvent>,
+        expected_count: usize,
+    ) -> Vec<B1TestEvent> {
+        let mut events = Vec::with_capacity(expected_count);
+        for _ in 0..expected_count {
+            let event = tokio::time::timeout(B1_TEST_TIMEOUT, receiver.recv())
+                .await
+                .expect("B1 observation must arrive before the bounded test timeout")
+                .expect("B1 observation channel must remain open during the request");
+            events.push(event);
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "B1 request emitted an unexpected observation"
+        );
+        events
+    }
+
+    async fn await_b1_request(
+        task: &mut tokio::task::JoinHandle<Result<FileDiffClassification, SafeError>>,
+    ) -> Result<FileDiffClassification, SafeError> {
+        match tokio::time::timeout(B1_TEST_TIMEOUT, &mut *task).await {
+            Ok(joined) => joined.expect("B1 task must not panic"),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                panic!("B1 request did not terminate before the bounded test timeout");
+            }
+        }
+    }
+
+    async fn await_b1_post_numstat_pause(
+        reached: &tokio::sync::Notify,
+        resume: &tokio::sync::Notify,
+        task: &mut tokio::task::JoinHandle<Result<FileDiffClassification, SafeError>>,
+    ) {
+        if tokio::time::timeout(B1_TEST_TIMEOUT, reached.notified())
+            .await
+            .is_err()
+        {
+            resume.notify_one();
+            let _ = await_b1_request(task).await;
+            panic!("first complete evidence pass did not reach its bounded pause");
+        }
+    }
+
     fn fixture_git(directory: &Path, args: &[&str]) {
         let output = Command::new("/usr/bin/git")
             .args(args)
@@ -2309,7 +2988,6 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_classification_uses_fresh_inventory_and_preserves_both_worktrees() {
         let (fixture, state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
         let leaf = PathBuf::from(&row.path);
@@ -2350,7 +3028,10 @@ mod bridge_tests {
         std::fs::write(leaf.join(".gitattributes"), "README.md diff=fixture\n").unwrap();
         let managed_before = inventory_snapshot(&leaf, "untracked file").await;
         let primary_before = inventory_snapshot(&primary, "untracked file").await;
-        let selected_path = legacy_unsafe_status_control(&leaf)
+        let selected_path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
             .into_iter()
             .find(|file| file.path.as_str() == "README.md")
             .unwrap()
@@ -2463,7 +3144,6 @@ mod bridge_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_defers_clean_and_process_filters_without_launching_helpers() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2494,7 +3174,10 @@ mod bridge_tests {
             std::fs::write(leaf.join("README.md"), format!("{kind} filtered change")).unwrap();
             let managed_before = inventory_snapshot(&leaf, "untracked file").await;
             let primary_before = inventory_snapshot(&primary, "untracked file").await;
-            let selected_path = legacy_unsafe_status_control(&leaf)
+            let selected_path = inspect_worktree_changes_impl(&state, row.id.clone())
+                .await
+                .unwrap()
+                .files
                 .into_iter()
                 .find(|file| file.path.as_str() == "README.md")
                 .unwrap()
@@ -2780,7 +3463,6 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_rejects_a_lifecycle_transition_after_numstat_before_final_validation() {
         let test_timeout = std::time::Duration::from_secs(5);
         let (fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
@@ -2790,7 +3472,10 @@ mod bridge_tests {
         fixture_git(&leaf, &["add", "README.md"]);
         let managed_before = inventory_snapshot(&leaf, "untracked file").await;
         let primary_before = inventory_snapshot(&primary, "untracked file").await;
-        let selected_path = legacy_unsafe_status_control(&leaf)
+        let selected_path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
             .into_iter()
             .find(|file| file.path.as_str() == "README.md")
             .expect("staged path is inventoried")
@@ -2801,6 +3486,13 @@ mod bridge_tests {
         state.b1_test_hooks = Some(B1TestHooks {
             post_numstat_reached: post_numstat_reached.clone(),
             resume_post_numstat: resume_post_numstat.clone(),
+            post_c2_equality_reached: None,
+            resume_post_c2_equality: None,
+            final_validation_reached: None,
+            resume_final_validation: None,
+            final_persisted_reload_reached: None,
+            resume_final_persisted_reload: None,
+            observations: None,
         });
         let reached = post_numstat_reached.notified();
         let service_state = state.clone();
@@ -2903,6 +3595,532 @@ mod bridge_tests {
         release_project_worktree_lock(&state, &row.project_id).await;
     }
 
+    #[tokio::test]
+    async fn production_b1_rejects_transient_content_change_between_evidence_passes() {
+        let (fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        const V1: &str = "v1\nadded-one\n";
+        const V2: &str = "v2\nadded-one\nadded-two\nadded-three\n";
+        std::fs::write(leaf.join("README.md"), V1).unwrap();
+        let selected_path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let (observations, mut receiver) = tokio::sync::mpsc::channel(24);
+        state.b1_test_hooks = Some(B1TestHooks {
+            post_numstat_reached: reached.clone(),
+            resume_post_numstat: resume.clone(),
+            post_c2_equality_reached: None,
+            resume_post_c2_equality: None,
+            final_validation_reached: None,
+            resume_final_validation: None,
+            final_persisted_reload_reached: None,
+            resume_final_persisted_reload: None,
+            observations: Some(observations),
+        });
+        let service_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            inspect_worktree_file_diff_classification_impl(
+                &service_state,
+                row.id.clone(),
+                selected_path,
+            )
+            .await
+        });
+        await_b1_post_numstat_pause(&reached, &resume, &mut task).await;
+        // Both versions are ordinary unstaged modifications; only real numstat
+        // counts differ, so inventory A and B remain equal at ChangedFile level.
+        std::fs::write(leaf.join("README.md"), V2).unwrap();
+        resume.notify_one();
+        let error = await_b1_request(&mut task)
+            .await
+            .expect_err("different C1/C2 numstat evidence must fail closed");
+        let events = collect_b1_events(&mut receiver, 9).await;
+        let [B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::A,
+            observation: inventory_a,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C1,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C1,
+            path_key: first_path_key,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(2),
+            deletions: Some(1),
+            binary: false,
+            mode_only: false,
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C1,
+            observation: evidence_one,
+        }, B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::B,
+            observation: inventory_b,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C2,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C2,
+            path_key: second_path_key,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(4),
+            deletions: Some(1),
+            binary: false,
+            mode_only: false,
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C2,
+            observation: evidence_two,
+        }, B1TestEvent::EvidenceComparisonCompleted { equal: false }] = events.as_slice()
+        else {
+            panic!("unexpected transient B1 observation sequence: {events:?}");
+        };
+        assert_eq!(inventory_a, inventory_b, "inventory A must equal B");
+        assert_eq!(inventory_a.file_count, 1);
+        assert_eq!(first_path_key, second_path_key);
+        assert_ne!(
+            evidence_one, evidence_two,
+            "complete C1/C2 evidence differs"
+        );
+        assert_eq!(evidence_one.entry_count, 1);
+        assert_eq!(
+            evidence_one.normalized_path_keys,
+            evidence_two.normalized_path_keys
+        );
+        assert_eq!(evidence_one.staged, evidence_two.staged);
+        assert_ne!(evidence_one.unstaged, evidence_two.unstaged);
+        assert_eq!(evidence_one.mode_head, evidence_two.mode_head);
+        assert_eq!(evidence_one.mode_index, evidence_two.mode_index);
+        assert_eq!(evidence_one.mode_worktree, evidence_two.mode_worktree);
+        assert_eq!(error.code, "change_stale");
+        assert_eq!(std::fs::read_to_string(leaf.join("README.md")).unwrap(), V2);
+        drop(fixture);
+    }
+
+    #[tokio::test]
+    async fn production_b1_stable_content_executes_two_matching_evidence_passes() {
+        let (_fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        std::fs::write(leaf.join("README.md"), "stable\nadded-one\n").unwrap();
+        let path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let (observations, mut receiver) = tokio::sync::mpsc::channel(24);
+        state.b1_test_hooks = Some(B1TestHooks {
+            post_numstat_reached: reached.clone(),
+            resume_post_numstat: resume.clone(),
+            post_c2_equality_reached: None,
+            resume_post_c2_equality: None,
+            final_validation_reached: None,
+            resume_final_validation: None,
+            final_persisted_reload_reached: None,
+            resume_final_persisted_reload: None,
+            observations: Some(observations),
+        });
+        let service_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            inspect_worktree_file_diff_classification_impl(&service_state, row.id.clone(), path)
+                .await
+        });
+        await_b1_post_numstat_pause(&reached, &resume, &mut task).await;
+        resume.notify_one();
+        let events = collect_b1_events(&mut receiver, 18).await;
+        let [B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::A,
+            observation: inventory_a,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C1,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C1,
+            path_key: first_path_key,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(2),
+            deletions: Some(1),
+            binary: false,
+            mode_only: false,
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C1,
+            observation: evidence_one,
+        }, B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::B,
+            observation: inventory_b,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C2,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C2,
+            path_key: second_path_key,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(2),
+            deletions: Some(1),
+            binary: false,
+            mode_only: false,
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C2,
+            observation: evidence_two,
+        }, B1TestEvent::EvidenceComparisonCompleted { equal: true }, B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::C,
+            observation: inventory_c,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C3,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C3,
+            path_key: third_path_key,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(2),
+            deletions: Some(1),
+            binary: false,
+            mode_only: false,
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C3,
+            observation: evidence_three,
+        }, B1TestEvent::FinalEvidenceComparisonCompleted { equal: true }, B1TestEvent::FinalPersistedStateReloadStarted, B1TestEvent::FinalPersistedStateReloadCompleted {
+            lifecycle: B1TestLifecycle::Eligible,
+            accepted: true,
+        }, B1TestEvent::FinalValidationStarted {
+            stage: B1TestInventoryStage::C,
+        }, B1TestEvent::FinalValidationCompleted {
+            stage: B1TestInventoryStage::C,
+        }] = events.as_slice()
+        else {
+            panic!("unexpected stable B1 observation sequence: {events:?}");
+        };
+        assert_eq!(inventory_a, inventory_b, "inventory A must equal B");
+        assert_eq!(inventory_b, inventory_c, "inventory B must equal C");
+        assert_eq!(inventory_a, inventory_c, "inventory A must equal C");
+        assert_eq!(inventory_a.file_count, 1);
+        assert_eq!(first_path_key, second_path_key);
+        assert_eq!(second_path_key, third_path_key);
+        assert_eq!(
+            evidence_one, evidence_two,
+            "complete C1/C2 evidence matches"
+        );
+        assert_eq!(
+            evidence_two, evidence_three,
+            "complete C2/C3 evidence matches"
+        );
+        assert_eq!(evidence_one.entry_count, 1);
+        assert_eq!(evidence_one.normalized_path_keys, vec![0]);
+        assert_eq!(evidence_one.unstaged.additions, Some(2));
+        assert_eq!(evidence_one.unstaged.deletions, Some(1));
+        let classification = await_b1_request(&mut task)
+            .await
+            .expect("InventoryCompleted(C) must precede the successful DTO");
+        assert_eq!(
+            classification.unstaged,
+            DiffSectionClassification::TextEligible(TextEligibleMetadata {
+                additions: 2,
+                deletions: 1
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn production_b1_rejects_content_change_after_c2_before_final_evidence() {
+        let (fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        const V1: &str = "v1\nadded-one\n";
+        const V2: &str = "v2\nadded-one\nadded-two\nadded-three\n";
+        std::fs::write(leaf.join("README.md"), V1).unwrap();
+        let path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        let post_numstat_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_post_numstat = Arc::new(tokio::sync::Notify::new());
+        let post_c2_equality_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_post_c2_equality = Arc::new(tokio::sync::Notify::new());
+        let (observations, mut receiver) = tokio::sync::mpsc::channel(24);
+        state.b1_test_hooks = Some(B1TestHooks {
+            post_numstat_reached: post_numstat_reached.clone(),
+            resume_post_numstat: resume_post_numstat.clone(),
+            post_c2_equality_reached: Some(post_c2_equality_reached.clone()),
+            resume_post_c2_equality: Some(resume_post_c2_equality.clone()),
+            final_validation_reached: None,
+            resume_final_validation: None,
+            final_persisted_reload_reached: None,
+            resume_final_persisted_reload: None,
+            observations: Some(observations),
+        });
+        let c2_equality_wait = post_c2_equality_reached.notified();
+        let service_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            inspect_worktree_file_diff_classification_impl(&service_state, row.id.clone(), path)
+                .await
+        });
+        await_b1_post_numstat_pause(&post_numstat_reached, &resume_post_numstat, &mut task).await;
+        resume_post_numstat.notify_one();
+        tokio::time::timeout(B1_TEST_TIMEOUT, c2_equality_wait)
+            .await
+            .expect("C1/C2 equality must precede the post-C2 mutation");
+        std::fs::write(leaf.join("README.md"), V2).unwrap();
+        resume_post_c2_equality.notify_one();
+        let error = await_b1_request(&mut task)
+            .await
+            .expect_err("post-C2 content drift must fail C2/C3 coherence");
+        let events = collect_b1_events(&mut receiver, 14).await;
+        let [B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::A,
+            observation: inventory_a,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C1,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C1,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(2),
+            deletions: Some(1),
+            ..
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C1,
+            observation: evidence_one,
+        }, B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::B,
+            observation: inventory_b,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C2,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C2,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(2),
+            deletions: Some(1),
+            ..
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C2,
+            observation: evidence_two,
+        }, B1TestEvent::EvidenceComparisonCompleted { equal: true }, B1TestEvent::InventoryCompleted {
+            stage: B1TestInventoryStage::C,
+            observation: inventory_c,
+        }, B1TestEvent::ClassificationPassStarted {
+            pass: B1TestPass::C3,
+        }, B1TestEvent::NumstatCompleted {
+            pass: B1TestPass::C3,
+            surface: B1TestSurface::Unstaged,
+            additions: Some(4),
+            deletions: Some(1),
+            ..
+        }, B1TestEvent::ClassificationPassCompleted {
+            pass: B1TestPass::C3,
+            observation: evidence_three,
+        }, B1TestEvent::FinalEvidenceComparisonCompleted { equal: false }] = events.as_slice()
+        else {
+            panic!("unexpected post-C2 drift sequence: {events:?}");
+        };
+        assert_eq!(inventory_a, inventory_b);
+        assert_eq!(inventory_b, inventory_c);
+        assert_eq!(evidence_one, evidence_two);
+        assert_ne!(evidence_two, evidence_three);
+        assert_eq!(error.code, "change_stale");
+        assert_eq!(std::fs::read_to_string(leaf.join("README.md")).unwrap(), V2);
+        drop(fixture);
+    }
+
+    #[tokio::test]
+    async fn production_b1_rejects_lifecycle_transition_after_inventory_c_begins() {
+        let (_fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        std::fs::write(leaf.join("README.md"), "stable\nadded-one\n").unwrap();
+        let path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        let post_numstat_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_post_numstat = Arc::new(tokio::sync::Notify::new());
+        let final_persisted_reload_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_final_persisted_reload = Arc::new(tokio::sync::Notify::new());
+        let (observations, mut receiver) = tokio::sync::mpsc::channel(24);
+        state.b1_test_hooks = Some(B1TestHooks {
+            post_numstat_reached: post_numstat_reached.clone(),
+            resume_post_numstat: resume_post_numstat.clone(),
+            post_c2_equality_reached: None,
+            resume_post_c2_equality: None,
+            final_validation_reached: None,
+            resume_final_validation: None,
+            final_persisted_reload_reached: Some(final_persisted_reload_reached.clone()),
+            resume_final_persisted_reload: Some(resume_final_persisted_reload.clone()),
+            observations: Some(observations),
+        });
+        let final_reload_wait = final_persisted_reload_reached.notified();
+        let service_state = state.clone();
+        let worktree_id = row.id.clone();
+        let mut task = tokio::spawn(async move {
+            inspect_worktree_file_diff_classification_impl(&service_state, worktree_id, path).await
+        });
+        await_b1_post_numstat_pause(&post_numstat_reached, &resume_post_numstat, &mut task).await;
+        resume_post_numstat.notify_one();
+        tokio::time::timeout(B1_TEST_TIMEOUT, final_reload_wait)
+            .await
+            .expect("matching C3 must reach the final persisted-state reload");
+        let transitioned = state
+            .repository
+            .transition_worktree(
+                &row.id,
+                ManagedWorktreeState::Ready,
+                ManagedWorktreeState::Removing,
+                None,
+            )
+            .await
+            .expect("typed disposable lifecycle transition");
+        assert_eq!(transitioned.state, ManagedWorktreeState::Removing);
+        resume_final_persisted_reload.notify_one();
+        let error = await_b1_request(&mut task)
+            .await
+            .expect_err("late lifecycle revocation must reject the DTO");
+        let events = collect_b1_events(&mut receiver, 16).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                B1TestEvent::InventoryCompleted {
+                    stage: B1TestInventoryStage::A,
+                    ..
+                },
+                _,
+                _,
+                _,
+                B1TestEvent::InventoryCompleted {
+                    stage: B1TestInventoryStage::B,
+                    ..
+                },
+                _,
+                _,
+                _,
+                B1TestEvent::EvidenceComparisonCompleted { equal: true },
+                B1TestEvent::InventoryCompleted {
+                    stage: B1TestInventoryStage::C,
+                    ..
+                },
+                B1TestEvent::ClassificationPassStarted {
+                    pass: B1TestPass::C3,
+                },
+                _,
+                B1TestEvent::ClassificationPassCompleted {
+                    pass: B1TestPass::C3,
+                    ..
+                },
+                B1TestEvent::FinalEvidenceComparisonCompleted { equal: true },
+                B1TestEvent::FinalPersistedStateReloadStarted,
+                B1TestEvent::FinalPersistedStateReloadCompleted {
+                    lifecycle: B1TestLifecycle::Removing,
+                    accepted: false,
+                },
+            ]
+        ));
+        assert_eq!(error.code, "worktree_not_ready");
+        assert_eq!(
+            state.repository.get_worktree(&row.id).await.unwrap().state,
+            ManagedWorktreeState::Removing
+        );
+    }
+
+    #[tokio::test]
+    async fn production_b1_rejects_repository_validation_failure_after_final_validation_started() {
+        let (_fixture, mut state, row) = inventory_fixture(ManagedWorktreeState::Ready).await;
+        let leaf = PathBuf::from(&row.path);
+        std::fs::write(leaf.join("README.md"), "stable\nadded-one\n").unwrap();
+        let path = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files
+            .into_iter()
+            .find(|file| file.path.as_str() == "README.md")
+            .unwrap()
+            .path;
+        let post_numstat_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_post_numstat = Arc::new(tokio::sync::Notify::new());
+        let final_validation_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_final_validation = Arc::new(tokio::sync::Notify::new());
+        let (observations, mut receiver) = tokio::sync::mpsc::channel(24);
+        state.b1_test_hooks = Some(B1TestHooks {
+            post_numstat_reached: post_numstat_reached.clone(),
+            resume_post_numstat: resume_post_numstat.clone(),
+            post_c2_equality_reached: None,
+            resume_post_c2_equality: None,
+            final_validation_reached: Some(final_validation_reached.clone()),
+            resume_final_validation: Some(resume_final_validation.clone()),
+            final_persisted_reload_reached: None,
+            resume_final_persisted_reload: None,
+            observations: Some(observations),
+        });
+        let final_validation_wait = final_validation_reached.notified();
+        let service_state = state.clone();
+        let mut task = tokio::spawn(async move {
+            inspect_worktree_file_diff_classification_impl(&service_state, row.id.clone(), path)
+                .await
+        });
+        await_b1_post_numstat_pause(&post_numstat_reached, &resume_post_numstat, &mut task).await;
+        resume_post_numstat.notify_one();
+        tokio::time::timeout(B1_TEST_TIMEOUT, final_validation_wait)
+            .await
+            .expect("Inventory C must reach its real final validation boundary");
+
+        // The fixture worktree's Git file is removed only while Inventory C is
+        // paused immediately before its final repository inspection.
+        std::fs::remove_file(leaf.join(".git")).unwrap();
+        resume_final_validation.notify_one();
+        let error = await_b1_request(&mut task)
+            .await
+            .expect_err("a failed Inventory C repository validation must reject the DTO");
+        let events = collect_b1_events(&mut receiver, 17).await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                B1TestEvent::InventoryCompleted {
+                    stage: B1TestInventoryStage::A,
+                    ..
+                },
+                _,
+                _,
+                _,
+                B1TestEvent::InventoryCompleted {
+                    stage: B1TestInventoryStage::B,
+                    ..
+                },
+                _,
+                _,
+                _,
+                B1TestEvent::EvidenceComparisonCompleted { equal: true },
+                B1TestEvent::InventoryCompleted {
+                    stage: B1TestInventoryStage::C,
+                    ..
+                },
+                B1TestEvent::ClassificationPassStarted {
+                    pass: B1TestPass::C3,
+                },
+                _,
+                B1TestEvent::ClassificationPassCompleted {
+                    pass: B1TestPass::C3,
+                    ..
+                },
+                B1TestEvent::FinalEvidenceComparisonCompleted { equal: true },
+                B1TestEvent::FinalPersistedStateReloadStarted,
+                B1TestEvent::FinalPersistedStateReloadCompleted {
+                    lifecycle: B1TestLifecycle::Eligible,
+                    accepted: true,
+                },
+                B1TestEvent::FinalValidationStarted {
+                    stage: B1TestInventoryStage::C,
+                },
+            ]
+        ));
+        assert_eq!(error.code, "git_command_failed");
+    }
+
     #[test]
     fn b1_metadata_only_policies_defer_untracked_conflict_symlink_and_gitlink_content() {
         const OID: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -2953,7 +4171,6 @@ mod bridge_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "blocked until Phase 3C-AH2 supplies a complete filter-free inventory"]
     async fn production_b1_service_classifies_binary_mode_symlink_and_untracked_without_content() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2970,7 +4187,10 @@ mod bridge_tests {
         std::fs::write(leaf.join("binary.bin"), [0_u8, 0x9f, 0x92, 0x96]).unwrap();
         std::fs::write(leaf.join("untracked.txt"), "deferred").unwrap();
         fixture_git(&leaf, &["add", "README.md", "managed-link", "binary.bin"]);
-        let inventory = legacy_unsafe_status_control(&leaf);
+        let inventory = inspect_worktree_changes_impl(&state, row.id.clone())
+            .await
+            .unwrap()
+            .files;
         for (name, staged, unstaged) in [
             (
                 "README.md",
@@ -2980,7 +4200,7 @@ mod bridge_tests {
             (
                 "managed-link",
                 DiffSectionClassification::SymlinkMetadataOnly,
-                DiffSectionClassification::NotApplicable,
+                DiffSectionClassification::SymlinkMetadataOnly,
             ),
             (
                 "binary.bin",
