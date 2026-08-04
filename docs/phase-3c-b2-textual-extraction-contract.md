@@ -4,17 +4,38 @@
 
 Phase 3C-B2 contract design is **APPROVED / COMPLETE**; its final contract
 re-review is **CLEAN**, with no remaining blocking contract P1/P2 issues. This
-document is the approved internal baseline for later B2 implementation.
-Implementation is **NOT STARTED**: B2-A, B2-B0, B2-B1, B2-C, and B2-D are each
-**NOT STARTED**. `PLAN.md` remains the operational roadmap: it requires Phase
-3 Git isolation/diffs and eventual final-diff review, but does not specify B2's
-format, API, limits, or eligibility. The completed B1 documents reserve B2 for
-future bounded textual extraction. The decisions labelled **contract default**
-below are necessary conservative choices, not claims that PLAN.md already
-specified them.
+document is the approved internal baseline for later B2 implementation. B2
+implementation is **IN PROGRESS**: B2-A is **COMPLETE** after its **CLEAN**
+final sign-off; B2-B0 is **NOT STARTED — NEXT MANDATORY STAGE**, and B2-B1,
+B2-C, and B2-D are **NOT STARTED**. `PLAN.md` remains the operational
+roadmap: it requires Phase 3 Git isolation/diffs and eventual final-diff review,
+but does not specify B2's format, API, limits, or eligibility. The completed B1
+documents reserve B2 for future bounded textual extraction. The decisions
+labelled **contract default** below are necessary conservative choices, not
+claims that PLAN.md already specified them.
 
-No B2 production code, parser, extraction command, Tauri command, TypeScript
-DTO, or UI exists. B2-B0 grammar/fixture work has not been written or approved.
+B2-A private request/evidence/attribute/budget/outcome types are **COMPLETE**
+after a **CLEAN** final sign-off. Its pure layer binds accepted evidence to the exact
+request plus a later-B2-C-supplied resolved identity, requires every semantic
+attribute eligible whenever a surface is extractable, validates no-final-newline
+metadata across the entire applicable old/new side, and retains evidence through
+opaque exact-allocation tokens. B2-A now retains ordered, unique, bounded
+multi-reason non-extractability evidence: every present non-extractable surface
+must include each reason implied by its semantic attributes, while absent
+surfaces carry no surface reason because they represent no present change
+surface. Filter deferral is an explicit bounded normalized attribute state and
+maps only to `FilterDeferred`. Retained charge and normalized text/line/hunk
+counts are private conservative measurements derived only from structurally
+validated immutable evidence, never supplied by the caller. Direct regressions
+cover every configured/deferred attribute-to-reason mapping and new-side
+no-final-newline finality in the same hunk, later hunks, and duplicate-marker
+cases. The validated authoritative request path is bound and charged exactly
+once per private request; repeated E-style observations verify that binding
+without recharging it, and textual and non-textual outcomes carry it. `NoTextualSurface` and
+`NotTextEligible` remain distinct. No B2 Git extraction, parser, extraction command,
+persistence/coherence orchestration, Tauri command, TypeScript DTO, or UI
+exists. B2-B0 grammar/fixture work has not been written or approved; it is the
+**NOT STARTED — NEXT MANDATORY STAGE**.
 Phase 3C-C owns any future public bridge, serialization, and rendering contract
 and remains **NOT STARTED**.
 

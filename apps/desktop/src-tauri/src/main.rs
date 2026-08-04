@@ -1,3 +1,5 @@
+#[allow(dead_code)]
+mod b2_a;
 mod windowing;
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
