@@ -4,10 +4,10 @@
 
 Phase 3C-B2 contract design is **APPROVED / COMPLETE**; its final contract
 re-review is **CLEAN**, with no remaining blocking contract P1/P2 issues. This
-document is the approved internal baseline for later B2 implementation. B2
-implementation is **IN PROGRESS**: B2-A is **COMPLETE** after its **CLEAN**
-final sign-off; B2-B0 is **NOT STARTED — NEXT MANDATORY STAGE**, and B2-B1,
-B2-C, and B2-D are **NOT STARTED**. `PLAN.md` remains the operational
+document is the approved internal baseline for B2 implementation. B2-A/B0/B1,
+B2-C, and B2-D are implemented as one Phase 3 delivery pending the integrated
+final validation gate.
+`PLAN.md` remains the operational
 roadmap: it requires Phase 3 Git isolation/diffs and eventual final-diff review,
 but does not specify B2's format, API, limits, or eligibility. The completed B1
 documents reserve B2 for future bounded textual extraction. The decisions
@@ -34,8 +34,9 @@ once per private request; repeated E-style observations verify that binding
 without recharging it, and textual and non-textual outcomes carry it. `NoTextualSurface` and
 `NotTextEligible` remain distinct. No B2 Git extraction, parser, extraction command,
 persistence/coherence orchestration, Tauri command, TypeScript DTO, or UI
-exists. B2-B0 grammar/fixture work has not been written or approved; it is the
-**NOT STARTED — NEXT MANDATORY STAGE**.
+exists. B2-B0 grammar/fixture work is drafted only in
+`phase-3c-b2-b0-unified-diff-grammar.md`; it is not approved and B2-B1 remains
+blocked pending its clean review.
 Phase 3C-C owns any future public bridge, serialization, and rendering contract
 and remains **NOT STARTED**.
 

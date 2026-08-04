@@ -1,0 +1,2 @@
+# B2-B0 corpus files deliberately contain adversarial trailing bytes and CRLF.
+docs/fixtures/phase-3c-b2-b0/** -whitespace

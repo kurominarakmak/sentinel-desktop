@@ -1,0 +1,37 @@
+# B2-B0 static text fixture manifest v1. Columns: id	path	sha256	class	surface	provenance	expected	rationale
+# Exact raw binary fixtures and byte lengths are in raw-manifest.tsv and are verified together.
+P01	positive/P01-simple.patch	6bf659d39871fb1c6c07b28bdb9d587e0cc450004aba8b0eaceae0fcd3acdebe	positive	unstaged	manual	Extractable file.txt; hunk 1,2=>1,2; Context keep, Deletion old, Addition new; LF/LF/LF; +1/-1	basic mapping
+P02	positive/P02-empty-and-prefixes.patch	941e1b024132b1230092945842b52e422a7426e87e8446560f18f4a88a218c43	positive	unstaged	manual	Extractable; empty context and literal prefix payloads	prefix protection and empty record
+P03	positive/P03-multiple-hunks.patch	0711a5c25da178f700b77aeb4c51083498964dcb1b30473ddfd21fd7beb4cd33	positive	staged	manual	Extractable; hunks (1,1),(10,10); +2/-2	ordered hunks
+P04	positive/P04-omitted-count.patch	b07bee2453bf0a6ea7bb289f51d8caee469332eb019b3fe5b57d07b1f945fbc4	positive	unstaged	manual	Extractable; omitted counts equal one	omitted count
+P05	positive/P05-zero-range-addition.patch	c971e1d74ace3a32048a1c8f2793960b8c1374c58fe634ea0c45b509ff1a4d1f	positive	staged	manual	Extractable addition; old mode None, new 100644; /dev/null old; +1	addition zero range
+P06	positive/P06-zero-range-deletion.patch	51081c589b2af8eae23c6336acb512f5dcf8d7656e41dae5099cc2f23e49a1d5	positive	staged	manual	Extractable deletion; old 100644, new None; /dev/null new; -1	deletion zero range
+P07	positive/P07-crlf.patch	627a7d292b06465c65994ce62348a78f2dda948b6fb1127ff27627a17f88f5e0	positive	unstaged	manual-transcript	Illustrative CRLF transcript; byte-exact P13-crlf-valid.bin is authoritative	human-readable companion
+P08	positive/P08-old-no-final-newline.patch	d8958a67b4c05ee12ffab75de90adff72252d2bdbbc9799620d9adcd173cbf3e	positive	unstaged	empirical-git-2.48.1	Deletion old=None marker old; Addition new=Lf	old missing final newline
+P09	positive/P09-new-no-final-newline.patch	55bdeb39adead95205726ea15b285a1e3246fe29107b0534bb4a1db19b0ab5bf	positive	unstaged	empirical-git-2.48.1	Deletion old=Lf; Addition new=None marker new	new missing final newline
+P10	positive/P10-both-no-final-newline.patch	677ef33e34d3fdda332bba7de020c592130b077bbd1d66d6f203f4d1b254e2a1	positive	unstaged	empirical-git-2.48.1	Deletion old=None marker old; Addition new=None marker new	both missing terminators
+P11	positive/P11-unicode-space-dash.patch	412f8c970cdb024a100759f3f62d275ba31449c305f0bb5d216c2dbc1a346b26	positive	unstaged	manual	Extractable literal path - space-π.txt; UTF-8 payload; optional TAB header separator	space/Unicode/leading-dash path mapping
+P12	positive/P12-literal-marker-text.patch	47b0fdb351c6edede89e95d5836b4bf195b80d2bbb2c665113685b059ca3a6fe	positive	unstaged	manual	Extractable literal line, not marker	marker text only exact after prefix
+P14	positive/P14-context-both-no-final-newline.patch	4f86959f56f9d0d0bd39c6c15c5308a82cfa651b2982f9ea654c53fe9f8a988c	positive	unstaged	empirical-git-2.48.1	Extractable Context(final): old=None+marker, new=None+marker	one marker applies to both context sides
+N01	negative/N01-empty-header.patch	fb6f3d476ca7ea43d75e41b36690c464b706e56179dacf4f1a72208ea895d6b4	negative	unstaged	manual	MalformedOutput	truncated header
+N02	negative/N02-malformed-diff-header.patch	a033a1c8792e200d270d361bdcde32c0554f0512d4b9b393092802daef242c7b	negative	unstaged	manual	MalformedOutput	invalid diff header
+N03	negative/N03-malformed-index.patch	bbdf6aee3396c7a07585b409fa1697c22007af5ccdcec3b126408af072d9dc55	negative	unstaged	manual	MalformedOutput	invalid full index
+N04	negative/N04-path-mismatch.patch	e9ec90e7f8b7f733ee0a972d35bb3793102aa87c75e8b0cea6f764940f662cb9	negative	unstaged	manual	PathMismatch	old/new differ
+N05	negative/N05-second-section.patch	bb758689c9bf2c61073c751bd457cb4b15061e0182a9fd9cd6cefc0382b8d684	negative	unstaged	manual	MalformedOutput	multiple sections
+N06	negative/N06-rename.patch	d89220067f76710cb72f8e5a6a8bf77ab03b1a2361123a29826a2ce68a5b930e	negative	unstaged	manual	NonExtractable/Unsupported	forbidden rename headers
+N07	negative/N07-binary.patch	30376d85757bfeb85bff5f94b7b3e0685f945291fe89ad2876aa5b3370b5307a	negative	unstaged	manual	NonExtractable(Binary)	binary indication
+N08	negative/N08-combined.patch	ac8471d66f38b5d3cb2641037b5b5a32fd8fad29572cdd5a335b8b216b9b5ec2	negative	unstaged	manual	MalformedOutput	combined diff forbidden
+N09	negative/N09-gitlink.patch	ac0be3d13cfb6fb646023fe0516ca83e6d3ef617001727b33b69531a5d6dcd0d	negative	unstaged	manual	NonExtractable(Gitlink)	gitlink mode
+N10	negative/N10-unsupported-mode.patch	a87d28a5d1c5eeaf75adc4b612e2adaed3f66b950ccb33f319c7f0dbe85df509	negative	unstaged	manual	NonExtractable(UnsupportedType)	symlink mode unsupported by draft
+N11	negative/N11-malformed-hunk.patch	3f2a31a8a48ca838491f13792a66cf8bd9a8edc36e17ed53de5d9ded360896b2	negative	unstaged	manual	MalformedOutput	bad number
+N12	negative/N12-overflow-hunk.patch	68fe3efbe04671cdb1d8ec642dcecb1810786c705e6fc9071a6e93e5f5cdc6ce	negative	unstaged	manual	MalformedOutput	u64 overflow
+N13	negative/N13-count-mismatch.patch	ff071b300a280a062bfeb15bb27391ff86c95ce1489667dec668483c8c68ac62	negative	unstaged	manual	MalformedOutput	hunk counts mismatch
+N14	negative/N14-unexpected-body.patch	a93025511de987586c8fd96085aa76fe543038b2bff6ff5b86770afe150b1324	negative	unstaged	manual	MalformedOutput	unknown body prefix
+N15	negative/N15-marker-at-start.patch	4c621b11de38d976b0ecdeb52ebaac00f8babcf3bae16d88ef3b9108ecae7e88	negative	unstaged	manual	MalformedOutput	marker without line
+N16	negative/N16-duplicate-marker.patch	147f8bd6b32c63e56e97f2efad57d243faa4fddef1102fdd6f1f05b8087806b1	negative	unstaged	manual	MalformedOutput	duplicate marker
+N17	negative/N17-later-applicable.patch	1bc726cf4039c0c3f0c86143843321c2465cec80c7b265b2f5d87bf0339cf9ec	negative	unstaged	manual	MalformedOutput	marker before later old-applicable line
+N18	negative/N18-trailing-garbage.patch	95cf293d6cf0dbbdbd13fa8db0a69b5411c2ea38c2e7ed698cebfc1d66c16f81	negative	unstaged	manual	MalformedOutput	complete consumption
+N19	negative/N19-ansi.patch	f52dd2f0701a46030ce52dc5652e2fc186478711158b6e678289576fb40546bf	negative	unstaged	manual-transcript	MalformedOutput	text companion; exact ESC/ANSI artifacts are N32-N36
+N63	negative/N63-context-marker-later-applicable.patch	c495832297da689faa41df1299287e8aeb65748a0cd2125df8d5657d58a2ac6e	negative	unstaged	manual-adversarial	MalformedOutput	context marker before later new-applicable line
+N64	negative/N64-context-marker-truncated.patch	18358ea77a4c9b89050d10a4b20d414c5c16698f2c0ed7e7826d27995625c586	negative	unstaged	manual-adversarial	MalformedOutput	truncated special marker
+N65	negative/N65-context-marker-altered.patch	e12f3249eed4108693b08f84dc3a67a9cfe387af1c68a4da4078b17fca8f2953	negative	unstaged	manual-adversarial	MalformedOutput	altered marker bytes

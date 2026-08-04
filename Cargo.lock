@@ -26,6 +26,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tempfile",
  "tokio",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -3089,6 +3090,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "unicode-normalization",
  "windows-sys 0.59.0",
 ]
 

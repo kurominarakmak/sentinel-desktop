@@ -10,12 +10,13 @@ use sentinel_core::{
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
-    add_detached_worktree, inspect_repository, inspect_worktree_changes_at_base,
-    inspect_worktree_destination_no_follow, inspect_worktree_filter_attribute,
-    inspect_worktree_numstat, resolve_exact_head, with_inventory_operation_context,
-    with_inventory_operation_deadline, worktree_metadata_lookup, ChangedFile, FilterAttributeState,
-    GitError, NumstatClassification, RepositoryInspection, RepositoryMode, RepositoryRelativePath,
-    RepositoryState, TextEligibleMetadata, WorktreeDestinationState, WorktreeMetadataLookup,
+    add_detached_worktree, extract_textual_diff, inspect_repository,
+    inspect_worktree_changes_at_base, inspect_worktree_destination_no_follow,
+    inspect_worktree_filter_attribute, inspect_worktree_numstat, resolve_exact_head,
+    with_inventory_operation_context, with_inventory_operation_deadline, worktree_metadata_lookup,
+    ChangedFile, FilterAttributeState, GitError, NumstatClassification, RepositoryInspection,
+    RepositoryMode, RepositoryRelativePath, RepositoryState, TextEligibleMetadata,
+    WorktreeDestinationState, WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,27 @@ struct WorktreeDto {
     ready_at_ms: Option<i64>,
     removed_at_ms: Option<i64>,
     error_category: Option<String>,
+}
+/// The Phase 3C-C public textual-diff bridge. It is intentionally aggregate
+/// only: source paths, line text, Git output, commands and private evidence
+/// stay behind the desktop trust boundary.
+#[derive(Clone, Debug, Serialize)]
+struct TextualDiffDto {
+    project_id: String,
+    worktree_id: String,
+    textual_available: bool,
+    staged_additions: u64,
+    staged_deletions: u64,
+    unstaged_additions: u64,
+    unstaged_deletions: u64,
+    hunk_count: usize,
+}
+
+#[derive(Deserialize)]
+struct InspectTextualDiffRequest {
+    project_id: String,
+    worktree_id: String,
+    path: String,
 }
 /// Internal Phase 3C-A result.  It is deliberately not a Tauri DTO yet.
 #[derive(Clone, Debug)]
@@ -2296,6 +2318,105 @@ async fn submit_fake_run(
     });
     Ok(run_dto(&state, run).await)
 }
+async fn capture_b2_diff_pair(
+    row: &ManagedWorktree,
+    path: &RepositoryRelativePath,
+) -> Result<(Vec<u8>, Vec<u8>), SafeError> {
+    let staged = extract_textual_diff(Path::new(&row.path), path, Some(&row.base_commit))
+        .await
+        .map_err(|_| SafeError {
+            code: "diff_unavailable",
+            message: "The textual change is no longer available.",
+        })?;
+    let unstaged = extract_textual_diff(Path::new(&row.path), path, None)
+        .await
+        .map_err(|_| SafeError {
+            code: "diff_unavailable",
+            message: "The textual change is no longer available.",
+        })?;
+    Ok((staged, unstaged))
+}
+
+/// Phase 3C-C bridge over the private B2 extraction pipeline. The caller's
+/// path is only a lexical candidate; B1 exact inventory/classification and
+/// the persisted ProjectId/WorktreeId binding remain the authority.
+#[tauri::command]
+async fn inspect_textual_diff(
+    request: InspectTextualDiffRequest,
+    state: State<'_, DesktopState>,
+) -> Result<TextualDiffDto, SafeError> {
+    let project_id = ProjectId::from_str(&request.project_id).map_err(|_| input_error())?;
+    let worktree_id = WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?;
+    let selected_path =
+        RepositoryRelativePath::from_selection(&request.path).map_err(|_| input_error())?;
+    let row = state
+        .repository
+        .get_worktree(&worktree_id)
+        .await
+        .map_err(|_| SafeError {
+            code: "worktree_not_found",
+            message: "The managed worktree was not found.",
+        })?;
+    if row.project_id != project_id {
+        return Err(input_error());
+    }
+    let classification = inspect_worktree_file_diff_classification_impl(
+        &state,
+        worktree_id.clone(),
+        selected_path.clone(),
+    )
+    .await?;
+    let textual = matches!(
+        classification.staged,
+        DiffSectionClassification::TextEligible(_)
+    ) || matches!(
+        classification.unstaged,
+        DiffSectionClassification::TextEligible(_)
+    );
+    if !textual {
+        return Ok(TextualDiffDto {
+            project_id: project_id.to_string(),
+            worktree_id: worktree_id.to_string(),
+            textual_available: false,
+            staged_additions: 0,
+            staged_deletions: 0,
+            unstaged_additions: 0,
+            unstaged_deletions: 0,
+            hunk_count: 0,
+        });
+    }
+    // E1/E2/E3 are independently captured after B1's matching A/C1/B/C2/C/C3
+    // authority. Raw byte equality prevents accepting a transient patch.
+    let evidence_one = capture_b2_diff_pair(&row, &selected_path).await?;
+    let evidence_two = capture_b2_diff_pair(&row, &selected_path).await?;
+    let evidence_three = capture_b2_diff_pair(&row, &selected_path).await?;
+    if evidence_one != evidence_two || evidence_two != evidence_three {
+        return Err(SafeError {
+            code: "change_stale",
+            message: "The change changed while it was being inspected.",
+        });
+    }
+    let summary = b2_a::parse_private_diff_pair(
+        selected_path.as_str().to_owned(),
+        &evidence_three.0,
+        &evidence_three.1,
+    )
+    .map_err(|error| SafeError {
+        code: error.safe_code(),
+        message: "The textual change could not be safely inspected.",
+    })?;
+    Ok(TextualDiffDto {
+        project_id: project_id.to_string(),
+        worktree_id: worktree_id.to_string(),
+        textual_available: summary.textual_available,
+        staged_additions: summary.staged_additions,
+        staged_deletions: summary.staged_deletions,
+        unstaged_additions: summary.unstaged_additions,
+        unstaged_deletions: summary.unstaged_deletions,
+        hunk_count: summary.hunk_count,
+    })
+}
+
 /// Deprecated Phase 0 command compatibility; delegates to the trusted runtime only.
 #[tauri::command]
 async fn run_fake_agent(state: State<'_, DesktopState>, app: AppHandle) -> Result<(), SafeError> {
@@ -2528,6 +2649,7 @@ fn main() {
             list_project_worktrees,
             remove_project_worktree,
             reconcile_project_worktrees,
+            inspect_textual_diff,
             run_fake_agent,
             record_manual_probe_request
         ])
@@ -4958,5 +5080,68 @@ mod bridge_tests {
     fn bundled_sidecar_requires_a_binary_parent() {
         let error = bundled_sidecar_candidate(std::path::Path::new("")).unwrap_err();
         assert_eq!(error.code, "fake_agent_unavailable");
+    }
+
+    #[tokio::test]
+    async fn phase3_two_fake_tasks_are_worktree_isolated() {
+        let temp = tempdir().unwrap();
+        let main = temp.path().join("main-repository");
+        std::fs::create_dir(&main).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Phase Three"]);
+        git(&["config", "user.email", "phase3@example.invalid"]);
+        std::fs::write(main.join("baseline.txt"), b"baseline\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "baseline"]);
+        let base = resolve_exact_head(&main).await.unwrap();
+        let task_one = temp.path().join("managed-task-one");
+        let task_two = temp.path().join("managed-task-two");
+        add_detached_worktree(&main, &task_one, &base)
+            .await
+            .unwrap();
+        add_detached_worktree(&main, &task_two, &base)
+            .await
+            .unwrap();
+        let main_before = std::fs::read(main.join("baseline.txt")).unwrap();
+        let one = tokio::spawn({
+            let task_one = task_one.clone();
+            async move {
+                std::fs::write(task_one.join("task-one.txt"), b"fake one\n").unwrap();
+                Ok::<(), ()>(())
+            }
+        });
+        let two = tokio::spawn({
+            let task_two = task_two.clone();
+            async move {
+                std::fs::write(task_two.join("task-two.txt"), b"fake two\n").unwrap();
+                Err::<(), ()>(())
+            }
+        });
+        assert_eq!(one.await.unwrap(), Ok(()));
+        assert_eq!(two.await.unwrap(), Err(()));
+        assert_eq!(
+            std::fs::read(main.join("baseline.txt")).unwrap(),
+            main_before
+        );
+        assert!(!main.join("task-one.txt").exists() && !main.join("task-two.txt").exists());
+        assert!(task_one.join("task-one.txt").exists() && !task_one.join("task-two.txt").exists());
+        assert!(task_two.join("task-two.txt").exists() && !task_two.join("task-one.txt").exists());
+        // Cross-use of a task's selected filesystem identity is rejected by
+        // managed-leaf validation before it can become a worktree authority.
+        assert!(validate_managed_leaf(
+            temp.path(),
+            &ProjectId::new(),
+            &WorktreeId::new(),
+            &task_one
+        )
+        .is_err());
     }
 }

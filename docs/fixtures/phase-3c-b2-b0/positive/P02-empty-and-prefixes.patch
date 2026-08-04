@@ -1,0 +1,11 @@
+diff --git a/file.txt b/file.txt
+index 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 100644
+--- a/file.txt
++++ b/file.txt
+@@ -1,4 +1,6 @@
+ 
+-old
++--- literal
+++++ literal
++@@ literal
++\\ literal

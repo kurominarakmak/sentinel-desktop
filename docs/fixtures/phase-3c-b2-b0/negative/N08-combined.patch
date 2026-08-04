@@ -1,0 +1,5 @@
+diff --cc file.txt
+index 1111111,2222222..3333333
+--- a/file.txt
++++ b/file.txt
+@@@ -1,1 -1,1 +1,1 @@@

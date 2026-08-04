@@ -12,6 +12,7 @@ use tokio::{
     process::Command as TokioCommand,
     time,
 };
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Error)]
 pub enum GitError {
@@ -80,6 +81,8 @@ pub const MAX_FILTER_ATTRIBUTE_STDOUT: usize = 16 * 1024;
 pub const MAX_FILTER_ATTRIBUTE_STDERR: usize = 16 * 1024;
 pub const MAX_INVENTORY_STDOUT: usize = 256 * 1024;
 pub const MAX_INVENTORY_STDERR: usize = 16 * 1024;
+pub const MAX_TEXTUAL_DIFF_STDOUT: usize = 2 * 1024 * 1024;
+pub const MAX_TEXTUAL_DIFF_STDERR: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextEligibleMetadata {
@@ -117,9 +120,106 @@ pub struct StagedIndexChange {
 pub struct RepositoryRelativePath(String);
 
 impl RepositoryRelativePath {
+    /// Validates a non-authoritative UI selection before it can be compared to
+    /// an authoritative inventory entry. It never resolves a filesystem path.
+    pub fn from_selection(value: &str) -> Result<Self, GitError> {
+        parse_repository_relative_path(value.as_bytes())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Runs the one permitted textual-diff envelope for a previously validated
+/// worktree/path pair.  The output remains raw private bytes: callers must
+/// parse it completely before making any decision from it.
+pub async fn extract_textual_diff(
+    worktree: &Path,
+    path: &RepositoryRelativePath,
+    base_commit: Option<&str>,
+) -> Result<Vec<u8>, GitError> {
+    if let Some(base) = base_commit {
+        if !valid_oid(base.as_bytes()) {
+            return Err(GitError::MetadataInvalid);
+        }
+    }
+    let inspection = inspect_repository(worktree).await?;
+    if inspection.is_primary {
+        return Err(GitError::MetadataInvalid);
+    }
+    let executable = TrustedGitExecutableResolver.resolve()?;
+    let output = if let Some(base) = base_commit {
+        run_git_with_limits(
+            &executable,
+            &inspection.repository_root,
+            [
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "color.ui=false",
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--cached",
+                "--patch",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                base,
+                "--",
+                path.as_str(),
+            ],
+            GIT_TIMEOUT,
+            MAX_TEXTUAL_DIFF_STDOUT,
+            MAX_TEXTUAL_DIFF_STDERR,
+            true,
+            true,
+        )
+        .await?
+    } else {
+        run_git_with_limits(
+            &executable,
+            &inspection.repository_root,
+            [
+                "--no-optional-locks",
+                "--literal-pathspecs",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "-c",
+                "color.ui=false",
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--patch",
+                "--full-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "--no-renames",
+                "--",
+                path.as_str(),
+            ],
+            GIT_TIMEOUT,
+            MAX_TEXTUAL_DIFF_STDOUT,
+            MAX_TEXTUAL_DIFF_STDERR,
+            true,
+            true,
+        )
+        .await?
+    };
+    if !output.status.success() {
+        return Err(GitError::Command("textual diff failed".into()));
+    }
+    Ok(output.stdout)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1770,6 +1870,11 @@ fn parse_repository_relative_path(value: &[u8]) -> Result<RepositoryRelativePath
         return Err(GitError::StatusMalformed);
     }
     let text = std::str::from_utf8(value).map_err(|_| GitError::StatusMalformed)?;
+    // Identity is raw UTF-8 bytes.  Canonically unstable spellings are
+    // rejected so platform normalization cannot alias two Git paths.
+    if text.nfc().collect::<String>() != text.nfd().collect::<String>() {
+        return Err(GitError::StatusMalformed);
+    }
     validate_inventory_lookup_path(text, current_lookup_path_semantics())?;
     Ok(RepositoryRelativePath(text.to_owned()))
 }
@@ -2639,7 +2744,7 @@ mod status_inventory_tests {
 
     #[test]
     fn status_inventory_supports_untracked_unicode_newline_and_gitlink_metadata() {
-        let mut bytes = "? - ünicode\nname\0".to_owned().into_bytes();
+        let mut bytes = "? - πunicode\nname\0".to_owned().into_bytes();
         bytes.extend_from_slice(
             format!("1 M. SC.. 160000 160000 160000 {OID} {OID} module\0").as_bytes(),
         );
@@ -2647,7 +2752,7 @@ mod status_inventory_tests {
         assert_eq!(files.len(), 2);
         assert!(files
             .iter()
-            .any(|file| file.untracked && file.path.as_str() == "- ünicode\nname"));
+            .any(|file| file.untracked && file.path.as_str() == "- πunicode\nname"));
         assert!(files
             .iter()
             .any(|file| file.mode_head == Some(RepositoryMode::Gitlink)));
@@ -4153,7 +4258,7 @@ mod inspection_tests {
             "file[1].txt",
             "-leading.txt",
             "name with spaces.txt",
-            "ünicode.txt",
+            "πunicode.txt",
             "newline\nname.txt",
             "folder\\name.txt",
         ] {
@@ -4180,7 +4285,7 @@ mod inspection_tests {
             "file[1].txt",
             "-leading.txt",
             "name with spaces.txt",
-            "ünicode.txt",
+            "πunicode.txt",
             "newline\nname.txt",
             "folder\\name.txt",
         ] {
@@ -4206,7 +4311,7 @@ mod inspection_tests {
             "file[1].txt",
             "-leading.txt",
             "name with spaces.txt",
-            "ünicode.txt",
+            "πunicode.txt",
             "newline\nname.txt",
             "folder\\name.txt",
         ] {

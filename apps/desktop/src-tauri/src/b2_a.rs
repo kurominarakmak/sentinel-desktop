@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Duration;
+use unicode_normalization::UnicodeNormalization;
 
 const MIB: usize = 1024 * 1024;
 const KIB: usize = 1024;
@@ -144,6 +145,11 @@ fn validate_candidate_path(value: &str) -> Result<(), B2Error> {
             && value.as_bytes()[0].is_ascii_alphabetic()
             && value.as_bytes()[1] == b':')
     {
+        return Err(B2Error::InvalidRequest);
+    }
+    // Do not permit platform Unicode normalization to collapse two exact Git
+    // byte names into one selection identity.
+    if value.nfc().collect::<String>() != value.nfd().collect::<String>() {
         return Err(B2Error::InvalidRequest);
     }
     #[cfg(windows)]
@@ -930,7 +936,7 @@ fn checked_add_u8(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum B2Error {
+pub(crate) enum B2Error {
     ChangeStale,
     WorktreeNotReady,
     ProjectUnavailable,
@@ -947,6 +953,284 @@ enum B2Error {
     OperationCancelled,
     InvalidRequest,
     InvalidEvidence,
+}
+
+impl B2Error {
+    pub(crate) fn safe_code(&self) -> &'static str {
+        match self {
+            Self::ChangeStale => "change_stale",
+            Self::WorktreeNotReady => "worktree_not_ready",
+            Self::ProjectUnavailable | Self::WorktreeUnavailable => "selection_unavailable",
+            Self::InventoryUnavailable | Self::ClassificationUnavailable => "change_unavailable",
+            Self::NotTextEligible => "not_text_eligible",
+            Self::MalformedOutput => "diff_unavailable",
+            Self::PathMismatch | Self::InvalidRequest => "invalid_selection",
+            Self::OutputOverflow | Self::ResourceLimit => "resource_limit",
+            Self::Timeout => "deadline_exceeded",
+            Self::GitCommandFailed => "git_unavailable",
+            Self::OperationCancelled => "operation_cancelled",
+            Self::InvalidEvidence => "change_unavailable",
+        }
+    }
+}
+
+/// Redacted, path-free information which may cross the Phase 3C-C boundary.
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct PublicTextualSummary {
+    pub(crate) textual_available: bool,
+    pub(crate) staged_additions: u64,
+    pub(crate) staged_deletions: u64,
+    pub(crate) unstaged_additions: u64,
+    pub(crate) unstaged_deletions: u64,
+    pub(crate) hunk_count: usize,
+}
+
+/// Strictly parse both raw Git envelopes into private B2-A evidence, then
+/// return only an aggregate redacted summary. The caller owns fresh inventory,
+/// classification and lifecycle coherence; this primitive performs no I/O.
+pub(crate) fn parse_private_diff_pair(
+    authoritative_path: String,
+    staged: &[u8],
+    unstaged: &[u8],
+) -> Result<PublicTextualSummary, B2Error> {
+    let path = ValidatedInternalPathIdentity::from_authoritative_path(authoritative_path)?;
+    let expected_path = path.0.clone();
+    let attributes = GitSemanticAttribute::REQUIRED
+        .iter()
+        .map(|attribute| {
+            AttributeEligibilityEvidence::new(*attribute, GitAttributeState::Unspecified)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let evidence = TextualExtractionEvidence {
+        path,
+        staged: parse_unified_surface(staged, &expected_path)?,
+        unstaged: parse_unified_surface(unstaged, &expected_path)?,
+        attributes,
+    };
+    evidence.validate()?;
+    let (
+        mut staged_additions,
+        mut staged_deletions,
+        mut unstaged_additions,
+        mut unstaged_deletions,
+        mut hunk_count,
+    ): (u64, u64, u64, u64, usize) = (0, 0, 0, 0, 0);
+    for (surface, additions, deletions) in [
+        (
+            &evidence.staged,
+            &mut staged_additions,
+            &mut staged_deletions,
+        ),
+        (
+            &evidence.unstaged,
+            &mut unstaged_additions,
+            &mut unstaged_deletions,
+        ),
+    ] {
+        if let SurfaceExtractionState::Extractable(value) = surface {
+            *additions = value.total_additions;
+            *deletions = value.total_deletions;
+            hunk_count = hunk_count
+                .checked_add(value.hunks.len())
+                .ok_or(B2Error::ResourceLimit)?;
+        }
+    }
+    Ok(PublicTextualSummary {
+        textual_available: matches!(evidence.staged, SurfaceExtractionState::Extractable(_))
+            || matches!(evidence.unstaged, SurfaceExtractionState::Extractable(_)),
+        staged_additions,
+        staged_deletions,
+        unstaged_additions,
+        unstaged_deletions,
+        hunk_count,
+    })
+}
+
+fn parse_unified_surface(
+    bytes: &[u8],
+    expected_path: &str,
+) -> Result<SurfaceExtractionState, B2Error> {
+    if bytes.is_empty() {
+        return Ok(SurfaceExtractionState::Absent);
+    }
+    if bytes.len() > MAX_TEXT_BYTES_PER_EXTRACTION {
+        return Err(B2Error::OutputOverflow);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| B2Error::MalformedOutput)?;
+    if text.contains('\0')
+        || text.chars().any(|ch| {
+            ch == '\u{1b}' || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return Err(B2Error::MalformedOutput);
+    }
+    if text.contains("GIT binary patch") || text.contains("Binary files ") {
+        return Ok(SurfaceExtractionState::NonExtractable(
+            NonExtractableReasons::new(vec![NonExtractableReason::Binary])?,
+        ));
+    }
+    let mut lines = text.split_inclusive('\n').peekable();
+    let first = lines.next().ok_or(B2Error::MalformedOutput)?;
+    if first.trim_end_matches(['\r', '\n'])
+        != format!("diff --git a/{expected_path} b/{expected_path}")
+        || text.matches("\ndiff --git ").count() != 0
+    {
+        return Err(B2Error::MalformedOutput);
+    }
+    if text.contains("diff --cc ")
+        || text.contains("diff --combined ")
+        || text.contains("rename from ")
+        || text.contains("rename to ")
+    {
+        return Err(B2Error::MalformedOutput);
+    }
+    let mut old_header = false;
+    let mut new_header = false;
+    let mut current: Option<TextualHunk> = None;
+    let mut hunks = Vec::new();
+    for raw in lines {
+        let (line, record_ending) = if let Some(line) = raw.strip_suffix("\r\n") {
+            (line, LineEnding::CrLf)
+        } else if let Some(line) = raw.strip_suffix('\n') {
+            (line, LineEnding::Lf)
+        } else {
+            return Err(B2Error::MalformedOutput);
+        };
+        if line.starts_with("--- ") {
+            old_header = true;
+            continue;
+        }
+        if line.starts_with("+++ ") {
+            new_header = true;
+            continue;
+        }
+        if line.starts_with("@@ ") {
+            if !old_header || !new_header {
+                return Err(B2Error::MalformedOutput);
+            }
+            if let Some(hunk) = current.take() {
+                hunks.push(hunk);
+            }
+            current = Some(parse_hunk_header(line)?);
+            continue;
+        }
+        // Git's fixed envelope has metadata between `diff --git` and the
+        // mandatory old/new headers. It is deliberately ignored here only as
+        // framing, never interpreted as evidence.
+        if current.is_none() && !old_header && !new_header {
+            if line.starts_with("index ")
+                || line.starts_with("old mode ")
+                || line.starts_with("new mode ")
+                || line.starts_with("new file mode ")
+                || line.starts_with("deleted file mode ")
+                || line.starts_with("similarity index ")
+            {
+                continue;
+            }
+            return Err(B2Error::MalformedOutput);
+        }
+        if line == "\\ No newline at end of file" {
+            let hunk = current.as_mut().ok_or(B2Error::MalformedOutput)?;
+            let previous = hunk.lines.last_mut().ok_or(B2Error::MalformedOutput)?;
+            if previous.old_no_newline_marker || previous.new_no_newline_marker {
+                return Err(B2Error::MalformedOutput);
+            }
+            match previous.kind {
+                TextualDiffLineKind::Context => {
+                    previous.old_line_ending = Some(LineEnding::None);
+                    previous.new_line_ending = Some(LineEnding::None);
+                    previous.old_no_newline_marker = true;
+                    previous.new_no_newline_marker = true;
+                }
+                TextualDiffLineKind::Deletion => {
+                    previous.old_line_ending = Some(LineEnding::None);
+                    previous.old_no_newline_marker = true;
+                }
+                TextualDiffLineKind::Addition => {
+                    previous.new_line_ending = Some(LineEnding::None);
+                    previous.new_no_newline_marker = true;
+                }
+            }
+            continue;
+        }
+        let hunk = current.as_mut().ok_or(B2Error::MalformedOutput)?;
+        let (kind, payload) = match line.as_bytes().first() {
+            Some(b' ') => (TextualDiffLineKind::Context, &line[1..]),
+            Some(b'+') => (TextualDiffLineKind::Addition, &line[1..]),
+            Some(b'-') => (TextualDiffLineKind::Deletion, &line[1..]),
+            _ => return Err(B2Error::MalformedOutput),
+        };
+        let (old_line_ending, new_line_ending) = match kind {
+            TextualDiffLineKind::Context => (Some(record_ending), Some(record_ending)),
+            TextualDiffLineKind::Addition => (None, Some(record_ending)),
+            TextualDiffLineKind::Deletion => (Some(record_ending), None),
+        };
+        hunk.lines.push(TextualDiffLine {
+            kind,
+            text: payload.to_owned(),
+            old_line_ending,
+            new_line_ending,
+            old_no_newline_marker: false,
+            new_no_newline_marker: false,
+        });
+    }
+    if let Some(hunk) = current {
+        hunks.push(hunk);
+    }
+    if !old_header || !new_header {
+        return Err(B2Error::MalformedOutput);
+    }
+    if hunks.is_empty() {
+        return Ok(SurfaceExtractionState::NonExtractable(
+            NonExtractableReasons::new(vec![NonExtractableReason::ModeOnly])?,
+        ));
+    }
+    let total_additions = hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|line| line.kind == TextualDiffLineKind::Addition)
+        .count() as u64;
+    let total_deletions = hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|line| line.kind == TextualDiffLineKind::Deletion)
+        .count() as u64;
+    Ok(SurfaceExtractionState::Extractable(
+        TextualSurfaceEvidence {
+            old_mode: None,
+            new_mode: None,
+            hunks,
+            total_additions,
+            total_deletions,
+        },
+    ))
+}
+
+fn parse_hunk_header(line: &str) -> Result<TextualHunk, B2Error> {
+    let body = line
+        .strip_prefix("@@ -")
+        .and_then(|value| value.split_once(" @@").map(|(body, _)| body))
+        .ok_or(B2Error::MalformedOutput)?;
+    let (old, new) = body.split_once(" +").ok_or(B2Error::MalformedOutput)?;
+    let (old_start, old_count) = parse_range(old)?;
+    let (new_start, new_count) = parse_range(new)?;
+    Ok(TextualHunk {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        lines: Vec::new(),
+    })
+}
+
+fn parse_range(value: &str) -> Result<(u64, u64), B2Error> {
+    let (start, count) = match value.split_once(',') {
+        Some(pair) => pair,
+        None => (value, "1"),
+    };
+    let start = start.parse().map_err(|_| B2Error::MalformedOutput)?;
+    let count = count.parse().map_err(|_| B2Error::MalformedOutput)?;
+    Ok((start, count))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2300,4 +2584,25 @@ mod tests {
         assert_ne!(B2Error::ChangeStale, B2Error::OutputOverflow);
         assert_ne!(B2Error::Timeout, B2Error::OperationCancelled);
     }
+}
+#[test]
+fn b2_b0_fixture_conformance_smoke_and_unicode_alias_rejection() {
+    let positive =
+        include_bytes!("../../../../docs/fixtures/phase-3c-b2-b0/positive/P01-simple.patch");
+    let negative = include_bytes!(
+        "../../../../docs/fixtures/phase-3c-b2-b0/negative/N13-count-mismatch.patch"
+    );
+    let parsed =
+        parse_private_diff_pair("file.txt".into(), &[], positive).expect("positive fixture");
+    assert!(parsed.textual_available);
+    assert_eq!(
+        (parsed.unstaged_additions, parsed.unstaged_deletions),
+        (1, 1)
+    );
+    assert!(matches!(
+        parse_private_diff_pair("file.txt".into(), &[], negative),
+        Err(B2Error::InvalidEvidence)
+    ));
+    assert!(NonAuthoritativePathSelection::new("composed-é.txt".into()).is_err());
+    assert!(NonAuthoritativePathSelection::new("decomposed-e\u{301}.txt".into()).is_err());
 }
