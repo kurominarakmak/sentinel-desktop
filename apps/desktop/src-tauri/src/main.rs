@@ -6,10 +6,10 @@ use sentinel_agent_api::{
     codex_capabilities, detect_installation, AgentKind, CodexCapabilities, InstallationStatus,
 };
 use sentinel_core::{
-    CodexRunContext, CodexRunLifecycle, CoreError, CreateCodexRunContext, ManagedWorktree,
-    ManagedWorktreeState, NormalizedAgentEvent, Project, ProjectFingerprintScheme, ProjectId,
-    ProjectRegistration, ProjectValidationState, PublicRunReference, Run, RunId, RunRepository,
-    TaskRequest, WorktreeId,
+    ClaudeRunContext, CodexRunContext, CodexRunLifecycle, CoreError, CreateClaudeRunContext,
+    CreateCodexRunContext, ManagedWorktree, ManagedWorktreeState, NormalizedAgentEvent, Project,
+    ProjectFingerprintScheme, ProjectId, ProjectRegistration, ProjectValidationState,
+    PublicRunReference, Run, RunId, RunRepository, TaskRequest, WorktreeId,
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
@@ -74,6 +74,42 @@ struct CodexRunStartRequest {
     project_id: String,
     worktree_id: String,
     task_key: String,
+    prompt: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeRunDto {
+    public_reference: String,
+    status: CodexRunLifecycle,
+    progress_summary: Option<String>,
+    terminal_summary: Option<String>,
+    error_category: Option<String>,
+    cancellation_available: bool,
+    followup_available: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeRunStartRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    prompt: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeRunLookupRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    public_reference: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeFollowupRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    public_reference: String,
     prompt: String,
 }
 #[derive(Deserialize)]
@@ -376,6 +412,135 @@ fn codex_run_dto(context: CodexRunContext) -> CodexRunDto {
         error_category: context.failure_category,
         cancellation_available: !context.lifecycle.terminal() && !context.cancellation_requested,
     }
+}
+fn claude_run_dto(context: ClaudeRunContext) -> ClaudeRunDto {
+    ClaudeRunDto {
+        public_reference: context.public_reference.to_string(),
+        status: context.lifecycle,
+        progress_summary: context.progress_summary,
+        terminal_summary: context.terminal_summary,
+        error_category: context.failure_category,
+        cancellation_available: !context.lifecycle.terminal() && !context.cancellation_requested,
+        followup_available: context.lifecycle == CodexRunLifecycle::Running
+            && !context.cancellation_requested
+            && context.session_token.is_some(),
+    }
+}
+fn parse_claude_lookup(
+    request: &ClaudeRunLookupRequest,
+) -> Result<(ProjectId, WorktreeId, PublicRunReference), SafeError> {
+    Ok((
+        ProjectId::from_str(&request.project_id).map_err(|_| input_error())?,
+        WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?,
+        PublicRunReference::parse(request.public_reference.clone()).map_err(|_| input_error())?,
+    ))
+}
+#[tauri::command]
+async fn query_claude_run(
+    request: ClaudeRunLookupRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ClaudeRunDto, SafeError> {
+    let (p, w, r) = parse_claude_lookup(&request)?;
+    state
+        .repository
+        .get_claude_run_context_owned(&p, &w, &request.task_key, &r)
+        .await
+        .map(claude_run_dto)
+        .map_err(|_| safe_error("claude lookup"))
+}
+#[tauri::command]
+async fn cancel_claude_run(
+    request: ClaudeRunLookupRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ClaudeRunDto, SafeError> {
+    let (p, w, r) = parse_claude_lookup(&request)?;
+    let c = state
+        .repository
+        .get_claude_run_context_owned(&p, &w, &request.task_key, &r)
+        .await
+        .map_err(|_| safe_error("claude lookup"))?;
+    state
+        .repository
+        .request_claude_cancellation(&c)
+        .await
+        .map(claude_run_dto)
+        .map_err(|_| safe_error("claude cancellation"))
+}
+#[tauri::command]
+async fn followup_claude_run(
+    request: ClaudeFollowupRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ClaudeRunDto, SafeError> {
+    if request.prompt.trim().is_empty()
+        || request.prompt.len() > 8_000
+        || request.prompt.contains('\0')
+    {
+        return Err(input_error());
+    };
+    let lookup = ClaudeRunLookupRequest {
+        project_id: request.project_id,
+        worktree_id: request.worktree_id,
+        task_key: request.task_key,
+        public_reference: request.public_reference,
+    };
+    let (p, w, r) = parse_claude_lookup(&lookup)?;
+    let c = state
+        .repository
+        .get_claude_run_context_owned(&p, &w, &lookup.task_key, &r)
+        .await
+        .map_err(|_| safe_error("claude lookup"))?;
+    state
+        .repository
+        .reserve_claude_followup(&c)
+        .await
+        .map(claude_run_dto)
+        .map_err(|_| safe_error("claude followup"))
+}
+#[tauri::command]
+async fn start_claude_run(
+    request: ClaudeRunStartRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ClaudeRunDto, SafeError> {
+    if request.prompt.trim().is_empty()
+        || request.prompt.len() > 8_000
+        || request.prompt.contains('\0')
+        || request.task_key.trim().is_empty()
+        || request.task_key.len() > 128
+    {
+        return Err(input_error());
+    };
+    let p = ProjectId::from_str(&request.project_id).map_err(|_| input_error())?;
+    let w = WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?;
+    let wt = state
+        .repository
+        .get_worktree(&w)
+        .await
+        .map_err(|_| safe_error("claude worktree"))?;
+    if wt.project_id != p || wt.state != ManagedWorktreeState::Ready {
+        return Err(safe_error("claude ownership"));
+    };
+    let c = state
+        .repository
+        .create_claude_run_context(CreateClaudeRunContext {
+            project_id: p,
+            worktree_id: w,
+            task_key: request.task_key,
+        })
+        .await
+        .map_err(|_| safe_error("claude creation"))?;
+    let failed = state
+        .repository
+        .transition_claude_run_context(
+            &c,
+            CodexRunLifecycle::Failed,
+            None,
+            Some("Claude execution is unavailable in this desktop build."),
+            Some("claude_unavailable"),
+            None,
+        )
+        .await
+        .map_err(|_| safe_error("claude lifecycle"))?;
+    Ok(claude_run_dto(failed))
 }
 
 fn parse_codex_lookup(
@@ -2950,6 +3115,10 @@ fn main() {
             start_codex_run,
             query_codex_run,
             cancel_codex_run,
+            start_claude_run,
+            query_claude_run,
+            followup_claude_run,
+            cancel_claude_run,
             submit_fake_run,
             list_runs,
             get_run,

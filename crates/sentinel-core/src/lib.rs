@@ -359,6 +359,32 @@ pub struct CreateCodexRunContext {
     pub task_key: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeRunContext {
+    pub run_id: RunId,
+    pub public_reference: PublicRunReference,
+    pub project_id: ProjectId,
+    pub worktree_id: WorktreeId,
+    pub task_key: String,
+    pub session_token: Option<String>,
+    pub lifecycle: CodexRunLifecycle,
+    pub cancellation_requested: bool,
+    pub followup_sequence: u64,
+    pub version: u64,
+    pub progress_summary: Option<String>,
+    pub terminal_summary: Option<String>,
+    pub failure_category: Option<String>,
+    pub created_at_ms: i64,
+    pub transitioned_at_ms: i64,
+    pub terminal_at_ms: Option<i64>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateClaudeRunContext {
+    pub project_id: ProjectId,
+    pub worktree_id: WorktreeId,
+    pub task_key: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -536,6 +562,32 @@ fn row_to_codex_context(row: &sqlx::sqlite::SqliteRow) -> Result<CodexRunContext
         task_key: row.get("task_key"),
         lifecycle: parse_codex_lifecycle(&row.get::<String, _>("lifecycle"))?,
         cancellation_requested: row.get::<i64, _>("cancellation_requested") != 0,
+        version: checked_u64(row.get("version"))?,
+        progress_summary: row.get("progress_summary"),
+        terminal_summary: row.get("terminal_summary"),
+        failure_category: row.get("failure_category"),
+        created_at_ms: row.get("created_at_ms"),
+        transitioned_at_ms: row.get("transitioned_at_ms"),
+        terminal_at_ms: row.get("terminal_at_ms"),
+    })
+}
+fn row_to_claude_context(row: &sqlx::sqlite::SqliteRow) -> Result<ClaudeRunContext, CoreError> {
+    Ok(ClaudeRunContext {
+        run_id: RunId(
+            Uuid::from_str(&row.get::<String, _>("run_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        public_reference: PublicRunReference::parse(row.get::<String, _>("public_reference"))?,
+        project_id: ProjectId(
+            Uuid::from_str(&row.get::<String, _>("project_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        worktree_id: WorktreeId(
+            Uuid::from_str(&row.get::<String, _>("worktree_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        task_key: row.get("task_key"),
+        session_token: row.get("session_token"),
+        lifecycle: parse_codex_lifecycle(&row.get::<String, _>("lifecycle"))?,
+        cancellation_requested: row.get::<i64, _>("cancellation_requested") != 0,
+        followup_sequence: checked_u64(row.get("followup_sequence"))?,
         version: checked_u64(row.get("version"))?,
         progress_summary: row.get("progress_summary"),
         terminal_summary: row.get("terminal_summary"),
@@ -1042,6 +1094,146 @@ impl RunRepository {
             transitioned_at_ms: timestamp,
             terminal_at_ms: None,
         })
+    }
+
+    pub async fn create_claude_run_context(
+        &self,
+        request: CreateClaudeRunContext,
+    ) -> Result<ClaudeRunContext, CoreError> {
+        if request.task_key.trim().is_empty() || request.task_key.len() > 128 {
+            return Err(CoreError::InvalidTask);
+        }
+        let mut tx = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM managed_worktrees WHERE id = ? AND project_id = ? AND state = 'ready'",
+        )
+        .bind(request.worktree_id.to_string())
+        .bind(request.project_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| CoreError::Storage)?;
+        if owned.is_none() {
+            return Err(CoreError::RunContextNotFound);
+        }
+        let run_id = RunId::new();
+        let public_reference = PublicRunReference::new();
+        let timestamp = now();
+        sqlx::query("INSERT INTO runs (id, task_text, agent_kind, status, schema_version, created_at_ms) VALUES (?, '[redacted claude request]', 'claude_code', 'queued', ?, ?)").bind(run_id.to_string()).bind(i64::from(RUN_SCHEMA_VERSION)).bind(timestamp).execute(&mut *tx).await.map_err(|_| CoreError::Storage)?;
+        sqlx::query("INSERT INTO claude_run_contexts (run_id, public_reference, project_id, worktree_id, task_key, adapter, protocol_version, lifecycle, created_at_ms, transitioned_at_ms) VALUES (?, ?, ?, ?, ?, 'claude_stream_json', 1, 'created', ?, ?)").bind(run_id.to_string()).bind(public_reference.as_str()).bind(request.project_id.to_string()).bind(request.worktree_id.to_string()).bind(&request.task_key).bind(timestamp).bind(timestamp).execute(&mut *tx).await.map_err(|_| CoreError::Storage)?;
+        tx.commit().await.map_err(|_| CoreError::Storage)?;
+        Ok(ClaudeRunContext {
+            run_id,
+            public_reference,
+            project_id: request.project_id,
+            worktree_id: request.worktree_id,
+            task_key: request.task_key,
+            session_token: None,
+            lifecycle: CodexRunLifecycle::Created,
+            cancellation_requested: false,
+            followup_sequence: 0,
+            version: 0,
+            progress_summary: None,
+            terminal_summary: None,
+            failure_category: None,
+            created_at_ms: timestamp,
+            transitioned_at_ms: timestamp,
+            terminal_at_ms: None,
+        })
+    }
+    pub async fn get_claude_run_context_owned(
+        &self,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        reference: &PublicRunReference,
+    ) -> Result<ClaudeRunContext, CoreError> {
+        let row=sqlx::query("SELECT * FROM claude_run_contexts WHERE public_reference=? AND project_id=? AND worktree_id=? AND task_key=?").bind(reference.as_str()).bind(project.to_string()).bind(worktree.to_string()).bind(task_key).fetch_optional(&self.pool).await.map_err(|_| CoreError::Storage)?.ok_or(CoreError::RunContextNotFound)?;
+        row_to_claude_context(&row)
+    }
+    pub async fn transition_claude_run_context(
+        &self,
+        context: &ClaudeRunContext,
+        next: CodexRunLifecycle,
+        progress: Option<&str>,
+        terminal: Option<&str>,
+        failure: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<ClaudeRunContext, CoreError> {
+        context.lifecycle.transition(next)?;
+        if context.cancellation_requested && next == CodexRunLifecycle::Succeeded {
+            return Err(CoreError::RunContextConflict);
+        };
+        let session = session
+            .map(|s| {
+                if s.len() <= 128
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                {
+                    Ok(s.to_owned())
+                } else {
+                    Err(CoreError::InvalidTask)
+                }
+            })
+            .transpose()?;
+        let t = now();
+        let terminal_at = next.terminal().then_some(t);
+        let changed=sqlx::query("UPDATE claude_run_contexts SET lifecycle=?, version=version+1, progress_summary=COALESCE(?,progress_summary), terminal_summary=?, failure_category=?, session_token=COALESCE(?,session_token), transitioned_at_ms=?, terminal_at_ms=? WHERE run_id=? AND lifecycle=? AND version=?").bind(codex_lifecycle_name(next)).bind(progress.map(|x|redact_and_bound(x,MAX_RUN_SUMMARY_BYTES))).bind(terminal.map(|x|redact_and_bound(x,MAX_RUN_SUMMARY_BYTES))).bind(failure.map(|x|redact_and_bound(x,128))).bind(session).bind(t).bind(terminal_at).bind(context.run_id.to_string()).bind(codex_lifecycle_name(context.lifecycle)).bind(checked_i64(context.version)?).execute(&self.pool).await.map_err(|_|CoreError::Storage)?.rows_affected();
+        if changed != 1 {
+            return Err(CoreError::RunContextConflict);
+        };
+        self.get_claude_run_context_owned(
+            &context.project_id,
+            &context.worktree_id,
+            &context.task_key,
+            &context.public_reference,
+        )
+        .await
+    }
+    pub async fn request_claude_cancellation(
+        &self,
+        context: &ClaudeRunContext,
+    ) -> Result<ClaudeRunContext, CoreError> {
+        if context.lifecycle.terminal() {
+            return Ok(context.clone());
+        };
+        let next = if context.lifecycle == CodexRunLifecycle::Created {
+            CodexRunLifecycle::Cancelled
+        } else {
+            CodexRunLifecycle::Cancelling
+        };
+        self.transition_claude_run_context(
+            context,
+            next,
+            None,
+            next.terminal().then_some("Cancellation confirmed."),
+            None,
+            None,
+        )
+        .await
+    }
+    pub async fn reserve_claude_followup(
+        &self,
+        context: &ClaudeRunContext,
+    ) -> Result<ClaudeRunContext, CoreError> {
+        if context.lifecycle != CodexRunLifecycle::Running || context.session_token.is_none() {
+            return Err(CoreError::RunContextConflict);
+        };
+        let t = now();
+        let changed=sqlx::query("UPDATE claude_run_contexts SET followup_sequence=followup_sequence+1, version=version+1, transitioned_at_ms=? WHERE run_id=? AND lifecycle='running' AND version=?").bind(t).bind(context.run_id.to_string()).bind(checked_i64(context.version)?).execute(&self.pool).await.map_err(|_|CoreError::Storage)?.rows_affected();
+        if changed != 1 {
+            return Err(CoreError::RunContextConflict);
+        };
+        self.get_claude_run_context_owned(
+            &context.project_id,
+            &context.worktree_id,
+            &context.task_key,
+            &context.public_reference,
+        )
+        .await
+    }
+    pub async fn reconcile_claude_run_contexts_on_startup(&self) -> Result<u64, CoreError> {
+        let t = now();
+        Ok(sqlx::query("UPDATE claude_run_contexts SET lifecycle='failed', version=version+1, terminal_summary='Execution was interrupted before completion.', failure_category='interrupted', transitioned_at_ms=?, terminal_at_ms=? WHERE lifecycle IN ('created','starting','running','cancelling')").bind(t).bind(t).execute(&self.pool).await.map_err(|_|CoreError::Storage)?.rows_affected())
     }
 
     pub async fn get_codex_run_context_owned(

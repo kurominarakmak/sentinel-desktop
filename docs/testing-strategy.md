@@ -27,6 +27,13 @@ argv, environment, and PID markers and assert none reach public JSON. The
 frontend contract has no `any` at this boundary; terminal polling stops and
 stale responses/cancel requests are ignored.
 
+Phase 5 uses only deterministic fake Claude records. It covers strict
+stream-json parsing, malformed/oversized/unknown event rejection, fixed
+start/resume construction, session-token bounds, ownership-scoped persistence,
+follow-up sequence conflicts, cancellation precedence, restart interruption,
+and public JSON redaction. Codex bounded parsing and the complete Phase 3
+two-worktree isolation acceptance remain mandatory regressions.
+
 Maintain Rust, Node/TypeScript, and Python fixture repositories with passing baselines, safe and failing tasks, protected files, dependency manifests, and deterministic evidence commands. The fake agent simulates normal completion, changes, test failure, approval, drift, crash, and cancellation.
 
 Desktop end-to-end tests cover project registration, prompt launch, fake task, tray state, follow-up, approval, drift, evidence, final diff, restart, and retained history. Cross-platform tests validate platform-specific shortcuts, tray behavior, process cancellation, executable discovery, paths, and packaging as each platform phase begins.

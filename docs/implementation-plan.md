@@ -26,6 +26,14 @@ and conservative restart interruption reconciliation. No automatic worktree
 removal occurs. App Server remains unavailable/experimental and Phase 5 is not
 started.
 
+## Phase 5 Claude boundary
+
+Phase 5 supplies a bounded `stream-json` parser and fixed new/resume argv
+forms, session-aware persisted run context, follow-up sequencing, permission
+normalization, cancellation ownership, and redacted typed bridge contracts.
+It intentionally does not add Phase 6 prompt/tray/task UI, reconnect sessions
+after restart, enable App Server, or remove worktrees automatically.
+
 ## Product Controls And Release Work
 
 Desktop UX adds the prompt, search, agent selection, tray state, task details, notifications, keyboard navigation, and autostart. Approval profiles, audit history, deterministic drift findings, and evidence checks follow. Reliability adds persistent logs, restart recovery, interrupted-task detection, process-group cleanup, output limits, rotation, worktree recovery, and migrations.

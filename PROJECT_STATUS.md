@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 4 — COMPLETE / CLEAN. Phase 5 is NOT STARTED.**
+**Current phase: Phase 5 — COMPLETE / CLEAN. Phase 6 is NOT STARTED.**
 
 ## Documentation Navigation
 
@@ -32,7 +32,7 @@ Phase 2C3 is **COMPLETE**: manual macOS Tauri desktop acceptance verified succes
 
 Phase 2 is **COMPLETE**. Its exit criterion is satisfied: a deterministic fake task traverses the desktop UI, typed Tauri bridge, Rust orchestrator and state machine, SQLite persistence, live/persisted event recovery, history, terminal handling, and cancellation.
 
-Phase 3 is complete at `630a54f` and checkpointed by the immutable `phase-3-complete` tag. Phase 4 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-4-authoritative-execution-contract.md): it adds bounded private Codex structured execution, a persisted ownership-bound run context with opaque public references, redacted start/query/cancel DTOs, direct-child cancellation, and conservative restart interruption reconciliation. App Server is explicitly unavailable/experimental, automatic worktree removal remains disabled, and Phase 5 is **NOT STARTED**. Phase 3 exact-byte identity, isolation, bounded worktree operations, and redacted public boundaries remain unchanged.
+Phase 3 is complete at `630a54f` and checkpointed by the immutable `phase-3-complete` tag. Phase 4 remains **COMPLETE / CLEAN**. Phase 5 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-5-authoritative-execution-contract.md): it adds bounded Claude stream-json parsing, fixed resume construction, session-aware ownership-bound persistence, and redacted query/follow-up/cancel DTOs. Claude remains unavailable unless a private configured runner is added; this is honest capability behavior, not a Phase 6 workflow. App Server is explicitly unavailable/experimental, automatic worktree removal remains disabled, direct-child containment remains the only claim, and Phase 6 is **NOT STARTED**. Phase 3 and Phase 4 trust boundaries remain unchanged.
 
 Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
 

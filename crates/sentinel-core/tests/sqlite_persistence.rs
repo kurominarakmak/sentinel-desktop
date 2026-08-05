@@ -1,9 +1,9 @@
 use sentinel_core::{
-    redact, CodexRunLifecycle, CoreError, CreateCodexRunContext, ManagedWorktreeState,
-    NormalizedAgentEvent, ProjectFingerprintScheme, ProjectRegistration, ProjectValidationState,
-    RunId, RunRepository, RunStatus, SafeRunError, TaskRequest, WorktreeId, EVENT_SCHEMA_VERSION,
-    MAX_EVENT_PAYLOAD_BYTES, MAX_SAFE_ERROR_CATEGORY_BYTES, MAX_SAFE_ERROR_MESSAGE_BYTES,
-    MAX_TASK_BYTES,
+    redact, CodexRunLifecycle, CoreError, CreateClaudeRunContext, CreateCodexRunContext,
+    ManagedWorktreeState, NormalizedAgentEvent, ProjectFingerprintScheme, ProjectRegistration,
+    ProjectValidationState, RunId, RunRepository, RunStatus, SafeRunError, TaskRequest, WorktreeId,
+    EVENT_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES, MAX_SAFE_ERROR_CATEGORY_BYTES,
+    MAX_SAFE_ERROR_MESSAGE_BYTES, MAX_TASK_BYTES,
 };
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
@@ -181,6 +181,53 @@ async fn codex_context_is_owned_versioned_and_restart_reconciled() {
         .expect("recovered");
     assert_eq!(recovered.lifecycle, CodexRunLifecycle::Failed);
     assert_eq!(recovered.failure_category.as_deref(), Some("interrupted"));
+}
+
+#[tokio::test]
+async fn claude_context_redacts_prompt_and_scopes_ownership() {
+    let (_directory, _url, repository) = repository().await;
+    let (project, worktree) = codex_owner(&repository).await;
+    let context = repository
+        .create_claude_run_context(CreateClaudeRunContext {
+            project_id: project.clone(),
+            worktree_id: worktree.clone(),
+            task_key: "claude-task".into(),
+        })
+        .await
+        .expect("context");
+    assert_eq!(
+        repository
+            .get_run(&context.run_id)
+            .await
+            .expect("run")
+            .task_text,
+        "[redacted claude request]"
+    );
+    assert!(repository
+        .get_claude_run_context_owned(&project, &worktree, "wrong", &context.public_reference)
+        .await
+        .is_err());
+    assert_eq!(
+        repository
+            .reconcile_claude_run_contexts_on_startup()
+            .await
+            .expect("reconcile"),
+        1
+    );
+    assert_eq!(
+        repository
+            .get_claude_run_context_owned(
+                &project,
+                &worktree,
+                "claude-task",
+                &context.public_reference
+            )
+            .await
+            .expect("context")
+            .failure_category
+            .as_deref(),
+        Some("interrupted")
+    );
 }
 
 #[tokio::test]

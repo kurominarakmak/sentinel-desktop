@@ -21,8 +21,11 @@ Tauri 2 hosts a React, TypeScript, and Vite frontend plus a Rust/Tokio core. SQL
 macOS is implemented and validated first; Windows and Linux are planned. Codex
 structured execution is bounded to backend-owned managed worktrees and uses
 opaque public run references. Codex App Server is explicitly unavailable and
-experimental; it is never launched by the desktop bridge. Claude/Phase 5 work
-has not started.
+experimental; it is never launched by the desktop bridge. Claude stream-json
+records use the same bounded, ownership-scoped persisted interface; follow-up
+and resume inputs are fixed-form capabilities and Claude is truthfully reported
+unavailable until a private configured runner exists. Phase 6 UX work has not
+started.
 
 ## Installation And Development
 

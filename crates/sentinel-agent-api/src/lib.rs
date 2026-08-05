@@ -93,6 +93,7 @@ pub fn parse_json_line(line: &str) -> Result<serde_json::Value, serde_json::Erro
 /// Maximum provider JSON-line transport size. The caller must apply this
 /// before UTF-8 decoding so a provider cannot cause unbounded allocation.
 pub const MAX_CODEX_JSON_LINE_BYTES: usize = 16 * 1024;
+pub const MAX_CLAUDE_JSON_LINE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodexProtocolError {
@@ -100,6 +101,85 @@ pub enum CodexProtocolError {
     InvalidUtf8,
     Malformed,
     Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaudeProtocolError {
+    Oversized,
+    InvalidUtf8,
+    Malformed,
+    Unsupported,
+}
+
+/// Converts the small documented `claude --output-format stream-json` subset
+/// needed by the normalized contract. Provider content is never forwarded
+/// unless its exact event shape and bounded string field are allowlisted.
+pub fn parse_claude_stream_json_line(bytes: &[u8]) -> Result<AgentEvent, ClaudeProtocolError> {
+    if bytes.is_empty() || bytes.len() > MAX_CLAUDE_JSON_LINE_BYTES {
+        return Err(ClaudeProtocolError::Oversized);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| ClaudeProtocolError::InvalidUtf8)?;
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| ClaudeProtocolError::Malformed)?;
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ClaudeProtocolError::Malformed)?;
+    let bounded = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty() && v.len() <= 4096)
+            .map(str::to_owned)
+            .ok_or(ClaudeProtocolError::Malformed)
+    };
+    match kind {
+        "system" if value.get("subtype").and_then(serde_json::Value::as_str) == Some("init") => {
+            Ok(AgentEvent::SessionStarted {
+                session_id: bounded("session_id")?,
+            })
+        }
+        "assistant" => Ok(AgentEvent::Message {
+            text: bounded("text")?,
+        }),
+        "result" if value.get("subtype").and_then(serde_json::Value::as_str) == Some("success") => {
+            Ok(AgentEvent::Completed)
+        }
+        "result" => Ok(AgentEvent::Failed {
+            error: "Claude reported a failed turn.".into(),
+        }),
+        "permission_request" => Ok(AgentEvent::WaitingForInput),
+        _ => Err(ClaudeProtocolError::Unsupported),
+    }
+}
+
+/// Fixed noninteractive stream-json command construction. The caller cannot
+/// inject flags, session IDs, or executable paths.
+pub fn claude_stream_argv(prompt: &str) -> Result<Vec<String>, ClaudeProtocolError> {
+    if prompt.trim().is_empty() || prompt.len() > 8_000 || prompt.contains('\0') {
+        return Err(ClaudeProtocolError::Malformed);
+    }
+    Ok(vec![
+        "--output-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--print".into(),
+        prompt.into(),
+    ])
+}
+
+pub fn claude_resume_argv(session: &str, prompt: &str) -> Result<Vec<String>, ClaudeProtocolError> {
+    if session.is_empty()
+        || session.len() > 128
+        || !session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(ClaudeProtocolError::Malformed);
+    }
+    let mut argv = vec!["--resume".into(), session.into()];
+    argv.extend(claude_stream_argv(prompt)?);
+    Ok(argv)
 }
 
 /// Converts the conservative documented subset of `codex exec --json` event
@@ -176,6 +256,36 @@ mod tests {
         assert_eq!(
             codex_exec_argv("fix it").unwrap(),
             vec!["exec", "--json", "--", "fix it"]
+        );
+    }
+    #[test]
+    fn claude_stream_parser_and_fixed_resume_are_bounded() {
+        assert_eq!(
+            parse_claude_stream_json_line(
+                br#"{"type":"system","subtype":"init","session_id":"s_1"}"#
+            ),
+            Ok(AgentEvent::SessionStarted {
+                session_id: "s_1".into()
+            })
+        );
+        assert_eq!(
+            parse_claude_stream_json_line(br#"{"type":"permission_request"}"#),
+            Ok(AgentEvent::WaitingForInput)
+        );
+        assert!(
+            parse_claude_stream_json_line(br#"{"type":"tool_use","command":"secret"}"#).is_err()
+        );
+        assert_eq!(
+            claude_resume_argv("s_1", "continue").unwrap(),
+            vec![
+                "--resume",
+                "s_1",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--print",
+                "continue"
+            ]
         );
     }
 }

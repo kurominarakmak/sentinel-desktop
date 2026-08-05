@@ -53,4 +53,16 @@ Server remains unavailable experimental metadata and is never launched.
 Automatic worktree removal stays disabled; Phase 3 remains the authority for
 exact worktree identity and inspectable diffs.
 
+## Phase 5 Claude boundary
+
+Phase 5 mirrors the Codex boundary for Claude stream-json: a strict UTF-8
+allowlist normalizes only session, message, terminal, and permission-needed
+events; fixed start/resume argv forms admit no caller flags or session token.
+The private `claude_run_contexts` table binds the opaque public reference to
+the same ProjectId/WorktreeId/task key and retains only a bounded private
+session token, follow-up sequence, lifecycle, and redacted summaries. Public
+query/follow-up/cancel DTOs never reveal the session token or process data.
+Restart fails active records as interrupted and does not reconnect a session.
+Phase 6 desktop workflow remains out of scope.
+
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).
