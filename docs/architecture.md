@@ -74,4 +74,11 @@ The tray and global shortcut only show/focus the prompt. Notification and
 autostart capability are explicit unavailable states in this build; no OS
 setting is silently changed. Approval decisions remain Phase 7.
 
+## Phase 7 approval boundary
+
+Approval profiles and requests are persisted as backend-owned, ownership-bound
+records. Hard-denied action categories override all profiles. This phase does
+not run an approved action or implement drift/evidence evaluation; those remain
+outside the approval boundary and Phase 8 is not started.
+
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).

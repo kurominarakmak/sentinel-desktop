@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 6 — COMPLETE / CLEAN. Phase 7 is NOT STARTED.**
+**Current phase: Phase 7 — COMPLETE / CLEAN. Phase 8 is NOT STARTED.**
 
 ## Documentation Navigation
 
@@ -32,7 +32,7 @@ Phase 2C3 is **COMPLETE**: manual macOS Tauri desktop acceptance verified succes
 
 Phase 2 is **COMPLETE**. Its exit criterion is satisfied: a deterministic fake task traverses the desktop UI, typed Tauri bridge, Rust orchestrator and state machine, SQLite persistence, live/persisted event recovery, history, terminal handling, and cancellation.
 
-Phase 3, Phase 4, and Phase 5 remain **COMPLETE / CLEAN** at their checkpoint tags. Phase 6 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-6-authoritative-execution-contract.md): the desktop prompt now presents opaque project/worktree and agent selection, task detail/history, availability, cancellation, tray/shortcut focus behavior, and truthful notification/autostart posture. Phase 7 approvals are **NOT STARTED**. App Server remains unavailable/experimental, automatic worktree removal remains disabled, and direct-child containment remains the only claim.
+Phase 3–6 remain **COMPLETE / CLEAN** at their checkpoint tags. Phase 7 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-7-authoritative-execution-contract.md): Safe, Balanced, Autonomous, and Custom profiles have a bounded approval-request persistence boundary, with hard-denied merge/push/force-push/CLI-install/unrestricted-permission categories. Phase 8 drift/evidence is **NOT STARTED**. App Server remains unavailable/experimental, automatic worktree removal remains disabled, and direct-child containment remains the only claim.
 
 Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
 

@@ -243,6 +243,28 @@ pub struct TaskRequest {
     pub task_text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalProfile {
+    Safe,
+    Balanced,
+    Autonomous,
+    Custom,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowForTask,
+    Deny,
+}
+pub fn hard_denied_action(action: &str) -> bool {
+    matches!(
+        action,
+        "merge" | "push" | "force_push" | "install_cli" | "unrestricted_permissions"
+    )
+}
+
 /// Backend-generated bearer-resistant reference.  It is deliberately opaque:
 /// callers must also prove the project/worktree/task ownership tuple.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1534,5 +1556,18 @@ mod tests {
         assert!(first.as_str().starts_with("cr_"));
         assert!(PublicRunReference::parse("17").is_err());
         assert!(PublicRunReference::parse("cr_A_NOT_LOWERCASE").is_err());
+    }
+    #[test]
+    fn hard_denials_override_every_profile() {
+        for action in [
+            "merge",
+            "push",
+            "force_push",
+            "install_cli",
+            "unrestricted_permissions",
+        ] {
+            assert!(hard_denied_action(action));
+        }
+        assert!(!hard_denied_action("read_repository"));
     }
 }
