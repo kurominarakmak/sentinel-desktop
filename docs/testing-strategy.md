@@ -12,6 +12,21 @@ Phase 2B runtime integration tests run only the local deterministic fake-agent b
 
 ## Fixtures And End To End
 
+Phase 4 uses a newly-created executable fixture that emits deterministic Codex
+JSON Lines. It proves fixed argv parsing, strict allowlisting, persisted Codex
+run identity, supplied temporary-worktree execution, redaction, and terminal
+reconciliation. It never invokes a real Codex or Claude workflow, a production
+repository, or a user-owned worktree.
+
+The Phase 4 persistence suite also proves the migration constraints, opaque
+reference uniqueness/syntax, ownership-scoped lookup (wrong ownership is the
+same public-safe failure as unknown), legal/illegal transitions, stale-version
+rejection, cancellation-over-success precedence, bounded summaries, and
+restart reconciliation. Bridge serialization tests inject paths, credentials,
+argv, environment, and PID markers and assert none reach public JSON. The
+frontend contract has no `any` at this boundary; terminal polling stops and
+stale responses/cancel requests are ignored.
+
 Maintain Rust, Node/TypeScript, and Python fixture repositories with passing baselines, safe and failing tasks, protected files, dependency manifests, and deterministic evidence commands. The fake agent simulates normal completion, changes, test failure, approval, drift, crash, and cancellation.
 
 Desktop end-to-end tests cover project registration, prompt launch, fake task, tray state, follow-up, approval, drift, evidence, final diff, restart, and retained history. Cross-platform tests validate platform-specific shortcuts, tray behavior, process cancellation, executable discovery, paths, and packaging as each platform phase begins.

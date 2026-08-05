@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 3 — IN PROGRESS (remaining implementation is complete and awaiting the single integrated end-of-phase validation gate; Phase 4 is NOT STARTED).**
+**Current phase: Phase 4 — COMPLETE / CLEAN. Phase 5 is NOT STARTED.**
 
 ## Documentation Navigation
 
@@ -32,7 +32,7 @@ Phase 2C3 is **COMPLETE**: manual macOS Tauri desktop acceptance verified succes
 
 Phase 2 is **COMPLETE**. Its exit criterion is satisfied: a deterministic fake task traverses the desktop UI, typed Tauri bridge, Rust orchestrator and state machine, SQLite persistence, live/persisted event recovery, history, terminal handling, and cancellation.
 
-Phase 3 is **IN PROGRESS** pending its one final validation gate. B2-B0 supplies the reviewed byte grammar and fixture corpus; B2-B1 uses a bounded fixed-argument Git patch envelope and complete private parser; B2-C reuses the locked A/C1/B/C2/C/C3 coherence authority before extraction; B2-D adds hostile-fixture and two-task isolation coverage; and 3C-C exposes only aggregate, typed, path-free diff totals. Canonically normalization-unstable Unicode selections reject before inventory comparison, and Git inventory parsing applies the same exact-byte policy. Raw patch bytes, paths, line text, commands, stderr, environment, PIDs, and private evidence never cross the desktop bridge. Managed-worktree removal remains disabled, production descendant containment is unchanged, and Phase 4 remains **NOT STARTED**. All implementation and tests use disposable repositories/worktrees and deterministic fake tasks only.
+Phase 3 is complete at `630a54f` and checkpointed by the immutable `phase-3-complete` tag. Phase 4 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-4-authoritative-execution-contract.md): it adds bounded private Codex structured execution, a persisted ownership-bound run context with opaque public references, redacted start/query/cancel DTOs, direct-child cancellation, and conservative restart interruption reconciliation. App Server is explicitly unavailable/experimental, automatic worktree removal remains disabled, and Phase 5 is **NOT STARTED**. Phase 3 exact-byte identity, isolation, bounded worktree operations, and redacted public boundaries remain unchanged.
 
 Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
 

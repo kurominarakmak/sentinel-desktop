@@ -1,7 +1,9 @@
 use sentinel_core::{
-    redact, CoreError, NormalizedAgentEvent, RunId, RunRepository, RunStatus, SafeRunError,
-    TaskRequest, EVENT_SCHEMA_VERSION, MAX_EVENT_PAYLOAD_BYTES, MAX_SAFE_ERROR_CATEGORY_BYTES,
-    MAX_SAFE_ERROR_MESSAGE_BYTES, MAX_TASK_BYTES,
+    redact, CodexRunLifecycle, CoreError, CreateCodexRunContext, ManagedWorktreeState,
+    NormalizedAgentEvent, ProjectFingerprintScheme, ProjectRegistration, ProjectValidationState,
+    RunId, RunRepository, RunStatus, SafeRunError, TaskRequest, WorktreeId, EVENT_SCHEMA_VERSION,
+    MAX_EVENT_PAYLOAD_BYTES, MAX_SAFE_ERROR_CATEGORY_BYTES, MAX_SAFE_ERROR_MESSAGE_BYTES,
+    MAX_TASK_BYTES,
 };
 use serde_json::json;
 use sqlx::{Row, SqlitePool};
@@ -12,6 +14,45 @@ fn database_url(directory: &TempDir) -> String {
         "sqlite://{}",
         directory.path().join("sentinel.sqlite").display()
     )
+}
+
+async fn codex_owner(repository: &RunRepository) -> (sentinel_core::ProjectId, WorktreeId) {
+    let project = repository
+        .register_project(ProjectRegistration {
+            display_name: "fixture".into(),
+            repository_identity: format!("identity-{}", uuid::Uuid::new_v4()),
+            repository_fingerprint: "a".repeat(64),
+            fingerprint_scheme: ProjectFingerprintScheme::StrongV1,
+            repository_root: "/fixture".into(),
+            primary_root: "/fixture".into(),
+            git_common_dir: "/fixture/.git".into(),
+            branch: Some("main".into()),
+            head: Some("b".repeat(40)),
+            validation_state: ProjectValidationState::Valid,
+            is_primary_worktree: true,
+        })
+        .await
+        .expect("project");
+    let id = WorktreeId::new();
+    repository
+        .insert_creating_worktree(
+            id.clone(),
+            &project,
+            format!("/fixture/wt-{id}"),
+            "c".repeat(40),
+        )
+        .await
+        .expect("worktree");
+    repository
+        .transition_worktree(
+            &id,
+            ManagedWorktreeState::Creating,
+            ManagedWorktreeState::Ready,
+            None,
+        )
+        .await
+        .expect("ready");
+    (project.id, id)
 }
 
 async fn repository() -> (TempDir, String, RunRepository) {
@@ -71,6 +112,75 @@ async fn fresh_database_migrates_with_required_schema_and_configuration() {
     assert!(worktree_columns.contains(&"worktree_path".into()));
     assert!(worktree_columns.contains(&"base_commit".into()));
     assert!(project_columns.contains(&"fingerprint_scheme".into()));
+}
+
+#[tokio::test]
+async fn codex_context_is_owned_versioned_and_restart_reconciled() {
+    let (_directory, _url, repository) = repository().await;
+    let (project, worktree) = codex_owner(&repository).await;
+    let context = repository
+        .create_codex_run_context(CreateCodexRunContext {
+            project_id: project.clone(),
+            worktree_id: worktree.clone(),
+            task_key: "task-1".into(),
+        })
+        .await
+        .expect("context");
+    assert_eq!(
+        repository
+            .get_run(&context.run_id)
+            .await
+            .expect("legacy run")
+            .task_text,
+        "[redacted codex request]"
+    );
+    assert!(repository
+        .get_codex_run_context_owned(&project, &worktree, "other", &context.public_reference)
+        .await
+        .is_err());
+    let starting = repository
+        .transition_codex_run_context(
+            &context,
+            CodexRunLifecycle::Starting,
+            Some("safe progress"),
+            None,
+            None,
+        )
+        .await
+        .expect("starting");
+    assert_eq!(starting.version, 1);
+    assert!(repository
+        .transition_codex_run_context(&context, CodexRunLifecycle::Running, None, None, None)
+        .await
+        .is_err());
+    let cancelled = repository
+        .request_codex_cancellation(&starting)
+        .await
+        .expect("cancel");
+    assert_eq!(cancelled.lifecycle, CodexRunLifecycle::Cancelling);
+    assert!(repository
+        .transition_codex_run_context(
+            &cancelled,
+            CodexRunLifecycle::Succeeded,
+            None,
+            Some("done"),
+            None
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        repository
+            .reconcile_codex_run_contexts_on_startup()
+            .await
+            .expect("reconcile"),
+        1
+    );
+    let recovered = repository
+        .get_codex_run_context_owned(&project, &worktree, "task-1", &context.public_reference)
+        .await
+        .expect("recovered");
+    assert_eq!(recovered.lifecycle, CodexRunLifecycle::Failed);
+    assert_eq!(recovered.failure_category.as_deref(), Some("interrupted"));
 }
 
 #[tokio::test]

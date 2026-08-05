@@ -3,10 +3,12 @@ use sentinel_core::{
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_runtime::{
-    bounded_redacted_text, CancellationResult, FakeAgentProgram, RunOrchestrator, RunStorage,
-    RuntimeError, StorageFuture,
+    bounded_redacted_text, CancellationResult, CodexExecProgram, FakeAgentProgram, RunOrchestrator,
+    RunStorage, RuntimeError, StorageFuture,
 };
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     path::PathBuf,
     sync::{
@@ -47,6 +49,54 @@ fn fake_agent_executable() -> PathBuf {
         ))
 }
 
+#[cfg(unix)]
+fn fake_codex_executable(directory: &std::path::Path, body: &str) -> PathBuf {
+    let executable = directory.join("fake-codex");
+    std::fs::write(&executable, body).expect("fake Codex script");
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&executable, permissions).unwrap();
+    executable
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_exec_uses_the_supplied_worktree_and_persists_only_normalized_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let worktree = directory.path().join("managed-worktree");
+    std::fs::create_dir(&worktree).unwrap();
+    let executable = fake_codex_executable(
+        directory.path(),
+        "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"fixture-session\"}' '{\"type\":\"item.completed\",\"text\":\"bounded update\"}' '{\"type\":\"turn.completed\"}'\n",
+    );
+    let url = format!(
+        "sqlite://{}",
+        directory.path().join("runtime.sqlite").display()
+    );
+    let repository = RunRepository::open(&url).await.unwrap();
+    let runtime = RunOrchestrator::new(repository.clone(), fake_agent_program())
+        .with_codex_exec(CodexExecProgram::from_executable(executable).unwrap());
+    let run = runtime
+        .submit_codex_run(
+            TaskRequest {
+                task_text: "fixture task".into(),
+            },
+            worktree,
+        )
+        .await
+        .unwrap();
+    let result = runtime.wait_for_run(&run.id).await.unwrap();
+    assert_eq!(result.agent, sentinel_agent_api::AgentKind::Codex);
+    assert_eq!(result.status, RunStatus::Completed, "{result:?}");
+    let events = repository.list_events(&run.id).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "session_started"));
+    assert!(events
+        .iter()
+        .all(|event| !event.payload.to_string().contains("fake-codex")));
+}
+
 struct FailingStorage {
     inner: RunRepository,
     status: Option<RunStatus>,
@@ -60,6 +110,13 @@ struct FailingStorage {
 impl RunStorage for FailingStorage {
     fn create_run<'a>(&'a self, request: TaskRequest) -> StorageFuture<'a, Run> {
         Box::pin(self.inner.create_run(request))
+    }
+    fn create_run_for_agent<'a>(
+        &'a self,
+        request: TaskRequest,
+        agent: sentinel_agent_api::AgentKind,
+    ) -> StorageFuture<'a, Run> {
+        Box::pin(self.inner.create_run_for_agent(request, agent))
     }
     fn get_run<'a>(&'a self, id: &'a sentinel_core::RunId) -> StorageFuture<'a, Run> {
         Box::pin(self.inner.get_run(id))

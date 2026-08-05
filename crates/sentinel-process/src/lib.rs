@@ -45,11 +45,34 @@ impl SupervisedProcess {
         args: &[&str],
         working_directory: Option<&Path>,
     ) -> Result<(Self, mpsc::Receiver<ProcessEvent>), ProcessError> {
+        Self::start_in_with_environment(program, args, working_directory, false).await
+    }
+
+    /// Starts a provider with a fixed empty environment.  Generic repository
+    /// helpers intentionally retain their existing environment semantics, so
+    /// execution adapters must opt into this narrower boundary explicitly.
+    pub async fn start_in_sanitized(
+        program: &str,
+        args: &[&str],
+        working_directory: Option<&Path>,
+    ) -> Result<(Self, mpsc::Receiver<ProcessEvent>), ProcessError> {
+        Self::start_in_with_environment(program, args, working_directory, true).await
+    }
+
+    async fn start_in_with_environment(
+        program: &str,
+        args: &[&str],
+        working_directory: Option<&Path>,
+        sanitize_environment: bool,
+    ) -> Result<(Self, mpsc::Receiver<ProcessEvent>), ProcessError> {
         let mut command = Command::new(program);
         command
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if sanitize_environment {
+            command.stdin(Stdio::null()).env_clear();
+        }
         if let Some(working_directory) = working_directory {
             command.current_dir(working_directory);
         }

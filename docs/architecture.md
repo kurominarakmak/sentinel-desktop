@@ -32,4 +32,25 @@ A task validates a project, records an intent contract, creates `agent-sentinel/
 
 ## Daemon And Platform Direction
 
+## Phase 4 Codex Boundary
+
+Phase 4 adds a private bounded `codex exec --json` runner and a persisted
+`codex_run_contexts` authority record. Each context binds the internal RunId to
+a backend-generated opaque reference, exact ProjectId/WorktreeId/task key,
+fixed adapter/protocol identity, closed lifecycle, cancellation bit, optimistic
+version, bounded progress/terminal summaries, redacted failure category, and
+timestamps. Prompts, paths, argv, environment, PID, process handles, stdout,
+stderr, raw JSON, and credentials are never stored in that context.
+
+Public start/query/cancel commands require the full ownership tuple plus the
+opaque reference on lookup. They return only the redacted run DTO. Lifecycle is
+`created → starting → running → {succeeded|failed}` or `… → cancelling →
+cancelled`; terminal states are immutable, versions prevent stale updates, and
+cancellation cannot yield later success. The private active map owns only the
+direct child coordination state. On restart it is deliberately not reattached:
+non-terminal persisted records become a redacted `interrupted` failure. App
+Server remains unavailable experimental metadata and is never launched.
+Automatic worktree removal stays disabled; Phase 3 remains the authority for
+exact worktree identity and inspectable diffs.
+
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).

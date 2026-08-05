@@ -16,6 +16,16 @@ Foundation establishes the monorepo, Cargo workspace, Tauri/React application, C
 
 Git isolation then registers projects, validates repositories, records base commits, creates branches/worktrees, generates diffs, supports cleanup, and opens editor or terminal. Only after that do the Codex and Claude adapters enter the product. Codex begins with structured `exec` parsing; App Server remains experimental and version-tested. Claude begins with structured streaming, session capture, follow-up input, resume fallback, permission events, cancellation, and errors.
 
+## Phase 4 execution boundary
+
+Phase 4 persists a redacted Codex run context before execution, binds it to the
+authoritative project/worktree/task tuple, and exposes only opaque-reference
+start/query/cancel DTOs. The adapter has fixed argv/environment, bounded JSON
+Lines parsing, direct-child-only cancellation, optimistic lifecycle updates,
+and conservative restart interruption reconciliation. No automatic worktree
+removal occurs. App Server remains unavailable/experimental and Phase 5 is not
+started.
+
 ## Product Controls And Release Work
 
 Desktop UX adds the prompt, search, agent selection, tray state, task details, notifications, keyboard navigation, and autostart. Approval profiles, audit history, deterministic drift findings, and evidence checks follow. Reliability adds persistent logs, restart recovery, interrupted-task detection, process-group cleanup, output limits, rotation, worktree recovery, and migrations.

@@ -1,4 +1,4 @@
-use sentinel_agent_api::AgentEvent;
+use sentinel_agent_api::{codex_exec_argv, parse_codex_exec_json_line, AgentEvent, AgentKind};
 use sentinel_core::{
     redact, CoreError, NormalizedAgentEvent, Run, RunId, RunRepository, RunStatus, SafeRunError,
     TaskRequest, EVENT_SCHEMA_VERSION,
@@ -31,6 +31,23 @@ const CANCEL_TIMEOUT: Duration = Duration::from_millis(250);
 pub struct FakeAgentProgram {
     executable: PathBuf,
     prefix_args: Vec<String>,
+}
+
+/// A user-managed Codex executable. It is never discovered or installed by
+/// the runtime, and its argv is fixed by the adapter contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexExecProgram {
+    executable: PathBuf,
+}
+
+impl CodexExecProgram {
+    pub fn from_executable(executable: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
+        let executable = executable.into();
+        if !executable.is_file() {
+            return Err(RuntimeError::LaunchTargetMissing);
+        }
+        Ok(Self { executable })
+    }
 }
 
 impl FakeAgentProgram {
@@ -85,12 +102,19 @@ pub enum RuntimeError {
     LaunchTargetMissing,
     #[error("runtime launch error")]
     Launch,
+    #[error("Codex execution is unavailable")]
+    CodexUnavailable,
     #[error("runtime process termination error")]
     Termination,
 }
 
 pub trait RunStorage: Send + Sync {
     fn create_run<'a>(&'a self, request: TaskRequest) -> StorageFuture<'a, Run>;
+    fn create_run_for_agent<'a>(
+        &'a self,
+        request: TaskRequest,
+        agent: AgentKind,
+    ) -> StorageFuture<'a, Run>;
     fn get_run<'a>(&'a self, id: &'a RunId) -> StorageFuture<'a, Run>;
     fn transition_with_event<'a>(
         &'a self,
@@ -115,6 +139,13 @@ pub type StorageFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, CoreError>
 impl RunStorage for RunRepository {
     fn create_run<'a>(&'a self, request: TaskRequest) -> StorageFuture<'a, Run> {
         Box::pin(RunRepository::create_run(self, request))
+    }
+    fn create_run_for_agent<'a>(
+        &'a self,
+        request: TaskRequest,
+        agent: AgentKind,
+    ) -> StorageFuture<'a, Run> {
+        Box::pin(RunRepository::create_run_for_agent(self, request, agent))
     }
     fn get_run<'a>(&'a self, id: &'a RunId) -> StorageFuture<'a, Run> {
         Box::pin(RunRepository::get_run(self, id))
@@ -215,6 +246,7 @@ struct TerminalOutcome {
 pub struct RunOrchestrator {
     repository: Arc<dyn RunStorage>,
     fake_agent: FakeAgentProgram,
+    codex: Option<CodexExecProgram>,
     active: Arc<Mutex<HashMap<RunId, ActiveRun>>>,
     next_generation: Arc<AtomicU64>,
 }
@@ -228,9 +260,15 @@ impl RunOrchestrator {
         Self {
             repository,
             fake_agent,
+            codex: None,
             active: Arc::new(Mutex::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    pub fn with_codex_exec(mut self, codex: CodexExecProgram) -> Self {
+        self.codex = Some(codex);
+        self
     }
 
     pub async fn submit_run(
@@ -263,6 +301,104 @@ impl RunOrchestrator {
             runner.run(id, scenario, active, cancel_receiver).await;
         });
         Ok(run)
+    }
+
+    /// Starts one structured Codex turn in a caller-validated managed
+    /// worktree. This API neither creates nor resolves worktrees itself.
+    pub async fn submit_codex_run(
+        &self,
+        request: TaskRequest,
+        worktree: PathBuf,
+    ) -> Result<Run, RuntimeError> {
+        let Some(codex) = self.codex.clone() else {
+            return Err(RuntimeError::CodexUnavailable);
+        };
+        if !worktree.is_dir() {
+            return Err(RuntimeError::LaunchTargetMissing);
+        }
+        let run = self
+            .repository
+            .create_run_for_agent(request.clone(), AgentKind::Codex)
+            .await
+            .map_err(|_| RuntimeError::Storage)?;
+        let (cancel_sender, cancel_receiver) = mpsc::channel(1);
+        let (event_sender, _) = broadcast::channel(LIVE_EVENT_CAPACITY);
+        let (completion_sender, _) = watch::channel(None);
+        let active = ActiveRun {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            state: ActiveRunState::Active,
+            cancel: cancel_sender,
+            events: event_sender,
+            completion: completion_sender,
+        };
+        self.active
+            .lock()
+            .await
+            .insert(run.id.clone(), active.clone());
+        let runner = self.clone();
+        let id = run.id.clone();
+        tokio::spawn(async move {
+            runner
+                .run_codex(
+                    id,
+                    request.task_text,
+                    worktree,
+                    codex,
+                    active,
+                    cancel_receiver,
+                )
+                .await;
+        });
+        Ok(run)
+    }
+
+    /// Starts a Codex adapter for an already-persisted, backend-owned run.
+    /// This is used by the Phase 4 context service so it never creates a
+    /// second RunId for the same public run reference.
+    pub async fn submit_existing_codex_run(
+        &self,
+        id: RunId,
+        task: String,
+        worktree: PathBuf,
+    ) -> Result<(), RuntimeError> {
+        let Some(codex) = self.codex.clone() else {
+            return Err(RuntimeError::CodexUnavailable);
+        };
+        if !worktree.is_dir() {
+            return Err(RuntimeError::LaunchTargetMissing);
+        }
+        let run = self
+            .repository
+            .get_run(&id)
+            .await
+            .map_err(|_| RuntimeError::Storage)?;
+        if run.agent != AgentKind::Codex || run.status != RunStatus::Queued {
+            return Err(RuntimeError::RunNotActive);
+        }
+        let (cancel_sender, cancel_receiver) = mpsc::channel(1);
+        let (event_sender, _) = broadcast::channel(LIVE_EVENT_CAPACITY);
+        let (completion_sender, _) = watch::channel(None);
+        let active = ActiveRun {
+            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
+            state: ActiveRunState::Active,
+            cancel: cancel_sender,
+            events: event_sender,
+            completion: completion_sender,
+        };
+        {
+            let mut active_runs = self.active.lock().await;
+            if active_runs.contains_key(&id) {
+                return Err(RuntimeError::RunNotActive);
+            }
+            active_runs.insert(id.clone(), active.clone());
+        }
+        let runner = self.clone();
+        tokio::spawn(async move {
+            runner
+                .run_codex(id, task, worktree, codex, active, cancel_receiver)
+                .await;
+        });
+        Ok(())
     }
 
     pub async fn get_active_run(&self, id: &RunId) -> Result<Option<Run>, RuntimeError> {
@@ -556,6 +692,119 @@ impl RunOrchestrator {
                 Some(ProcessEvent::Exited(_)) => {}
                 None => output_open = false,
                 },
+            }
+        }
+        self.finalize(&id, &mut sequence, evidence, true, &active)
+            .await;
+    }
+
+    async fn run_codex(
+        &self,
+        id: RunId,
+        task: String,
+        worktree: PathBuf,
+        codex: CodexExecProgram,
+        active: ActiveRun,
+        mut commands: mpsc::Receiver<RunnerCommand>,
+    ) {
+        let mut sequence = 0;
+        let mut evidence = RunOutcomeEvidence::default();
+        let preparing = self.lifecycle_event(&id, &mut sequence, "run_preparing");
+        if self
+            .persist_and_publish(&id, RunStatus::Preparing, None, preparing, &active)
+            .await
+            .is_err()
+        {
+            evidence.storage_error = Some(runtime_error(
+                "runtime_storage",
+                "unable to persist run lifecycle update",
+            ));
+            self.finalize(&id, &mut sequence, evidence, false, &active)
+                .await;
+            return;
+        }
+        let arguments = match codex_exec_argv(&task) {
+            Ok(arguments) => arguments,
+            Err(_) => {
+                evidence.fatal_runtime_error = Some(runtime_error(
+                    "invalid_codex_request",
+                    "the Codex task request is invalid",
+                ));
+                self.finalize(&id, &mut sequence, evidence, true, &active)
+                    .await;
+                return;
+            }
+        };
+        let references: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        let (mut process, mut output) = match SupervisedProcess::start_in_sanitized(
+            &codex.executable.to_string_lossy(),
+            &references,
+            Some(&worktree),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => {
+                evidence.fatal_runtime_error =
+                    Some(runtime_error("codex_start", "unable to start Codex"));
+                self.finalize(&id, &mut sequence, evidence, true, &active)
+                    .await;
+                return;
+            }
+        };
+        let running = self.lifecycle_event(&id, &mut sequence, "run_running");
+        if self
+            .persist_and_publish(&id, RunStatus::Running, None, running, &active)
+            .await
+            .is_err()
+        {
+            evidence.storage_error = Some(runtime_error(
+                "runtime_storage",
+                "unable to persist run lifecycle update",
+            ));
+            let _ = process.cancel(CANCEL_TIMEOUT).await;
+            self.finalize(&id, &mut sequence, evidence, true, &active)
+                .await;
+            return;
+        }
+        let mut output_open = true;
+        while output_open {
+            tokio::select! {
+                command = commands.recv() => if command.is_some() {
+                    let cancelling = self.lifecycle_event(&id, &mut sequence, "run_cancelling");
+                    let _ = self.persist_and_publish(&id, RunStatus::Cancelling, None, cancelling, &active).await;
+                    evidence.race_winner.get_or_insert(TerminalRaceWinner::Cancellation);
+                    match process.cancel(CANCEL_TIMEOUT).await { Ok(code) => evidence.process_exit_code = code, Err(_) => evidence.termination_error = Some(runtime_error("termination_failed", "Codex process cleanup failed")) }
+                    break;
+                },
+                event = output.recv() => match event {
+                    Some(ProcessEvent::Stdout(line)) => match parse_codex_exec_json_line(line.as_bytes()) {
+                        Ok(agent_event) => { if self.record_agent_event(&id, &mut sequence, agent_event, &mut evidence, &active).await.is_err() { evidence.storage_error = Some(runtime_error("event_persistence", "unable to persist normalized agent event")); let _ = process.cancel(CANCEL_TIMEOUT).await; break; } }
+                        Err(_) => { let _ = self.record_parser_error(&id, &mut sequence, &mut evidence, &active).await; let _ = process.cancel(CANCEL_TIMEOUT).await; break; }
+                    },
+                    Some(ProcessEvent::Stderr(line)) => append_bounded_redacted(&mut evidence.stderr, &line, STDERR_LIMIT),
+                    Some(ProcessEvent::OutputError) => { let _ = self.record_parser_error(&id, &mut sequence, &mut evidence, &active).await; break; }
+                    Some(ProcessEvent::Exited(_)) => {},
+                    None => output_open = false,
+                }
+            }
+        }
+        if evidence.process_exit_code.is_none() {
+            match time::timeout(CANCEL_TIMEOUT, process.wait()).await {
+                Ok(Ok(code)) => {
+                    evidence.process_exit_code = code;
+                    evidence.parent_exit_observed = true;
+                    evidence
+                        .race_winner
+                        .get_or_insert(TerminalRaceWinner::ParentExit);
+                }
+                _ => {
+                    evidence.termination_error = Some(runtime_error(
+                        "termination_failed",
+                        "Codex process did not exit",
+                    ));
+                    let _ = process.cancel(CANCEL_TIMEOUT).await;
+                }
             }
         }
         self.finalize(&id, &mut sequence, evidence, true, &active)

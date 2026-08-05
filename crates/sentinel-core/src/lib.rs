@@ -19,6 +19,8 @@ pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16_000;
 pub const MAX_SAFE_ERROR_CATEGORY_BYTES: usize = 512;
 /// Maximum UTF-8 bytes persisted for each SafeRunError field.
 pub const MAX_SAFE_ERROR_MESSAGE_BYTES: usize = 512;
+pub const MAX_PUBLIC_RUN_REFERENCE_BYTES: usize = 128;
+pub const MAX_RUN_SUMMARY_BYTES: usize = 512;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -241,6 +243,122 @@ pub struct TaskRequest {
     pub task_text: String,
 }
 
+/// Backend-generated bearer-resistant reference.  It is deliberately opaque:
+/// callers must also prove the project/worktree/task ownership tuple.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PublicRunReference(String);
+impl PublicRunReference {
+    pub fn new() -> Self {
+        Self(format!("cr_{}", Uuid::new_v4().simple()))
+    }
+    pub fn parse(value: impl Into<String>) -> Result<Self, CoreError> {
+        let value = value.into();
+        if value.len() < 32
+            || value.len() > MAX_PUBLIC_RUN_REFERENCE_BYTES
+            || !value.starts_with("cr_")
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            return Err(CoreError::InvalidPublicReference);
+        }
+        Ok(Self(value))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl std::fmt::Display for PublicRunReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexRunLifecycle {
+    Created,
+    Starting,
+    Running,
+    Cancelling,
+    Cancelled,
+    Succeeded,
+    Failed,
+}
+impl CodexRunLifecycle {
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Cancelled | Self::Succeeded | Self::Failed)
+    }
+    pub fn transition(self, next: Self) -> Result<(), CoreError> {
+        if matches!(
+            (self, next),
+            (Self::Created, Self::Starting | Self::Cancelled)
+                | (
+                    Self::Starting,
+                    Self::Running | Self::Cancelling | Self::Cancelled | Self::Failed
+                )
+                | (
+                    Self::Running,
+                    Self::Cancelling | Self::Succeeded | Self::Failed
+                )
+                | (Self::Cancelling, Self::Cancelled | Self::Failed)
+        ) {
+            Ok(())
+        } else {
+            Err(CoreError::RunContextConflict)
+        }
+    }
+}
+fn codex_lifecycle_name(value: CodexRunLifecycle) -> &'static str {
+    match value {
+        CodexRunLifecycle::Created => "created",
+        CodexRunLifecycle::Starting => "starting",
+        CodexRunLifecycle::Running => "running",
+        CodexRunLifecycle::Cancelling => "cancelling",
+        CodexRunLifecycle::Cancelled => "cancelled",
+        CodexRunLifecycle::Succeeded => "succeeded",
+        CodexRunLifecycle::Failed => "failed",
+    }
+}
+fn parse_codex_lifecycle(value: &str) -> Result<CodexRunLifecycle, CoreError> {
+    match value {
+        "created" => Ok(CodexRunLifecycle::Created),
+        "starting" => Ok(CodexRunLifecycle::Starting),
+        "running" => Ok(CodexRunLifecycle::Running),
+        "cancelling" => Ok(CodexRunLifecycle::Cancelling),
+        "cancelled" => Ok(CodexRunLifecycle::Cancelled),
+        "succeeded" => Ok(CodexRunLifecycle::Succeeded),
+        "failed" => Ok(CodexRunLifecycle::Failed),
+        _ => Err(CoreError::Storage),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexRunContext {
+    pub run_id: RunId,
+    pub public_reference: PublicRunReference,
+    pub project_id: ProjectId,
+    pub worktree_id: WorktreeId,
+    pub task_key: String,
+    pub lifecycle: CodexRunLifecycle,
+    pub cancellation_requested: bool,
+    pub version: u64,
+    pub progress_summary: Option<String>,
+    pub terminal_summary: Option<String>,
+    pub failure_category: Option<String>,
+    pub created_at_ms: i64,
+    pub transitioned_at_ms: i64,
+    pub terminal_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateCodexRunContext {
+    pub project_id: ProjectId,
+    pub worktree_id: WorktreeId,
+    pub task_key: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -346,6 +464,12 @@ pub enum CoreError {
     WorktreeNotFound,
     #[error("worktree state conflict")]
     WorktreeStateConflict,
+    #[error("invalid public run reference")]
+    InvalidPublicReference,
+    #[error("run context ownership lookup failed")]
+    RunContextNotFound,
+    #[error("run context state or version conflict")]
+    RunContextConflict,
     #[error(transparent)]
     Transition(#[from] TransitionError),
     #[error("storage error")]
@@ -394,6 +518,31 @@ fn row_to_worktree(row: &sqlx::sqlite::SqliteRow) -> Result<ManagedWorktree, Cor
         ready_at_ms: row.get("ready_at_ms"),
         removed_at_ms: row.get("removed_at_ms"),
         last_validated_at_ms: row.get("last_validated_at_ms"),
+    })
+}
+
+fn row_to_codex_context(row: &sqlx::sqlite::SqliteRow) -> Result<CodexRunContext, CoreError> {
+    Ok(CodexRunContext {
+        run_id: RunId(
+            Uuid::from_str(&row.get::<String, _>("run_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        public_reference: PublicRunReference::parse(row.get::<String, _>("public_reference"))?,
+        project_id: ProjectId(
+            Uuid::from_str(&row.get::<String, _>("project_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        worktree_id: WorktreeId(
+            Uuid::from_str(&row.get::<String, _>("worktree_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        task_key: row.get("task_key"),
+        lifecycle: parse_codex_lifecycle(&row.get::<String, _>("lifecycle"))?,
+        cancellation_requested: row.get::<i64, _>("cancellation_requested") != 0,
+        version: checked_u64(row.get("version"))?,
+        progress_summary: row.get("progress_summary"),
+        terminal_summary: row.get("terminal_summary"),
+        failure_category: row.get("failure_category"),
+        created_at_ms: row.get("created_at_ms"),
+        transitioned_at_ms: row.get("transitioned_at_ms"),
+        terminal_at_ms: row.get("terminal_at_ms"),
     })
 }
 
@@ -835,14 +984,172 @@ impl RunRepository {
         }
     }
 
+    /// Creates the internal run and its public-safe Codex context atomically.
+    /// The prompt is intentionally never persisted; legacy `runs.task_text`
+    /// receives a fixed marker solely to retain its foreign-key lifecycle.
+    pub async fn create_codex_run_context(
+        &self,
+        request: CreateCodexRunContext,
+    ) -> Result<CodexRunContext, CoreError> {
+        if request.task_key.trim().is_empty() || request.task_key.len() > 128 {
+            return Err(CoreError::InvalidTask);
+        }
+        let mut transaction = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
+        let owned: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM managed_worktrees WHERE id = ? AND project_id = ? AND state = 'ready'",
+        )
+        .bind(request.worktree_id.to_string())
+        .bind(request.project_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| CoreError::Storage)?;
+        if owned.is_none() {
+            return Err(CoreError::RunContextNotFound);
+        }
+        let run_id = RunId::new();
+        let reference = PublicRunReference::new();
+        let timestamp = now();
+        sqlx::query("INSERT INTO runs (id, task_text, agent_kind, status, schema_version, created_at_ms) VALUES (?, '[redacted codex request]', 'codex', 'queued', ?, ?)")
+            .bind(run_id.to_string()).bind(i64::from(RUN_SCHEMA_VERSION)).bind(timestamp).execute(&mut *transaction).await.map_err(|_| CoreError::Storage)?;
+        let inserted = sqlx::query("INSERT INTO codex_run_contexts (run_id, public_reference, project_id, worktree_id, task_key, adapter, protocol_version, lifecycle, cancellation_requested, version, created_at_ms, transitioned_at_ms) VALUES (?, ?, ?, ?, ?, 'codex_exec_json', 1, 'created', 0, 0, ?, ?)")
+            .bind(run_id.to_string()).bind(reference.as_str()).bind(request.project_id.to_string()).bind(request.worktree_id.to_string()).bind(&request.task_key).bind(timestamp).bind(timestamp).execute(&mut *transaction).await;
+        match inserted {
+            Ok(_) => {}
+            Err(error)
+                if error
+                    .as_database_error()
+                    .and_then(|e| e.code())
+                    .is_some_and(|c| c == "2067" || c == "1555") =>
+            {
+                return Err(CoreError::RunContextConflict)
+            }
+            Err(_) => return Err(CoreError::Storage),
+        }
+        transaction.commit().await.map_err(|_| CoreError::Storage)?;
+        Ok(CodexRunContext {
+            run_id,
+            public_reference: reference,
+            project_id: request.project_id,
+            worktree_id: request.worktree_id,
+            task_key: request.task_key,
+            lifecycle: CodexRunLifecycle::Created,
+            cancellation_requested: false,
+            version: 0,
+            progress_summary: None,
+            terminal_summary: None,
+            failure_category: None,
+            created_at_ms: timestamp,
+            transitioned_at_ms: timestamp,
+            terminal_at_ms: None,
+        })
+    }
+
+    pub async fn get_codex_run_context_owned(
+        &self,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        reference: &PublicRunReference,
+    ) -> Result<CodexRunContext, CoreError> {
+        let row = sqlx::query("SELECT * FROM codex_run_contexts WHERE public_reference = ? AND project_id = ? AND worktree_id = ? AND task_key = ?")
+            .bind(reference.as_str()).bind(project.to_string()).bind(worktree.to_string()).bind(task_key).fetch_optional(&self.pool).await.map_err(|_| CoreError::Storage)?.ok_or(CoreError::RunContextNotFound)?;
+        row_to_codex_context(&row)
+    }
+
+    pub async fn transition_codex_run_context(
+        &self,
+        context: &CodexRunContext,
+        next: CodexRunLifecycle,
+        progress: Option<&str>,
+        terminal: Option<&str>,
+        failure: Option<&str>,
+    ) -> Result<CodexRunContext, CoreError> {
+        context.lifecycle.transition(next)?;
+        if context.cancellation_requested && next == CodexRunLifecycle::Succeeded {
+            return Err(CoreError::RunContextConflict);
+        }
+        let progress = progress.map(|v| redact_and_bound(v, MAX_RUN_SUMMARY_BYTES));
+        let terminal = terminal.map(|v| redact_and_bound(v, MAX_RUN_SUMMARY_BYTES));
+        let failure = failure.map(|v| redact_and_bound(v, 128));
+        if next.terminal() && terminal.is_none() {
+            return Err(CoreError::InvalidTask);
+        }
+        let timestamp = now();
+        let terminal_at = next.terminal().then_some(timestamp);
+        let changed = sqlx::query("UPDATE codex_run_contexts SET lifecycle = ?, version = version + 1, progress_summary = COALESCE(?, progress_summary), terminal_summary = ?, failure_category = ?, transitioned_at_ms = ?, terminal_at_ms = ? WHERE run_id = ? AND lifecycle = ? AND version = ?")
+            .bind(codex_lifecycle_name(next)).bind(progress).bind(terminal).bind(failure).bind(timestamp).bind(terminal_at).bind(context.run_id.to_string()).bind(codex_lifecycle_name(context.lifecycle)).bind(checked_i64(context.version)?).execute(&self.pool).await.map_err(|_| CoreError::Storage)?.rows_affected();
+        if changed != 1 {
+            return Err(CoreError::RunContextConflict);
+        }
+        self.get_codex_run_context_owned(
+            &context.project_id,
+            &context.worktree_id,
+            &context.task_key,
+            &context.public_reference,
+        )
+        .await
+    }
+
+    pub async fn request_codex_cancellation(
+        &self,
+        context: &CodexRunContext,
+    ) -> Result<CodexRunContext, CoreError> {
+        if context.lifecycle.terminal() {
+            return Ok(context.clone());
+        }
+        let next = if context.lifecycle == CodexRunLifecycle::Created {
+            CodexRunLifecycle::Cancelled
+        } else {
+            CodexRunLifecycle::Cancelling
+        };
+        let timestamp = now();
+        let terminal = next.terminal().then_some(timestamp);
+        let changed = sqlx::query("UPDATE codex_run_contexts SET lifecycle = ?, cancellation_requested = 1, version = version + 1, transitioned_at_ms = ?, terminal_at_ms = ?, terminal_summary = CASE WHEN ? THEN 'Cancellation confirmed.' ELSE terminal_summary END WHERE run_id = ? AND lifecycle = ? AND version = ?")
+            .bind(codex_lifecycle_name(next)).bind(timestamp).bind(terminal).bind(next.terminal()).bind(context.run_id.to_string()).bind(codex_lifecycle_name(context.lifecycle)).bind(checked_i64(context.version)?).execute(&self.pool).await.map_err(|_| CoreError::Storage)?.rows_affected();
+        if changed != 1 {
+            return Err(CoreError::RunContextConflict);
+        }
+        self.get_codex_run_context_owned(
+            &context.project_id,
+            &context.worktree_id,
+            &context.task_key,
+            &context.public_reference,
+        )
+        .await
+    }
+
+    pub async fn list_active_codex_run_contexts(&self) -> Result<Vec<CodexRunContext>, CoreError> {
+        let rows = sqlx::query("SELECT * FROM codex_run_contexts WHERE lifecycle IN ('created','starting','running','cancelling') ORDER BY created_at_ms ASC").fetch_all(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        rows.iter().map(row_to_codex_context).collect()
+    }
+
+    /// A process cannot be reattached after restart.  Active contexts are
+    /// therefore fail-closed as interrupted before public services start.
+    pub async fn reconcile_codex_run_contexts_on_startup(&self) -> Result<u64, CoreError> {
+        let timestamp = now();
+        let changed = sqlx::query("UPDATE codex_run_contexts SET lifecycle = 'failed', version = version + 1, terminal_summary = 'Execution was interrupted before completion.', failure_category = 'interrupted', transitioned_at_ms = ?, terminal_at_ms = ? WHERE lifecycle IN ('created','starting','running','cancelling')")
+            .bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?.rows_affected();
+        Ok(changed)
+    }
+
     pub async fn create_run(&self, request: TaskRequest) -> Result<Run, CoreError> {
+        self.create_run_for_agent(request, AgentKind::Fake).await
+    }
+
+    /// Creates a run with an explicit adapter identity. Callers may not alter
+    /// the persisted identity after creation.
+    pub async fn create_run_for_agent(
+        &self,
+        request: TaskRequest,
+        agent: AgentKind,
+    ) -> Result<Run, CoreError> {
         if request.task_text.trim().is_empty() || request.task_text.len() > MAX_TASK_BYTES {
             return Err(CoreError::InvalidTask);
         }
         let run = Run {
             id: RunId::new(),
             task_text: request.task_text,
-            agent: AgentKind::Fake,
+            agent,
             status: RunStatus::Queued,
             schema_version: RUN_SCHEMA_VERSION,
             created_at_ms: now(),
@@ -1011,5 +1318,29 @@ mod tests {
         assert_eq!(redact("token refresh failed"), "token refresh failed");
         assert_eq!(redact("secret note: keep this"), "secret note: keep this");
         assert!(redact("Authorization: Bearer abc.def").contains("[REDACTED]"));
+    }
+    #[test]
+    fn codex_context_lifecycle_is_closed_and_cancellation_wins() {
+        assert!(CodexRunLifecycle::Created
+            .transition(CodexRunLifecycle::Starting)
+            .is_ok());
+        assert!(CodexRunLifecycle::Running
+            .transition(CodexRunLifecycle::Succeeded)
+            .is_ok());
+        assert!(CodexRunLifecycle::Cancelling
+            .transition(CodexRunLifecycle::Succeeded)
+            .is_err());
+        assert!(CodexRunLifecycle::Succeeded
+            .transition(CodexRunLifecycle::Failed)
+            .is_err());
+    }
+    #[test]
+    fn public_reference_is_opaque_and_bounded() {
+        let first = PublicRunReference::new();
+        let second = PublicRunReference::new();
+        assert_ne!(first, second);
+        assert!(first.as_str().starts_with("cr_"));
+        assert!(PublicRunReference::parse("17").is_err());
+        assert!(PublicRunReference::parse("cr_A_NOT_LOWERCASE").is_err());
     }
 }

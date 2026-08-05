@@ -18,7 +18,11 @@ Tauri 2 hosts a React, TypeScript, and Vite frontend plus a Rust/Tokio core. SQL
 
 ## Platforms And Agents
 
-macOS is implemented and validated first; Windows and Linux are planned. Supported agents are Codex and Claude Code. Codex App Server is an experimental future integration where appropriate.
+macOS is implemented and validated first; Windows and Linux are planned. Codex
+structured execution is bounded to backend-owned managed worktrees and uses
+opaque public run references. Codex App Server is explicitly unavailable and
+experimental; it is never launched by the desktop bridge. Claude/Phase 5 work
+has not started.
 
 ## Installation And Development
 

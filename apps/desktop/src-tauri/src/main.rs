@@ -2,11 +2,14 @@
 mod b2_a;
 mod windowing;
 
-use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
+use sentinel_agent_api::{
+    codex_capabilities, detect_installation, AgentKind, CodexCapabilities, InstallationStatus,
+};
 use sentinel_core::{
-    CoreError, ManagedWorktree, ManagedWorktreeState, NormalizedAgentEvent, Project,
-    ProjectFingerprintScheme, ProjectId, ProjectRegistration, ProjectValidationState, Run, RunId,
-    RunRepository, TaskRequest, WorktreeId,
+    CodexRunContext, CodexRunLifecycle, CoreError, CreateCodexRunContext, ManagedWorktree,
+    ManagedWorktreeState, NormalizedAgentEvent, Project, ProjectFingerprintScheme, ProjectId,
+    ProjectRegistration, ProjectValidationState, PublicRunReference, Run, RunId, RunRepository,
+    TaskRequest, WorktreeId,
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
@@ -18,7 +21,7 @@ use sentinel_git::{
     RepositoryMode, RepositoryRelativePath, RepositoryState, TextEligibleMetadata,
     WorktreeDestinationState, WorktreeMetadataLookup,
 };
-use sentinel_runtime::{CancellationResult, FakeAgentProgram, RunOrchestrator};
+use sentinel_runtime::{CancellationResult, CodexExecProgram, FakeAgentProgram, RunOrchestrator};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -48,10 +51,44 @@ struct Diagnostics {
     codex: String,
     claude_code: String,
 }
+#[derive(Serialize)]
+struct CodexCapabilityDto {
+    exec_json: bool,
+    app_server_experimental: bool,
+}
+/// The Phase 4 public boundary: no paths, database IDs, argv, environment,
+/// raw events, prompts, or process information cross this DTO.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRunDto {
+    public_reference: String,
+    status: CodexRunLifecycle,
+    progress_summary: Option<String>,
+    terminal_summary: Option<String>,
+    error_category: Option<String>,
+    cancellation_available: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRunStartRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    prompt: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRunLookupRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    public_reference: String,
+}
 #[derive(Clone)]
 struct DesktopState {
     repository: RunRepository,
     orchestrator: RunOrchestrator,
+    codex_exec_available: bool,
     database_path: PathBuf,
     forwarders: Arc<tokio::sync::Mutex<HashSet<RunId>>>,
     protected_application_repository: Option<ProtectedRepository>,
@@ -316,6 +353,261 @@ fn spike_diagnostics() -> Diagnostics {
         codex: format_installation(detect_installation(AgentKind::Codex)),
         claude_code: format_installation(detect_installation(AgentKind::ClaudeCode)),
     }
+}
+
+#[tauri::command]
+fn codex_capability() -> CodexCapabilityDto {
+    let CodexCapabilities {
+        exec_json,
+        app_server_experimental,
+    } = codex_capabilities(&detect_installation(AgentKind::Codex));
+    CodexCapabilityDto {
+        exec_json,
+        app_server_experimental,
+    }
+}
+
+fn codex_run_dto(context: CodexRunContext) -> CodexRunDto {
+    CodexRunDto {
+        public_reference: context.public_reference.to_string(),
+        status: context.lifecycle,
+        progress_summary: context.progress_summary,
+        terminal_summary: context.terminal_summary,
+        error_category: context.failure_category,
+        cancellation_available: !context.lifecycle.terminal() && !context.cancellation_requested,
+    }
+}
+
+fn parse_codex_lookup(
+    request: &CodexRunLookupRequest,
+) -> Result<(ProjectId, WorktreeId, PublicRunReference), SafeError> {
+    Ok((
+        ProjectId::from_str(&request.project_id).map_err(|_| input_error())?,
+        WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?,
+        PublicRunReference::parse(request.public_reference.clone()).map_err(|_| input_error())?,
+    ))
+}
+
+#[tauri::command]
+async fn query_codex_run(
+    request: CodexRunLookupRequest,
+    state: State<'_, DesktopState>,
+) -> Result<CodexRunDto, SafeError> {
+    let (project, worktree, reference) = parse_codex_lookup(&request)?;
+    state
+        .repository
+        .get_codex_run_context_owned(&project, &worktree, &request.task_key, &reference)
+        .await
+        .map(codex_run_dto)
+        .map_err(|_| safe_error("codex run lookup"))
+}
+
+#[tauri::command]
+async fn cancel_codex_run(
+    request: CodexRunLookupRequest,
+    state: State<'_, DesktopState>,
+) -> Result<CodexRunDto, SafeError> {
+    let (project, worktree, reference) = parse_codex_lookup(&request)?;
+    let context = state
+        .repository
+        .get_codex_run_context_owned(&project, &worktree, &request.task_key, &reference)
+        .await
+        .map_err(|_| safe_error("codex run lookup"))?;
+    // There is deliberately no PID or arbitrary process lookup.  A future
+    // configured runner must match this same persisted ownership tuple.
+    let updated = state
+        .repository
+        .request_codex_cancellation(&context)
+        .await
+        .map_err(|_| safe_error("codex cancellation"))?;
+    if !updated.lifecycle.terminal() {
+        // Absence after restart is safe: persisted cancellation remains
+        // authoritative and reconciliation will terminalize it.
+        let _ = state.orchestrator.cancel_run(&updated.run_id).await;
+    }
+    Ok(codex_run_dto(updated))
+}
+
+#[tauri::command]
+async fn start_codex_run(
+    request: CodexRunStartRequest,
+    state: State<'_, DesktopState>,
+) -> Result<CodexRunDto, SafeError> {
+    if request.prompt.trim().is_empty()
+        || request.prompt.len() > 8_000
+        || request.prompt.contains('\0')
+        || request.task_key.trim().is_empty()
+        || request.task_key.len() > 128
+    {
+        return Err(input_error());
+    }
+    let project = ProjectId::from_str(&request.project_id).map_err(|_| input_error())?;
+    let worktree = WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?;
+    let project_row = state
+        .repository
+        .get_project(&project)
+        .await
+        .map_err(|_| safe_error("codex project"))?;
+    let worktree_row = state
+        .repository
+        .get_worktree(&worktree)
+        .await
+        .map_err(|_| safe_error("codex worktree"))?;
+    if worktree_row.project_id != project
+        || worktree_row.state != ManagedWorktreeState::Ready
+        || project_row.is_primary_worktree
+        || worktree_row.path == project_row.primary_root
+    {
+        return Err(safe_error("codex ownership"));
+    }
+    let authoritative_worktree = validate_managed_leaf_for_reconciliation(
+        &state,
+        &project,
+        &worktree,
+        Path::new(&worktree_row.path),
+    )?;
+    let inspection = inspect_repository(&authoritative_worktree)
+        .await
+        .map_err(|_| safe_error("codex worktree validation"))?;
+    if inspection.is_primary
+        || inspection.identity != worktree_row.repository_identity
+        || inspection.fingerprint.as_str() != worktree_row.repository_fingerprint
+        || inspection.head.as_deref() != Some(worktree_row.base_commit.as_str())
+    {
+        return Err(safe_error("codex worktree validation"));
+    }
+    if !state.codex_exec_available {
+        return Err(SafeError {
+            code: "codex_unavailable",
+            message: "Codex execution is unavailable in this desktop build.",
+        });
+    }
+    let context = state
+        .repository
+        .create_codex_run_context(CreateCodexRunContext {
+            project_id: project,
+            worktree_id: worktree,
+            task_key: request.task_key,
+        })
+        .await
+        .map_err(|_| safe_error("codex run creation"))?;
+    let starting = state
+        .repository
+        .transition_codex_run_context(
+            &context,
+            CodexRunLifecycle::Starting,
+            Some("Execution is starting."),
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| safe_error("codex lifecycle"))?;
+    if state
+        .orchestrator
+        .submit_existing_codex_run(
+            starting.run_id.clone(),
+            request.prompt,
+            authoritative_worktree,
+        )
+        .await
+        .is_err()
+    {
+        let _ = state
+            .repository
+            .transition_codex_run_context(
+                &starting,
+                CodexRunLifecycle::Failed,
+                None,
+                Some("Execution could not be started."),
+                Some("start_failed"),
+            )
+            .await;
+        return Err(safe_error("codex start"));
+    }
+    let running = match state
+        .repository
+        .transition_codex_run_context(
+            &starting,
+            CodexRunLifecycle::Running,
+            Some("Execution is running."),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = state.orchestrator.cancel_run(&starting.run_id).await;
+            let _ = state
+                .repository
+                .transition_codex_run_context(
+                    &starting,
+                    CodexRunLifecycle::Failed,
+                    None,
+                    Some("Execution could not be recorded."),
+                    Some("persistence_failed"),
+                )
+                .await;
+            return Err(safe_error("codex lifecycle"));
+        }
+    };
+    let repository = state.repository.clone();
+    let orchestrator = state.orchestrator.clone();
+    let active = running.clone();
+    tauri::async_runtime::spawn(async move {
+        let terminal = match orchestrator.wait_for_run(&active.run_id).await {
+            Ok(run)
+                if run.status == sentinel_core::RunStatus::Completed
+                    && !active.cancellation_requested =>
+            {
+                (CodexRunLifecycle::Succeeded, "Execution completed.", None)
+            }
+            Ok(run)
+                if run.status == sentinel_core::RunStatus::Cancelled
+                    || active.cancellation_requested =>
+            {
+                (
+                    CodexRunLifecycle::Cancelled,
+                    "Cancellation confirmed.",
+                    None,
+                )
+            }
+            _ => (
+                CodexRunLifecycle::Failed,
+                "Execution did not complete.",
+                Some("execution_failed"),
+            ),
+        };
+        if let Ok(current) = repository
+            .get_codex_run_context_owned(
+                &active.project_id,
+                &active.worktree_id,
+                &active.task_key,
+                &active.public_reference,
+            )
+            .await
+        {
+            let next = if current.cancellation_requested {
+                CodexRunLifecycle::Cancelled
+            } else {
+                terminal.0
+            };
+            let _ = repository
+                .transition_codex_run_context(
+                    &current,
+                    next,
+                    None,
+                    Some(if next == CodexRunLifecycle::Cancelled {
+                        "Cancellation confirmed."
+                    } else {
+                        terminal.1
+                    }),
+                    terminal.2,
+                )
+                .await;
+        }
+    });
+    Ok(codex_run_dto(running))
 }
 
 fn safe_error(_: impl std::fmt::Debug) -> SafeError {
@@ -2583,6 +2875,14 @@ fn main() {
                     "Agent Sentinel could not initialize its local database",
                 )
             })?;
+            // A prior desktop process owns no reconnectable child handles.
+            // Fail closed before exposing public run queries.
+            tauri::async_runtime::block_on(repository.reconcile_codex_run_contexts_on_startup())
+                .map_err(|_| {
+                    Box::<dyn std::error::Error>::from(
+                        "Agent Sentinel could not reconcile interrupted Codex runs",
+                    )
+                })?;
             let protected_application_repository = application_repository_root()
                 .map(|root| {
                     tauri::async_runtime::block_on(inspect_repository(&root)).map(|inspection| {
@@ -2603,8 +2903,20 @@ fn main() {
                     "Agent Sentinel fake-agent executable is unavailable",
                 )
             })?;
+            // This private opt-in is intentionally read only at startup.  No
+            // public command accepts an executable path; tests may point it at
+            // a deterministic fixture executable.
+            let codex = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
+                .map(PathBuf::from)
+                .and_then(|path| CodexExecProgram::from_executable(path).ok());
+            let codex_exec_available = codex.is_some();
             app.manage(DesktopState {
-                orchestrator: RunOrchestrator::new(repository.clone(), fake_agent),
+                orchestrator: match codex {
+                    Some(program) => RunOrchestrator::new(repository.clone(), fake_agent)
+                        .with_codex_exec(program),
+                    None => RunOrchestrator::new(repository.clone(), fake_agent),
+                },
+                codex_exec_available,
                 repository,
                 database_path,
                 forwarders: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
@@ -2634,6 +2946,10 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             spike_diagnostics,
+            codex_capability,
+            start_codex_run,
+            query_codex_run,
+            cancel_codex_run,
             submit_fake_run,
             list_runs,
             get_run,
@@ -4472,6 +4788,7 @@ mod bridge_tests {
                 repository.clone(),
                 FakeAgentProgram::from_executable(executable).expect("test executable program"),
             ),
+            codex_exec_available: false,
             repository,
             database_path,
             forwarders: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
