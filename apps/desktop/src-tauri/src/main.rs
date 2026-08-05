@@ -263,6 +263,12 @@ struct RuntimeEnvironment {
     database_initialized: bool,
     fake_agent_available: bool,
 }
+#[derive(Serialize)]
+struct DesktopCapabilities {
+    notifications: bool,
+    autostart: bool,
+    app_server_experimental: bool,
+}
 #[derive(Clone, Serialize)]
 struct EventDto {
     schema_version: u16,
@@ -1099,6 +1105,16 @@ fn get_runtime_environment(state: State<'_, DesktopState>) -> RuntimeEnvironment
         schema_version: 1,
         database_initialized: state.database_path.is_file(),
         fake_agent_available: true,
+    }
+}
+/// Phase 6 reports unsupported OS integrations explicitly rather than
+/// changing login-item or notification permissions behind the user's back.
+#[tauri::command]
+fn desktop_capabilities() -> DesktopCapabilities {
+    DesktopCapabilities {
+        notifications: false,
+        autostart: false,
+        app_server_experimental: false,
     }
 }
 #[tauri::command]
@@ -3125,6 +3141,7 @@ fn main() {
             list_run_events,
             cancel_run,
             get_runtime_environment,
+            desktop_capabilities,
             register_project,
             list_projects,
             get_project,

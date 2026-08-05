@@ -34,6 +34,13 @@ normalization, cancellation ownership, and redacted typed bridge contracts.
 It intentionally does not add Phase 6 prompt/tray/task UI, reconnect sessions
 after restart, enable App Server, or remove worktrees automatically.
 
+## Phase 6 desktop UX boundary
+
+The prompt combines opaque project/worktree selection, agent availability,
+bounded task entry, persisted task detail/history, cancellation feedback, and
+tray/shortcut focus. Notifications/autostart are capability-posture only when
+unsupported. It adds no approval/profile/policy behavior; that is Phase 7.
+
 ## Product Controls And Release Work
 
 Desktop UX adds the prompt, search, agent selection, tray state, task details, notifications, keyboard navigation, and autostart. Approval profiles, audit history, deterministic drift findings, and evidence checks follow. Reliability adds persistent logs, restart recovery, interrupted-task detection, process-group cleanup, output limits, rotation, worktree recovery, and migrations.

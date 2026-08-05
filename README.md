@@ -24,8 +24,10 @@ opaque public run references. Codex App Server is explicitly unavailable and
 experimental; it is never launched by the desktop bridge. Claude stream-json
 records use the same bounded, ownership-scoped persisted interface; follow-up
 and resume inputs are fixed-form capabilities and Claude is truthfully reported
-unavailable until a private configured runner exists. Phase 6 UX work has not
-started.
+unavailable until a private configured runner exists. The Phase 6 desktop
+prompt now exposes safe project/worktree and agent
+selection, history/detail, tray/shortcut access, and truthful unavailable
+notification/autostart status. Approval policy work remains Phase 7.
 
 ## Installation And Development
 

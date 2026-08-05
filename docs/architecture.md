@@ -65,4 +65,13 @@ query/follow-up/cancel DTOs never reveal the session token or process data.
 Restart fails active records as interrupted and does not reconnect a session.
 Phase 6 desktop workflow remains out of scope.
 
+## Phase 6 desktop boundary
+
+The desktop prompt is an untrusted presentation layer over explicit DTOs. It
+holds opaque project/worktree IDs only, refreshes them with generation-ordered
+requests, and presents run history/detail and backend-confirmed cancellation.
+The tray and global shortcut only show/focus the prompt. Notification and
+autostart capability are explicit unavailable states in this build; no OS
+setting is silently changed. Approval decisions remain Phase 7.
+
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).

@@ -9,6 +9,10 @@ export type RunDto = { id: string; task_text: string; agent_kind: "fake" | "code
 export type CancellationResult = "cancellation_requested" | "already_terminal" | "already_cancelling" | "run_not_active" | "termination_failed";
 export type RunEvent = { schema_version: number; run_id: string; sequence_number: number; event_type: string; timestamp_ms: number; payload: unknown };
 export type RuntimeEnvironment = { schema_version: number; database_initialized: boolean; fake_agent_available: boolean };
+export type ProjectDto = { id: string; display_name: string; validation_state: "valid" | "detached" | "unborn" | "linked_worktree" | "requires_trusted_revalidation"; is_primary_worktree: boolean; branch: string | null; head: string | null; last_validated_at_ms: number };
+/** No path crosses this UX boundary; worktree selection is an opaque ID. */
+export type WorktreeDto = { id: string; project_id: string; state: "creating" | "ready" | "removing" | "removed" | "failed" | "missing" | "identity_changed" | "retained_dirty"; base_commit: string; created_at_ms: number; ready_at_ms: number | null; removed_at_ms: number | null; error_category: string | null };
+export type DesktopCapabilities = { notifications: false; autostart: false; app_server_experimental: false };
 export type CommandError = { code: string; message: string };
 export type Invoke = <T>(name: string, args?: Record<string, unknown>) => Promise<T>;
 export type Unlisten = () => void;
@@ -37,6 +41,9 @@ export function createApi(call: Invoke) { return {
   listRunEvents: (id: string) => command<RunEvent[]>(call, "list_run_events", { id }),
   cancelRun: (id: string) => command<CancellationResult>(call, "cancel_run", { id }),
   environment: () => command<RuntimeEnvironment>(call, "get_runtime_environment"),
+  listProjects: () => command<ProjectDto[]>(call, "list_projects"),
+  listProjectWorktrees: (project_id: string) => command<WorktreeDto[]>(call, "list_project_worktrees", { project_id }),
+  desktopCapabilities: () => command<DesktopCapabilities>(call, "desktop_capabilities"),
 }; }
 export const api = createApi(invoke);
 export function reconcile(events: RunEvent[], incoming: RunEvent): RunEvent[] {
