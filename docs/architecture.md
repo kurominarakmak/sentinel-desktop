@@ -109,3 +109,11 @@ not evidence; public results contain only redacted factual reasons and opaque
 fingerprints.
 
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).
+
+## Phase 10 Reliability boundary
+
+The reliability boundary retains durable history through migrations and startup
+reconciliation, then fails closed when live runtime ownership cannot be
+re-established. It does not reconnect arbitrary PIDs or silently remove a
+managed worktree. Cleanup remains direct-child only; release packaging belongs
+to Phase 11.
