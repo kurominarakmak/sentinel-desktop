@@ -1,5 +1,6 @@
 use sentinel_agent_api::AgentKind;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     Row, SqlitePool,
@@ -312,6 +313,41 @@ pub struct ApprovalAuditDecision {
     pub decision: ApprovalState,
     pub reason: String,
     pub source: String,
+}
+
+/// Phase 8's fixed, read-only Drift Guardian result.  It deliberately uses
+/// managed identifiers and states only; repository paths and raw Git output
+/// never become drift evidence or public DTO fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftFinding {
+    pub fingerprint: String,
+    pub rule_id: String,
+    pub rule_version: u16,
+    pub severity: DriftSeverity,
+    pub title: String,
+    pub expected: String,
+    pub observed: String,
+    pub explanation: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftSeverity {
+    Warning,
+    Error,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftEvaluation {
+    pub snapshot_fingerprint: String,
+    pub findings: Vec<DriftFinding>,
+}
+pub const DRIFT_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const DRIFT_RULE_CATALOG_VERSION: u16 = 1;
+const MAX_DRIFT_FINDINGS: usize = 8;
+fn digest_hex(value: &[u8]) -> String {
+    format!("dg_{:x}", Sha256::digest(value))
+}
+fn drift_state_name(state: ManagedWorktreeState) -> &'static str {
+    worktree_state_name(state)
 }
 fn approval_profile_name(v: ApprovalProfile) -> &'static str {
     match v {
@@ -1078,6 +1114,75 @@ impl RunRepository {
             .map_err(|_| CoreError::Storage)?
             .ok_or(CoreError::WorktreeNotFound)?;
         row_to_worktree(&row)
+    }
+    /// Evaluates the fixed Phase 8 catalog from one canonical managed-state
+    /// snapshot. It is read-only and all-or-nothing; callers cannot supply
+    /// rules, baselines, paths, findings, or severity.
+    pub async fn evaluate_drift_guardian(
+        &self,
+        project_id: &ProjectId,
+        worktree_id: &WorktreeId,
+    ) -> Result<DriftEvaluation, CoreError> {
+        let project = self.get_project(project_id).await?;
+        let worktree = self.get_worktree(worktree_id).await?;
+        if worktree.project_id != *project_id
+            || project.fingerprint_scheme != ProjectFingerprintScheme::StrongV1
+        {
+            return Err(CoreError::RunContextNotFound);
+        }
+        // Canonical serialization intentionally excludes temporary paths,
+        // timestamps, database IDs, and row order.
+        let snapshot = serde_json::json!({
+            "catalog_version": DRIFT_RULE_CATALOG_VERSION,
+            "schema_version": DRIFT_SNAPSHOT_SCHEMA_VERSION,
+            "project_fingerprint": project.repository_fingerprint,
+            "project_validation": project_state_name(project.validation_state),
+            "worktree_base_commit": worktree.base_commit,
+            "worktree_fingerprint": worktree.repository_fingerprint,
+            "worktree_state": drift_state_name(worktree.state),
+            "worktree_error": worktree.error_category.as_deref().unwrap_or(""),
+        });
+        let canonical = serde_json::to_vec(&snapshot).map_err(|_| CoreError::Storage)?;
+        if canonical.len() > 4_096 {
+            return Err(CoreError::PayloadTooLarge);
+        }
+        let snapshot_fingerprint = digest_hex(&canonical);
+        let mut findings = Vec::new();
+        let rule = match worktree.state {
+            ManagedWorktreeState::Ready => None,
+            ManagedWorktreeState::RetainedDirty => Some((
+                "DG001",
+                DriftSeverity::Warning,
+                "Managed worktree has retained changes",
+                "managed worktree state is ready",
+                "managed worktree state is retained_dirty",
+            )),
+            state => Some((
+                "DG002",
+                DriftSeverity::Error,
+                "Managed worktree is unavailable",
+                "managed worktree state is ready or retained_dirty",
+                drift_state_name(state),
+            )),
+        };
+        if let Some((rule_id, severity, title, expected, observed)) = rule {
+            let observed = observed.to_owned();
+            let evidence = format!("{rule_id}|1|{expected}|{observed}|{snapshot_fingerprint}");
+            let fingerprint = digest_hex(evidence.as_bytes());
+            findings.push(DriftFinding { fingerprint, rule_id: rule_id.into(), rule_version: 1, severity, title: title.into(), expected: expected.into(), observed: observed.clone(), explanation: format!("Expected {expected}; observed {observed}; rule {rule_id} triggered from the managed-state snapshot.") });
+        }
+        if findings.len() > MAX_DRIFT_FINDINGS {
+            return Err(CoreError::PayloadTooLarge);
+        }
+        findings.sort_by(|left, right| {
+            left.rule_id
+                .cmp(&right.rule_id)
+                .then(left.fingerprint.cmp(&right.fingerprint))
+        });
+        Ok(DriftEvaluation {
+            snapshot_fingerprint,
+            findings,
+        })
     }
     pub async fn list_project_worktrees(
         &self,
@@ -2046,5 +2151,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(source, "restart_reconciliation");
+    }
+    #[tokio::test]
+    async fn drift_guardian_is_canonical_and_changes_only_with_managed_state() {
+        let repository = RunRepository::open("sqlite::memory:").await.unwrap();
+        let (project, worktree) = approval_owner(&repository).await;
+        let first = repository
+            .evaluate_drift_guardian(&project, &worktree)
+            .await
+            .unwrap();
+        let second = repository
+            .evaluate_drift_guardian(&project, &worktree)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(first.findings.is_empty());
+        repository
+            .transition_worktree(
+                &worktree,
+                ManagedWorktreeState::Ready,
+                ManagedWorktreeState::RetainedDirty,
+                Some("worktree_dirty"),
+            )
+            .await
+            .unwrap();
+        let changed = repository
+            .evaluate_drift_guardian(&project, &worktree)
+            .await
+            .unwrap();
+        assert_eq!(changed.findings.len(), 1);
+        assert_eq!(changed.findings[0].rule_id, "DG001");
+        assert_ne!(first.snapshot_fingerprint, changed.snapshot_fingerprint);
+        assert!(!changed.findings[0].explanation.contains("likely"));
     }
 }

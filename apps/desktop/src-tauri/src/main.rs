@@ -7,10 +7,10 @@ use sentinel_agent_api::{
 };
 use sentinel_core::{
     ApprovalDecision, ApprovalRequest, ApprovalState, ClaudeRunContext, CodexRunContext,
-    CodexRunLifecycle, CoreError, CreateClaudeRunContext, CreateCodexRunContext, ManagedWorktree,
-    ManagedWorktreeState, NormalizedAgentEvent, Project, ProjectFingerprintScheme, ProjectId,
-    ProjectRegistration, ProjectValidationState, PublicRunReference, Run, RunId, RunRepository,
-    TaskRequest, WorktreeId,
+    CodexRunLifecycle, CoreError, CreateClaudeRunContext, CreateCodexRunContext, DriftEvaluation,
+    DriftFinding, ManagedWorktree, ManagedWorktreeState, NormalizedAgentEvent, Project,
+    ProjectFingerprintScheme, ProjectId, ProjectRegistration, ProjectValidationState,
+    PublicRunReference, Run, RunId, RunRepository, TaskRequest, WorktreeId,
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
@@ -106,6 +106,48 @@ struct ApprovalRequestDto {
     state: ApprovalState,
     version: u64,
     decision_available: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DriftRequest {
+    project_id: String,
+    worktree_id: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DriftFindingDto {
+    fingerprint: String,
+    rule_id: String,
+    rule_version: u16,
+    severity: sentinel_core::DriftSeverity,
+    title: String,
+    expected: String,
+    observed: String,
+    explanation: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DriftEvaluationDto {
+    snapshot_fingerprint: String,
+    findings: Vec<DriftFindingDto>,
+}
+fn drift_finding_dto(value: DriftFinding) -> DriftFindingDto {
+    DriftFindingDto {
+        fingerprint: value.fingerprint,
+        rule_id: value.rule_id,
+        rule_version: value.rule_version,
+        severity: value.severity,
+        title: value.title,
+        expected: value.expected,
+        observed: value.observed,
+        explanation: value.explanation,
+    }
+}
+fn drift_evaluation_dto(value: DriftEvaluation) -> DriftEvaluationDto {
+    DriftEvaluationDto {
+        snapshot_fingerprint: value.snapshot_fingerprint,
+        findings: value.findings.into_iter().map(drift_finding_dto).collect(),
+    }
 }
 fn approval_request_dto(value: ApprovalRequest) -> ApprovalRequestDto {
     ApprovalRequestDto {
@@ -518,6 +560,27 @@ fn approval_capability() -> ApprovalCapabilityDto {
             "unrestricted_permissions",
         ],
     }
+}
+#[tauri::command]
+fn drift_guardian_capability() -> bool {
+    true
+}
+#[tauri::command]
+async fn evaluate_drift_guardian(
+    request: DriftRequest,
+    state: State<'_, DesktopState>,
+) -> Result<DriftEvaluationDto, SafeError> {
+    let project = ProjectId::from_str(&request.project_id).map_err(|_| input_error())?;
+    let worktree = WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?;
+    // Reuse Phase 3's locked authoritative inventory path before evaluating
+    // managed-state rules; this rejects main repositories and stale identity.
+    inspect_worktree_changes_impl(&state, worktree.clone()).await?;
+    state
+        .repository
+        .evaluate_drift_guardian(&project, &worktree)
+        .await
+        .map(drift_evaluation_dto)
+        .map_err(|_| safe_error("drift evaluation"))
 }
 #[tauri::command]
 async fn list_pending_approvals(
@@ -3334,6 +3397,8 @@ fn main() {
             spike_diagnostics,
             codex_capability,
             approval_capability,
+            drift_guardian_capability,
+            evaluate_drift_guardian,
             list_pending_approvals,
             query_approval_request,
             decide_approval_request,

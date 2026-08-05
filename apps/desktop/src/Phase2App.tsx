@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { registerEscapeToHide } from "./escape";
 import { ApprovalPanel } from "./ApprovalPanel";
+import { DriftPanel } from "./DriftPanel";
 import type { approvalApi } from "./approval";
+import type { driftApi } from "./drift";
 import { formatEventSummary, isRunLifecycleEvent, isScenario, isTerminalRunEvent, MAX_TASK_BYTES, mergeRunEvents, patchRunInHistory, reconcile, scenarios, upsertRunInHistory, type CancellationResult, type DesktopCapabilities, type ProjectDto, type RunDto, type RunEvent, type RuntimeEnvironment, type Scenario, type Unlisten, type WorktreeDto } from "./phase2";
 import type { api as productionApi } from "./phase2";
 
 export interface Phase2AppServices {
   api: typeof productionApi;
   approvalApi?: ReturnType<typeof approvalApi>;
+  driftApi?: ReturnType<typeof driftApi>;
   listenToRunEvents(callback: (event: RunEvent) => void): Promise<Unlisten>;
   listenToTaskInputFocus(callback: () => void): Promise<Unlisten>;
   hidePrompt(): Promise<void>;

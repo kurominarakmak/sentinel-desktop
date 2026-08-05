@@ -29,8 +29,8 @@ prompt now exposes safe project/worktree and agent
 selection, history/detail, tray/shortcut access, and truthful unavailable
 notification/autostart status. Phase 7 supplies an approval control plane:
 bounded policy decisions and audit records are persisted and reviewable, but
-are not delivered to a live Codex or Claude process. Runtime delivery requires
-a separate Phase 8 adapter and waiter contract.
+are not delivered to a live Codex or Claude process. Phase 8 adds a read-only
+deterministic Drift Guardian; findings do not change repositories or runtimes.
 
 ## Installation And Development
 

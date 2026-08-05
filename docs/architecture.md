@@ -89,7 +89,15 @@ Approval persistence deliberately does not reattach processes or create a
 runtime permission waiter. An approval is an audit/control boundary in this
 phase, not an authority to run arbitrary commands; no PID, path, prompt, tool
 argument, stdout/stderr, argv, environment, or private event crosses it. This
-phase does not run an approved action or implement drift/evidence evaluation;
-those remain outside the approval boundary and Phase 8 is not started.
+phase does not run an approved action. Drift evaluation is supplied by the
+separate read-only Phase 8 boundary.
+
+## Phase 8 Drift Guardian boundary
+
+Drift Guardian reuses Phase 3 inventory authority and evaluates a fixed,
+read-only catalog over a bounded canonical managed-state snapshot. SHA-256
+fingerprints and fixed templates make each finding reproducible and factual.
+It does not use LLMs, heuristics, remediation, approval delivery, or process
+control. Phase 9 Evidence Gate is not started.
 
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).
