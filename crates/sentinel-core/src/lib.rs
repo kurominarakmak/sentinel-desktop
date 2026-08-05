@@ -340,6 +340,33 @@ pub struct DriftEvaluation {
     pub snapshot_fingerprint: String,
     pub findings: Vec<DriftFinding>,
 }
+/// Phase 9's read-only final evidence result.  It is deliberately separate
+/// from an agent's reported lifecycle: completion is a property of the
+/// managed baseline and deterministic Drift Guardian evidence, not a claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceGateResult {
+    pub bundle_fingerprint: String,
+    pub results: Vec<EvidenceGateFinding>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceGateFinding {
+    pub fingerprint: String,
+    pub gate_id: String,
+    pub gate_version: u16,
+    pub decision: EvidenceGateDecision,
+    pub title: String,
+    pub reason: String,
+    pub limitation: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGateDecision {
+    Passed,
+    Failed,
+    Unavailable,
+}
+pub const EVIDENCE_BUNDLE_SCHEMA_VERSION: u16 = 1;
+pub const EVIDENCE_GATE_CATALOG_VERSION: u16 = 1;
 pub const DRIFT_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
 pub const DRIFT_RULE_CATALOG_VERSION: u16 = 1;
 const MAX_DRIFT_FINDINGS: usize = 8;
@@ -1183,6 +1210,61 @@ impl RunRepository {
             snapshot_fingerprint,
             findings,
         })
+    }
+    /// Evaluates the closed Phase 9 catalog. EG001 is intentionally the sole
+    /// MVP gate: its baseline is the managed worktree's recorded base commit
+    /// and its evidence is the Phase 8 evaluation. No caller- or agent-
+    /// supplied claim can turn a failed result into a pass.
+    pub async fn evaluate_evidence_gate(
+        &self,
+        project_id: &ProjectId,
+        worktree_id: &WorktreeId,
+    ) -> Result<EvidenceGateResult, CoreError> {
+        let project = self.get_project(project_id).await?;
+        let worktree = self.get_worktree(worktree_id).await?;
+        if worktree.project_id != *project_id
+            || project.fingerprint_scheme != ProjectFingerprintScheme::StrongV1
+        {
+            return Err(CoreError::RunContextNotFound);
+        }
+        let drift = self
+            .evaluate_drift_guardian(project_id, worktree_id)
+            .await?;
+        let bundle = serde_json::json!({
+            "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "catalog_version": EVIDENCE_GATE_CATALOG_VERSION,
+            "project_fingerprint": project.repository_fingerprint,
+            "worktree_fingerprint": worktree.repository_fingerprint,
+            "base_commit": worktree.base_commit,
+            "drift_snapshot": drift.snapshot_fingerprint,
+            "drift_findings": drift.findings.iter().map(|f| &f.fingerprint).collect::<Vec<_>>(),
+        });
+        let canonical = serde_json::to_vec(&bundle).map_err(|_| CoreError::Storage)?;
+        if canonical.len() > 4_096 {
+            return Err(CoreError::PayloadTooLarge);
+        }
+        let bundle_fingerprint = format!("eg_{}", &digest_hex(&canonical)[3..]);
+        let (decision, reason) = if worktree.state == ManagedWorktreeState::Ready
+            && drift.findings.is_empty()
+        {
+            (EvidenceGateDecision::Passed, "Required baseline evidence is a ready managed worktree with no Drift Guardian findings; the authoritative managed state and fixed drift catalog satisfy that comparison.")
+        } else if worktree.state == ManagedWorktreeState::RetainedDirty
+            || !drift.findings.is_empty()
+        {
+            (EvidenceGateDecision::Failed, "Required baseline evidence is a ready managed worktree with no Drift Guardian findings; the authoritative managed state or fixed drift catalog does not satisfy that comparison.")
+        } else {
+            (EvidenceGateDecision::Unavailable, "Required baseline evidence is a ready managed worktree with no Drift Guardian findings; the authoritative managed state is unavailable for a passing comparison.")
+        };
+        let fingerprint_material = format!(
+            "evidence-gate-result-v1|EG001|1|{:?}|{}|{}",
+            decision, bundle_fingerprint, reason
+        );
+        Ok(EvidenceGateResult { bundle_fingerprint, results: vec![EvidenceGateFinding {
+            fingerprint: format!("eg_{}", &digest_hex(fingerprint_material.as_bytes())[3..]),
+            gate_id: "EG001".into(), gate_version: 1, decision,
+            title: "Managed baseline evidence".into(), reason: reason.into(),
+            limitation: "This gate evaluates managed baseline and Drift Guardian evidence only; it does not prove an agent action executed or infer a root cause.".into(),
+        }] })
     }
     pub async fn list_project_worktrees(
         &self,
@@ -2183,5 +2265,37 @@ mod tests {
         assert_eq!(changed.findings[0].rule_id, "DG001");
         assert_ne!(first.snapshot_fingerprint, changed.snapshot_fingerprint);
         assert!(!changed.findings[0].explanation.contains("likely"));
+    }
+    #[tokio::test]
+    async fn evidence_gate_is_reproducible_and_does_not_trust_claims() {
+        let repository = RunRepository::open("sqlite::memory:").await.unwrap();
+        let (project, worktree) = approval_owner(&repository).await;
+        let first = repository
+            .evaluate_evidence_gate(&project, &worktree)
+            .await
+            .unwrap();
+        let second = repository
+            .evaluate_evidence_gate(&project, &worktree)
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.results[0].gate_id, "EG001");
+        assert_eq!(first.results[0].decision, EvidenceGateDecision::Passed);
+        repository
+            .transition_worktree(
+                &worktree,
+                ManagedWorktreeState::Ready,
+                ManagedWorktreeState::RetainedDirty,
+                Some("dirty"),
+            )
+            .await
+            .unwrap();
+        let failed = repository
+            .evaluate_evidence_gate(&project, &worktree)
+            .await
+            .unwrap();
+        assert_eq!(failed.results[0].decision, EvidenceGateDecision::Failed);
+        assert_ne!(first.bundle_fingerprint, failed.bundle_fingerprint);
+        assert!(failed.results[0].limitation.contains("does not prove"));
     }
 }

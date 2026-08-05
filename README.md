@@ -31,6 +31,8 @@ notification/autostart status. Phase 7 supplies an approval control plane:
 bounded policy decisions and audit records are persisted and reviewable, but
 are not delivered to a live Codex or Claude process. Phase 8 adds a read-only
 deterministic Drift Guardian; findings do not change repositories or runtimes.
+Phase 9 Evidence Gate is a separate read-only deterministic baseline check:
+an agent claim alone cannot establish completion, and no remediation is run.
 
 ## Installation And Development
 

@@ -98,6 +98,14 @@ Drift Guardian reuses Phase 3 inventory authority and evaluates a fixed,
 read-only catalog over a bounded canonical managed-state snapshot. SHA-256
 fingerprints and fixed templates make each finding reproducible and factual.
 It does not use LLMs, heuristics, remediation, approval delivery, or process
-control. Phase 9 Evidence Gate is not started.
+control.
+
+## Phase 9 Evidence Gate boundary
+
+Evidence Gate is an ephemeral, read-only final evaluator. Its fixed `EG001`
+catalog entry passes only for a ready managed baseline with no Phase 8 Drift
+Guardian findings. Agent claims, raw command output, and private inventory are
+not evidence; public results contain only redacted factual reasons and opaque
+fingerprints.
 
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).

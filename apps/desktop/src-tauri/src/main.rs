@@ -131,6 +131,23 @@ struct DriftEvaluationDto {
     snapshot_fingerprint: String,
     findings: Vec<DriftFindingDto>,
 }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceGateFindingDto {
+    fingerprint: String,
+    gate_id: String,
+    gate_version: u16,
+    decision: sentinel_core::EvidenceGateDecision,
+    title: String,
+    reason: String,
+    limitation: String,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EvidenceGateDto {
+    bundle_fingerprint: String,
+    results: Vec<EvidenceGateFindingDto>,
+}
 fn drift_finding_dto(value: DriftFinding) -> DriftFindingDto {
     DriftFindingDto {
         fingerprint: value.fingerprint,
@@ -141,6 +158,24 @@ fn drift_finding_dto(value: DriftFinding) -> DriftFindingDto {
         expected: value.expected,
         observed: value.observed,
         explanation: value.explanation,
+    }
+}
+fn evidence_gate_dto(value: sentinel_core::EvidenceGateResult) -> EvidenceGateDto {
+    EvidenceGateDto {
+        bundle_fingerprint: value.bundle_fingerprint,
+        results: value
+            .results
+            .into_iter()
+            .map(|item| EvidenceGateFindingDto {
+                fingerprint: item.fingerprint,
+                gate_id: item.gate_id,
+                gate_version: item.gate_version,
+                decision: item.decision,
+                title: item.title,
+                reason: item.reason,
+                limitation: item.limitation,
+            })
+            .collect(),
     }
 }
 fn drift_evaluation_dto(value: DriftEvaluation) -> DriftEvaluationDto {
@@ -564,6 +599,25 @@ fn approval_capability() -> ApprovalCapabilityDto {
 #[tauri::command]
 fn drift_guardian_capability() -> bool {
     true
+}
+#[tauri::command]
+fn evidence_gate_capability() -> bool {
+    true
+}
+#[tauri::command]
+async fn evaluate_evidence_gate(
+    request: DriftRequest,
+    state: State<'_, DesktopState>,
+) -> Result<EvidenceGateDto, SafeError> {
+    let project = ProjectId::from_str(&request.project_id).map_err(|_| input_error())?;
+    let worktree = WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?;
+    inspect_worktree_changes_impl(&state, worktree.clone()).await?;
+    state
+        .repository
+        .evaluate_evidence_gate(&project, &worktree)
+        .await
+        .map(evidence_gate_dto)
+        .map_err(|_| safe_error("evidence evaluation"))
 }
 #[tauri::command]
 async fn evaluate_drift_guardian(
@@ -3399,6 +3453,8 @@ fn main() {
             approval_capability,
             drift_guardian_capability,
             evaluate_drift_guardian,
+            evidence_gate_capability,
+            evaluate_evidence_gate,
             list_pending_approvals,
             query_approval_request,
             decide_approval_request,

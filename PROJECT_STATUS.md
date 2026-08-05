@@ -2,7 +2,7 @@
 
 Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
 
-**Current phase: Phase 8 — COMPLETE / CLEAN. Phase 9 is NOT STARTED.**
+**Current phase: Phase 9 — COMPLETE / CLEAN. Phase 10 is NOT STARTED.**
 
 ## Documentation Navigation
 
@@ -32,7 +32,7 @@ Phase 2C3 is **COMPLETE**: manual macOS Tauri desktop acceptance verified succes
 
 Phase 2 is **COMPLETE**. Its exit criterion is satisfied: a deterministic fake task traverses the desktop UI, typed Tauri bridge, Rust orchestrator and state machine, SQLite persistence, live/persisted event recovery, history, terminal handling, and cancellation.
 
-Phase 3–7 remain **COMPLETE / CLEAN** at their checkpoint tags. Phase 8 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-8-authoritative-execution-contract.md): its fixed DG001/DG002 Drift Guardian catalog produces bounded, deterministic, factually explained, read-only findings over authoritative managed state. Phase 9 Evidence Gate is **NOT STARTED**. Runtime approval delivery is not implemented. App Server remains unavailable/experimental, automatic worktree removal remains disabled, notifications and autostart remain unavailable, and direct-child containment remains the only claim.
+Phase 3–7 remain **COMPLETE / CLEAN** at their checkpoint tags. Phase 8 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-8-authoritative-execution-contract.md): its fixed DG001/DG002 Drift Guardian catalog produces bounded, deterministic, factually explained, read-only findings over authoritative managed state. Phase 9 Evidence Gate is **COMPLETE / CLEAN** under its [authoritative execution contract](docs/phase-9-authoritative-execution-contract.md). Its fixed EG001 baseline evaluator is deterministic, ephemeral, read-only, and does not treat an agent claim as completion evidence. Phase 10 is **NOT STARTED**. Runtime approval delivery is not implemented. App Server remains unavailable/experimental, automatic worktree removal remains disabled, notifications and autostart remain unavailable, and direct-child containment remains the only claim.
 
 Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
 
