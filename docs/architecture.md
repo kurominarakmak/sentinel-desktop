@@ -77,8 +77,19 @@ setting is silently changed. Approval decisions remain Phase 7.
 ## Phase 7 approval boundary
 
 Approval profiles and requests are persisted as backend-owned, ownership-bound
-records. Hard-denied action categories override all profiles. This phase does
-not run an approved action or implement drift/evidence evaluation; those remain
-outside the approval boundary and Phase 8 is not started.
+records. A request is queried and resolved only with its exact
+project/worktree/task ownership tuple plus its opaque reference. Resolution is
+optimistically versioned and writes its bounded redacted audit row in the same
+SQLite transaction; unknown and cross-owner requests use the same public
+failure. Hard-denied action categories override all profiles and never appear
+as pending approvals. The desktop bridge exposes only policy posture, bounded
+queue/detail items, and a backend-confirmed decision.
+
+Approval persistence deliberately does not reattach processes or create a
+runtime permission waiter. An approval is an audit/control boundary in this
+phase, not an authority to run arbitrary commands; no PID, path, prompt, tool
+argument, stdout/stderr, argv, environment, or private event crosses it. This
+phase does not run an approved action or implement drift/evidence evaluation;
+those remain outside the approval boundary and Phase 8 is not started.
 
 `sentineld` is deferred. Extract it only when tasks must survive full app exit, a CLI or IDE client needs independent connection, multiple desktop clients need one engine, remote execution is added, or independent upgrades become necessary. The architecture stays cross-platform, but macOS is implemented and validated first. See [platform support](platform-support.md), [data model](data-model.md), and [adapter contract](agent-adapter-contract.md).

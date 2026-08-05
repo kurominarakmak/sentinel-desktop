@@ -27,7 +27,10 @@ and resume inputs are fixed-form capabilities and Claude is truthfully reported
 unavailable until a private configured runner exists. The Phase 6 desktop
 prompt now exposes safe project/worktree and agent
 selection, history/detail, tray/shortcut access, and truthful unavailable
-notification/autostart status. Approval policy work remains Phase 7.
+notification/autostart status. Phase 7 supplies an approval control plane:
+bounded policy decisions and audit records are persisted and reviewable, but
+are not delivered to a live Codex or Claude process. Runtime delivery requires
+a separate Phase 8 adapter and waiter contract.
 
 ## Installation And Development
 

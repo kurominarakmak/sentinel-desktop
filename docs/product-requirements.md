@@ -2,7 +2,7 @@
 
 ## Problem And User
 
-Agent Sentinel helps a developer supervise autonomous coding tasks without giving up control of a real local repository. Its target user is a developer who already uses Codex or Claude Code and needs task isolation, visible progress, approvals, and deterministic verification.
+Agent Sentinel helps a developer supervise autonomous coding tasks without giving up control of a real local repository. Its target user is a developer who already uses Codex or Claude Code and needs task isolation, visible progress, approval records, and deterministic verification.
 
 ## Core Experience
 
@@ -14,7 +14,7 @@ From a global shortcut, the user selects a registered Git project and agent, des
 2. Open the prompt, submit a task or plan-only request, and create a branch and isolated worktree.
 3. Monitor agent-reported plan steps separately from actual commands, file changes, and evidence.
 4. Send a follow-up to an active task, queue it after the current turn, or start another task.
-5. Handle an approval request, drift finding, cancellation, or restart recovery.
+5. Review and record an approval decision, handle a drift finding, cancellation, or restart recovery.
 6. Review a diff and final outcome: Completed, Completed with warnings, Evidence incomplete, Failed, or Cancelled.
 
 ## Functional Requirements

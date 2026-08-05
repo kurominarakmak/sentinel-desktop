@@ -1,0 +1,32 @@
+import { useEffect, useRef, useState } from "react";
+import { approvalStateText, type ApprovalRequestDto, type ApprovalOwner } from "./approval";
+import type { approvalApi } from "./approval";
+
+type ApprovalApi = ReturnType<typeof approvalApi>;
+export function ApprovalPanel({ api, projectId, worktreeId }: { api?: ApprovalApi; projectId: string; worktreeId: string }) {
+  const [capable, setCapable] = useState<boolean | null>(null);
+  const [taskKey, setTaskKey] = useState("");
+  const [items, setItems] = useState<ApprovalRequestDto[]>([]);
+  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [deciding, setDeciding] = useState<string | null>(null);
+  const request = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; if (!api) { setCapable(false); return () => { mounted.current = false; }; } void api.capability().then((value) => { if (mounted.current) setCapable(value.available); }).catch(() => { if (mounted.current) setCapable(false); }); return () => { mounted.current = false; request.current += 1; }; }, [api]);
+  const owner = (): ApprovalOwner | null => projectId && worktreeId && taskKey.trim() ? { projectId, worktreeId, taskKey: taskKey.trim() } : null;
+  const refresh = async () => {
+    const context = owner(); if (!api || !context || loading) return;
+    const current = ++request.current; setLoading(true); setMessage("");
+    try { const queue = await api.listPending(context); if (mounted.current && current === request.current) setItems(queue); }
+    catch { if (mounted.current && current === request.current) { setItems([]); setMessage("Approval queue is unavailable."); } }
+    finally { if (mounted.current && current === request.current) setLoading(false); }
+  };
+  const decide = async (item: ApprovalRequestDto, decision: "allow_once" | "deny") => {
+    const context = owner(); if (!api || !context || deciding) return;
+    const key = item.approvalReference; const generation = ++request.current; setDeciding(key); setMessage("");
+    try { const updated = await api.decide({ ...context, approvalReference: key, expectedVersion: item.version, decision }); if (!mounted.current || generation !== request.current) return; setItems((current) => current.filter((value) => value.approvalReference !== key)); setMessage(`${approvalStateText(updated.state)} decision recorded.`); }
+    catch { if (mounted.current && generation === request.current) setMessage("The decision was not recorded. Refresh the queue."); }
+    finally { if (mounted.current && generation === request.current) setDeciding(null); }
+  };
+  return <section aria-live="polite"><h2>Approval review</h2>{capable === false ? <p>Approval control plane unavailable.</p> : <><p>Decisions are recorded; runtime delivery is not available in this phase.</p><label>Task key<input value={taskKey} onChange={(event) => setTaskKey(event.target.value)} maxLength={128} /></label><button onClick={() => void refresh()} disabled={!owner() || loading}>{loading ? "Refreshing…" : "Refresh approvals"}</button>{message && <p role="status">{message}</p>}{items.length ? <ol>{items.map((item) => <li key={item.approvalReference}><p>{item.summary}</p><p>{approvalStateText(item.state)}</p>{item.decisionAvailable && <><button onClick={() => void decide(item, "allow_once")} disabled={deciding !== null}>{deciding === item.approvalReference ? "Recording…" : "Approve once"}</button><button onClick={() => void decide(item, "deny")} disabled={deciding !== null}>Deny</button></>}</li>)}</ol> : <p>No pending approvals.</p>}</>}</section>;
+}

@@ -6,10 +6,11 @@ use sentinel_agent_api::{
     codex_capabilities, detect_installation, AgentKind, CodexCapabilities, InstallationStatus,
 };
 use sentinel_core::{
-    ClaudeRunContext, CodexRunContext, CodexRunLifecycle, CoreError, CreateClaudeRunContext,
-    CreateCodexRunContext, ManagedWorktree, ManagedWorktreeState, NormalizedAgentEvent, Project,
-    ProjectFingerprintScheme, ProjectId, ProjectRegistration, ProjectValidationState,
-    PublicRunReference, Run, RunId, RunRepository, TaskRequest, WorktreeId,
+    ApprovalDecision, ApprovalRequest, ApprovalState, ClaudeRunContext, CodexRunContext,
+    CodexRunLifecycle, CoreError, CreateClaudeRunContext, CreateCodexRunContext, ManagedWorktree,
+    ManagedWorktreeState, NormalizedAgentEvent, Project, ProjectFingerprintScheme, ProjectId,
+    ProjectRegistration, ProjectValidationState, PublicRunReference, Run, RunId, RunRepository,
+    TaskRequest, WorktreeId,
 };
 use sentinel_fake_agent::FakeAgentScenario;
 use sentinel_git::{
@@ -55,6 +56,67 @@ struct Diagnostics {
 struct CodexCapabilityDto {
     exec_json: bool,
     app_server_experimental: bool,
+}
+/// Explicit Phase 7 public allowlist.  The queue never exposes private event
+/// data, runtime IDs, paths, or audit rows.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalCapabilityDto {
+    available: bool,
+    hard_denied_categories: Vec<&'static str>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalOwnerRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    adapter: Option<String>,
+    runtime_reference: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalLookupRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    approval_reference: String,
+    adapter: Option<String>,
+    runtime_reference: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalDecisionRequest {
+    project_id: String,
+    worktree_id: String,
+    task_key: String,
+    approval_reference: String,
+    expected_version: u64,
+    decision: ApprovalDecision,
+    adapter: Option<String>,
+    runtime_reference: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalRequestDto {
+    approval_reference: String,
+    profile: sentinel_core::ApprovalProfile,
+    action_category: String,
+    summary: String,
+    state: ApprovalState,
+    version: u64,
+    decision_available: bool,
+}
+fn approval_request_dto(value: ApprovalRequest) -> ApprovalRequestDto {
+    ApprovalRequestDto {
+        approval_reference: value.public_reference.to_string(),
+        profile: value.profile,
+        action_category: value.action_category,
+        summary: value.summary,
+        state: value.state,
+        version: value.version,
+        decision_available: value.state == ApprovalState::Pending,
+    }
 }
 /// The Phase 4 public boundary: no paths, database IDs, argv, environment,
 /// raw events, prompts, or process information cross this DTO.
@@ -407,6 +469,140 @@ fn codex_capability() -> CodexCapabilityDto {
         exec_json,
         app_server_experimental,
     }
+}
+fn parse_approval_owner(
+    request: &ApprovalOwnerRequest,
+) -> Result<
+    (
+        ProjectId,
+        WorktreeId,
+        Option<AgentKind>,
+        Option<PublicRunReference>,
+    ),
+    SafeError,
+> {
+    if request.task_key.trim().is_empty() || request.task_key.len() > 128 {
+        return Err(input_error());
+    }
+    let adapter = match request.adapter.as_deref() {
+        None => None,
+        Some("codex") => Some(AgentKind::Codex),
+        Some("claude_code") => Some(AgentKind::ClaudeCode),
+        _ => return Err(input_error()),
+    };
+    let runtime_reference = request
+        .runtime_reference
+        .as_ref()
+        .map(|value| PublicRunReference::parse(value.clone()))
+        .transpose()
+        .map_err(|_| input_error())?;
+    if adapter.is_some() != runtime_reference.is_some() {
+        return Err(input_error());
+    }
+    Ok((
+        ProjectId::from_str(&request.project_id).map_err(|_| input_error())?,
+        WorktreeId::from_str(&request.worktree_id).map_err(|_| input_error())?,
+        adapter,
+        runtime_reference,
+    ))
+}
+#[tauri::command]
+fn approval_capability() -> ApprovalCapabilityDto {
+    ApprovalCapabilityDto {
+        available: true,
+        hard_denied_categories: vec![
+            "merge",
+            "push",
+            "force_push",
+            "install_cli",
+            "unrestricted_permissions",
+        ],
+    }
+}
+#[tauri::command]
+async fn list_pending_approvals(
+    request: ApprovalOwnerRequest,
+    state: State<'_, DesktopState>,
+) -> Result<Vec<ApprovalRequestDto>, SafeError> {
+    let (project, worktree, adapter, runtime_reference) = parse_approval_owner(&request)?;
+    state
+        .repository
+        .list_pending_approval_requests_owned(
+            &project,
+            &worktree,
+            &request.task_key,
+            adapter,
+            runtime_reference.as_ref(),
+        )
+        .await
+        .map(|items| items.into_iter().map(approval_request_dto).collect())
+        .map_err(|_| safe_error("approval queue"))
+}
+#[tauri::command]
+async fn query_approval_request(
+    request: ApprovalLookupRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ApprovalRequestDto, SafeError> {
+    let owner = ApprovalOwnerRequest {
+        project_id: request.project_id.clone(),
+        worktree_id: request.worktree_id.clone(),
+        task_key: request.task_key.clone(),
+        adapter: request.adapter.clone(),
+        runtime_reference: request.runtime_reference.clone(),
+    };
+    let (project, worktree, adapter, runtime_reference) = parse_approval_owner(&owner)?;
+    let reference =
+        PublicRunReference::parse(request.approval_reference).map_err(|_| input_error())?;
+    state
+        .repository
+        .get_approval_request_owned(
+            &project,
+            &worktree,
+            &request.task_key,
+            adapter,
+            runtime_reference.as_ref(),
+            &reference,
+        )
+        .await
+        .map(approval_request_dto)
+        .map_err(|_| safe_error("approval lookup"))
+}
+#[tauri::command]
+async fn decide_approval_request(
+    request: ApprovalDecisionRequest,
+    state: State<'_, DesktopState>,
+) -> Result<ApprovalRequestDto, SafeError> {
+    let owner = ApprovalOwnerRequest {
+        project_id: request.project_id.clone(),
+        worktree_id: request.worktree_id.clone(),
+        task_key: request.task_key.clone(),
+        adapter: request.adapter.clone(),
+        runtime_reference: request.runtime_reference.clone(),
+    };
+    let (project, worktree, adapter, runtime_reference) = parse_approval_owner(&owner)?;
+    let reference =
+        PublicRunReference::parse(request.approval_reference).map_err(|_| input_error())?;
+    let current = state
+        .repository
+        .get_approval_request_owned(
+            &project,
+            &worktree,
+            &request.task_key,
+            adapter,
+            runtime_reference.as_ref(),
+            &reference,
+        )
+        .await
+        .map_err(|_| safe_error("approval lookup"))?;
+    if current.version != request.expected_version {
+        return Err(safe_error("approval stale"));
+    }
+    state
+        .repository
+        .resolve_approval_request(&current, request.decision)
+        .await
+        .map(approval_request_dto)
+        .map_err(|_| safe_error("approval decision"))
 }
 
 fn codex_run_dto(context: CodexRunContext) -> CodexRunDto {
@@ -3064,6 +3260,15 @@ fn main() {
                         "Agent Sentinel could not reconcile interrupted Codex runs",
                     )
                 })?;
+            // Approval decisions are control-plane records in Phase 7. There
+            // is no process waiter to reconstruct, so adapter-bound pending
+            // rows become unavailable rather than implying delivery.
+            tauri::async_runtime::block_on(repository.reconcile_approval_requests_on_startup())
+                .map_err(|_| {
+                    Box::<dyn std::error::Error>::from(
+                        "Agent Sentinel could not reconcile approval records",
+                    )
+                })?;
             let protected_application_repository = application_repository_root()
                 .map(|root| {
                     tauri::async_runtime::block_on(inspect_repository(&root)).map(|inspection| {
@@ -3128,6 +3333,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             spike_diagnostics,
             codex_capability,
+            approval_capability,
+            list_pending_approvals,
+            query_approval_request,
+            decide_approval_request,
             start_codex_run,
             query_codex_run,
             cancel_codex_run,

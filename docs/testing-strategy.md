@@ -2,7 +2,7 @@
 
 ## Test Layers
 
-Rust unit tests cover state transitions, event normalization, command classification, path rules, drift scoring, evidence decisions, configuration precedence, and secret redaction. Frontend tests cover task presentation, approvals, drift/evidence states, keyboard flows, and bindings; use the repository's chosen frontend test runner (Vitest is planned).
+Rust unit tests cover state transitions, event normalization, command classification, path rules, approval ownership/audit transactions, drift scoring, evidence decisions, configuration precedence, and secret redaction. Frontend tests cover task presentation, recorded approval decisions, drift/evidence states, keyboard flows, and bindings; use the repository's chosen frontend test runner (Vitest is planned).
 
 Integration tests use temporary repositories for worktree creation, branch collisions, file changes, cancellation, approval blocking, test failures, restart recovery, and cleanup failures. Every adapter passes contract tests for detection, task start, session/command/file events, follow-up, cancellation, failure, and recovery metadata.
 

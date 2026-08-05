@@ -258,11 +258,68 @@ pub enum ApprovalDecision {
     AllowForTask,
     Deny,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalState {
+    Pending,
+    AllowedOnce,
+    AllowedForTask,
+    Denied,
+    HardDenied,
+}
+fn approval_state_name(value: ApprovalState) -> &'static str {
+    match value {
+        ApprovalState::Pending => "pending",
+        ApprovalState::AllowedOnce => "allowed_once",
+        ApprovalState::AllowedForTask => "allowed_for_task",
+        ApprovalState::Denied => "denied",
+        ApprovalState::HardDenied => "hard_denied",
+    }
+}
+fn parse_approval_state(value: &str) -> Result<ApprovalState, CoreError> {
+    match value {
+        "pending" => Ok(ApprovalState::Pending),
+        "allowed_once" => Ok(ApprovalState::AllowedOnce),
+        "allowed_for_task" => Ok(ApprovalState::AllowedForTask),
+        "denied" => Ok(ApprovalState::Denied),
+        "hard_denied" => Ok(ApprovalState::HardDenied),
+        _ => Err(CoreError::Storage),
+    }
+}
 pub fn hard_denied_action(action: &str) -> bool {
     matches!(
         action,
         "merge" | "push" | "force_push" | "install_cli" | "unrestricted_permissions"
     )
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub public_reference: PublicRunReference,
+    pub project_id: ProjectId,
+    pub worktree_id: WorktreeId,
+    pub task_key: String,
+    pub adapter_identity: Option<AgentKind>,
+    pub runtime_reference: Option<PublicRunReference>,
+    pub profile: ApprovalProfile,
+    pub action_category: String,
+    pub summary: String,
+    pub state: ApprovalState,
+    pub version: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalAuditDecision {
+    pub approval_reference: PublicRunReference,
+    pub decision: ApprovalState,
+    pub reason: String,
+    pub source: String,
+}
+fn approval_profile_name(v: ApprovalProfile) -> &'static str {
+    match v {
+        ApprovalProfile::Safe => "safe",
+        ApprovalProfile::Balanced => "balanced",
+        ApprovalProfile::Autonomous => "autonomous",
+        ApprovalProfile::Custom => "custom",
+    }
 }
 
 /// Backend-generated bearer-resistant reference.  It is deliberately opaque:
@@ -617,6 +674,37 @@ fn row_to_claude_context(row: &sqlx::sqlite::SqliteRow) -> Result<ClaudeRunConte
         created_at_ms: row.get("created_at_ms"),
         transitioned_at_ms: row.get("transitioned_at_ms"),
         terminal_at_ms: row.get("terminal_at_ms"),
+    })
+}
+fn row_to_approval_request(row: &sqlx::sqlite::SqliteRow) -> Result<ApprovalRequest, CoreError> {
+    let adapter = row.get::<String, _>("adapter_identity");
+    let runtime = row.get::<Option<String>, _>("runtime_reference");
+    Ok(ApprovalRequest {
+        public_reference: PublicRunReference::parse(row.get::<String, _>("public_reference"))?,
+        project_id: ProjectId(
+            Uuid::from_str(&row.get::<String, _>("project_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        worktree_id: WorktreeId(
+            Uuid::from_str(&row.get::<String, _>("worktree_id")).map_err(|_| CoreError::Storage)?,
+        ),
+        task_key: row.get("task_key"),
+        adapter_identity: if adapter == "none" {
+            None
+        } else {
+            Some(parse_agent(&adapter)?)
+        },
+        runtime_reference: runtime.map(PublicRunReference::parse).transpose()?,
+        profile: match row.get::<String, _>("profile").as_str() {
+            "safe" => ApprovalProfile::Safe,
+            "balanced" => ApprovalProfile::Balanced,
+            "autonomous" => ApprovalProfile::Autonomous,
+            "custom" => ApprovalProfile::Custom,
+            _ => return Err(CoreError::Storage),
+        },
+        action_category: row.get("action_category"),
+        summary: row.get("summary"),
+        state: parse_approval_state(&row.get::<String, _>("state"))?,
+        version: checked_u64(row.get("version"))?,
     })
 }
 
@@ -1346,6 +1434,248 @@ impl RunRepository {
         Ok(changed)
     }
 
+    pub async fn create_approval_request(
+        &self,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        profile: ApprovalProfile,
+        action: &str,
+        summary: &str,
+    ) -> Result<ApprovalRequest, CoreError> {
+        self.create_approval_request_for_context(
+            project, worktree, task_key, None, None, profile, action, summary,
+        )
+        .await
+    }
+    pub async fn create_approval_request_for_context(
+        &self,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        adapter: Option<AgentKind>,
+        runtime_reference: Option<&PublicRunReference>,
+        profile: ApprovalProfile,
+        action: &str,
+        summary: &str,
+    ) -> Result<ApprovalRequest, CoreError> {
+        if task_key.is_empty()
+            || task_key.len() > 128
+            || action.is_empty()
+            || action.len() > 64
+            || summary.is_empty()
+            || summary.len() > 512
+        {
+            return Err(CoreError::InvalidTask);
+        };
+        let owned: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM managed_worktrees WHERE id=? AND project_id=?")
+                .bind(worktree.to_string())
+                .bind(project.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| CoreError::Storage)?;
+        if owned.is_none() {
+            return Err(CoreError::RunContextNotFound);
+        };
+        if adapter.is_some() != runtime_reference.is_some() {
+            return Err(CoreError::InvalidTask);
+        }
+        if let (Some(adapter), Some(runtime_reference)) = (&adapter, runtime_reference) {
+            match adapter {
+                AgentKind::Codex => {
+                    if self
+                        .get_codex_run_context_owned(project, worktree, task_key, runtime_reference)
+                        .await?
+                        .lifecycle
+                        .terminal()
+                    {
+                        return Err(CoreError::RunContextConflict);
+                    }
+                }
+                AgentKind::ClaudeCode => {
+                    if self
+                        .get_claude_run_context_owned(
+                            project,
+                            worktree,
+                            task_key,
+                            runtime_reference,
+                        )
+                        .await?
+                        .lifecycle
+                        .terminal()
+                    {
+                        return Err(CoreError::RunContextConflict);
+                    }
+                }
+                AgentKind::Fake => return Err(CoreError::InvalidTask),
+            }
+        }
+        let reference = PublicRunReference::new();
+        let state = if hard_denied_action(action) {
+            ApprovalState::HardDenied
+        } else {
+            ApprovalState::Pending
+        };
+        let t = now();
+        let summary = redact_and_bound(summary, 512);
+        let mut transaction = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
+        sqlx::query("INSERT INTO approval_requests (id,public_reference,project_id,worktree_id,task_key,profile,action_category,summary,state,created_at_ms,decided_at_ms,adapter_identity,runtime_reference,resolution_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(reference.as_str()).bind(project.to_string()).bind(worktree.to_string()).bind(task_key).bind(approval_profile_name(profile)).bind(action).bind(&summary).bind(approval_state_name(state)).bind(t).bind((state != ApprovalState::Pending).then_some(t)).bind(adapter.as_ref().map(agent_name).unwrap_or("none")).bind(runtime_reference.map(PublicRunReference::as_str)).bind((state == ApprovalState::HardDenied).then_some("Policy denied this action."))
+            .execute(&mut *transaction).await.map_err(|_|CoreError::Storage)?;
+        if state == ApprovalState::HardDenied {
+            self.insert_approval_audit(
+                &mut transaction,
+                &reference,
+                project,
+                worktree,
+                task_key,
+                ApprovalState::HardDenied,
+                "policy",
+                "Policy denied this action.",
+                profile,
+                t,
+            )
+            .await?;
+        }
+        transaction.commit().await.map_err(|_| CoreError::Storage)?;
+        Ok(ApprovalRequest {
+            public_reference: reference,
+            project_id: project.clone(),
+            worktree_id: worktree.clone(),
+            task_key: task_key.into(),
+            adapter_identity: adapter,
+            runtime_reference: runtime_reference.cloned(),
+            profile,
+            action_category: action.into(),
+            summary,
+            state,
+            version: 0,
+        })
+    }
+    async fn insert_approval_audit(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        reference: &PublicRunReference,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        decision: ApprovalState,
+        source: &str,
+        reason: &str,
+        profile: ApprovalProfile,
+        timestamp: i64,
+    ) -> Result<(), CoreError> {
+        sqlx::query("INSERT INTO approval_decision_audit (id,approval_reference,project_id,worktree_id,task_key,decision,decision_source,reason,profile,previous_state,resulting_state,resolved_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(reference.as_str()).bind(project.to_string()).bind(worktree.to_string()).bind(task_key).bind(approval_state_name(decision)).bind(source).bind(redact_and_bound(reason, 256)).bind(approval_profile_name(profile)).bind("pending").bind(approval_state_name(decision)).bind(timestamp).execute(&mut **transaction).await.map_err(|_| CoreError::Storage)?;
+        Ok(())
+    }
+    pub async fn list_pending_approval_requests_owned(
+        &self,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        adapter: Option<AgentKind>,
+        runtime_reference: Option<&PublicRunReference>,
+    ) -> Result<Vec<ApprovalRequest>, CoreError> {
+        if adapter.is_some() != runtime_reference.is_some() {
+            return Err(CoreError::RunContextNotFound);
+        }
+        let rows = sqlx::query("SELECT * FROM approval_requests WHERE project_id=? AND worktree_id=? AND task_key=? AND adapter_identity=? AND ((runtime_reference IS NULL AND ? IS NULL) OR runtime_reference=?) AND state='pending' ORDER BY created_at_ms ASC, public_reference ASC LIMIT 32")
+            .bind(project.to_string()).bind(worktree.to_string()).bind(task_key).bind(adapter.map(|a| agent_name(&a)).unwrap_or("none")).bind(runtime_reference.map(PublicRunReference::as_str)).bind(runtime_reference.map(PublicRunReference::as_str)).fetch_all(&self.pool).await.map_err(|_|CoreError::Storage)?;
+        rows.iter().map(row_to_approval_request).collect()
+    }
+    pub async fn get_approval_request_owned(
+        &self,
+        project: &ProjectId,
+        worktree: &WorktreeId,
+        task_key: &str,
+        adapter: Option<AgentKind>,
+        runtime_reference: Option<&PublicRunReference>,
+        reference: &PublicRunReference,
+    ) -> Result<ApprovalRequest, CoreError> {
+        if adapter.is_some() != runtime_reference.is_some() {
+            return Err(CoreError::RunContextNotFound);
+        }
+        let row = sqlx::query("SELECT * FROM approval_requests WHERE project_id=? AND worktree_id=? AND task_key=? AND adapter_identity=? AND ((runtime_reference IS NULL AND ? IS NULL) OR runtime_reference=?) AND public_reference=?")
+            .bind(project.to_string()).bind(worktree.to_string()).bind(task_key).bind(adapter.map(|a| agent_name(&a)).unwrap_or("none")).bind(runtime_reference.map(PublicRunReference::as_str)).bind(runtime_reference.map(PublicRunReference::as_str)).bind(reference.as_str()).fetch_optional(&self.pool).await.map_err(|_|CoreError::Storage)?.ok_or(CoreError::RunContextNotFound)?;
+        row_to_approval_request(&row)
+    }
+    pub async fn resolve_approval_request(
+        &self,
+        request: &ApprovalRequest,
+        decision: ApprovalDecision,
+    ) -> Result<ApprovalRequest, CoreError> {
+        if request.state != ApprovalState::Pending {
+            return Err(CoreError::RunContextConflict);
+        };
+        let t = now();
+        let next = match decision {
+            ApprovalDecision::AllowOnce => ApprovalState::AllowedOnce,
+            ApprovalDecision::AllowForTask => ApprovalState::AllowedForTask,
+            ApprovalDecision::Deny => ApprovalState::Denied,
+        };
+        let mut transaction = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
+        let changed=sqlx::query("UPDATE approval_requests SET state=?,version=version+1,decided_at_ms=?,resolution_reason=? WHERE public_reference=? AND project_id=? AND worktree_id=? AND task_key=? AND adapter_identity=? AND ((runtime_reference IS NULL AND ? IS NULL) OR runtime_reference=?) AND state='pending' AND version=? AND (adapter_identity='none' OR (adapter_identity='codex' AND EXISTS (SELECT 1 FROM codex_run_contexts c WHERE c.public_reference=approval_requests.runtime_reference AND c.project_id=approval_requests.project_id AND c.worktree_id=approval_requests.worktree_id AND c.task_key=approval_requests.task_key AND c.lifecycle IN ('created','starting','running') AND c.cancellation_requested=0)) OR (adapter_identity='claude_code' AND EXISTS (SELECT 1 FROM claude_run_contexts c WHERE c.public_reference=approval_requests.runtime_reference AND c.project_id=approval_requests.project_id AND c.worktree_id=approval_requests.worktree_id AND c.task_key=approval_requests.task_key AND c.lifecycle IN ('created','starting','running') AND c.cancellation_requested=0)))").bind(approval_state_name(next)).bind(t).bind("Decision recorded.").bind(request.public_reference.as_str()).bind(request.project_id.to_string()).bind(request.worktree_id.to_string()).bind(&request.task_key).bind(request.adapter_identity.as_ref().map(agent_name).unwrap_or("none")).bind(request.runtime_reference.as_ref().map(PublicRunReference::as_str)).bind(request.runtime_reference.as_ref().map(PublicRunReference::as_str)).bind(checked_i64(request.version)?).execute(&mut *transaction).await.map_err(|_|CoreError::Storage)?.rows_affected();
+        if changed != 1 {
+            return Err(CoreError::RunContextConflict);
+        };
+        self.insert_approval_audit(
+            &mut transaction,
+            &request.public_reference,
+            &request.project_id,
+            &request.worktree_id,
+            &request.task_key,
+            next,
+            "user",
+            "Decision recorded.",
+            request.profile,
+            t,
+        )
+        .await?;
+        transaction.commit().await.map_err(|_| CoreError::Storage)?;
+        let mut value = request.clone();
+        value.state = next;
+        value.version += 1;
+        Ok(value)
+    }
+
+    /// Phase 7 has no reconnectable runtime channel. Pending requests that
+    /// were associated with an adapter are therefore made unavailable after a
+    /// restart, atomically with their audit record. Control-plane-only rows
+    /// remain pending for later user review.
+    pub async fn reconcile_approval_requests_on_startup(&self) -> Result<u64, CoreError> {
+        let rows = sqlx::query("SELECT * FROM approval_requests WHERE state='pending' AND adapter_identity <> 'none' ORDER BY created_at_ms ASC, public_reference ASC")
+            .fetch_all(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        let mut reconciled = 0_u64;
+        for row in rows {
+            let request = row_to_approval_request(&row)?;
+            let timestamp = now();
+            let mut transaction = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
+            let changed = sqlx::query("UPDATE approval_requests SET state='denied', version=version+1, decided_at_ms=?, resolution_reason=? WHERE public_reference=? AND project_id=? AND worktree_id=? AND task_key=? AND state='pending' AND version=?")
+                .bind(timestamp).bind("Decision context unavailable after restart.").bind(request.public_reference.as_str()).bind(request.project_id.to_string()).bind(request.worktree_id.to_string()).bind(&request.task_key).bind(checked_i64(request.version)?)
+                .execute(&mut *transaction).await.map_err(|_| CoreError::Storage)?.rows_affected();
+            if changed == 1 {
+                self.insert_approval_audit(
+                    &mut transaction,
+                    &request.public_reference,
+                    &request.project_id,
+                    &request.worktree_id,
+                    &request.task_key,
+                    ApprovalState::Denied,
+                    "restart_reconciliation",
+                    "Decision context unavailable after restart.",
+                    request.profile,
+                    timestamp,
+                )
+                .await?;
+                transaction.commit().await.map_err(|_| CoreError::Storage)?;
+                reconciled += 1;
+            }
+        }
+        Ok(reconciled)
+    }
+
     pub async fn create_run(&self, request: TaskRequest) -> Result<Run, CoreError> {
         self.create_run_for_agent(request, AgentKind::Fake).await
     }
@@ -1569,5 +1899,152 @@ mod tests {
             assert!(hard_denied_action(action));
         }
         assert!(!hard_denied_action("read_repository"));
+    }
+    async fn approval_owner(repository: &RunRepository) -> (ProjectId, WorktreeId) {
+        let project = ProjectId::new();
+        let worktree = WorktreeId::new();
+        sqlx::query("INSERT INTO projects (id,display_name,repository_identity,repository_fingerprint,fingerprint_scheme,repository_root,primary_root,git_common_dir,validation_state,is_primary_worktree,created_at_ms,updated_at_ms,last_validated_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(project.to_string()).bind("test").bind("identity").bind("fingerprint").bind("strong_v1").bind("private").bind("primary").bind("git").bind("valid").bind(0_i64).bind(1_i64).bind(1_i64).bind(1_i64).execute(&repository.pool).await.unwrap();
+        sqlx::query("INSERT INTO managed_worktrees (id,project_id,worktree_path,base_commit,repository_identity,repository_fingerprint,state,created_at_ms,last_validated_at_ms) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(worktree.to_string()).bind(project.to_string()).bind("private-worktree").bind("a".repeat(40)).bind("identity").bind("fingerprint").bind("ready").bind(1_i64).bind(1_i64).execute(&repository.pool).await.unwrap();
+        (project, worktree)
+    }
+    #[tokio::test]
+    async fn approvals_are_owner_scoped_and_decisions_are_audited_atomically() {
+        let repository = RunRepository::open("sqlite::memory:").await.unwrap();
+        let (project, worktree) = approval_owner(&repository).await;
+        let request = repository
+            .create_approval_request(
+                &project,
+                &worktree,
+                "task",
+                ApprovalProfile::Safe,
+                "read_repository",
+                "safe summary",
+            )
+            .await
+            .unwrap();
+        let queue = repository
+            .list_pending_approval_requests_owned(&project, &worktree, "task", None, None)
+            .await
+            .unwrap();
+        assert_eq!(queue, vec![request.clone()]);
+        let wrong = repository
+            .get_approval_request_owned(
+                &project,
+                &worktree,
+                "other",
+                None,
+                None,
+                &request.public_reference,
+            )
+            .await;
+        assert!(matches!(wrong, Err(CoreError::RunContextNotFound)));
+        let resolved = repository
+            .resolve_approval_request(&request, ApprovalDecision::Deny)
+            .await
+            .unwrap();
+        assert_eq!(resolved.state, ApprovalState::Denied);
+        assert!(repository
+            .resolve_approval_request(&request, ApprovalDecision::Deny)
+            .await
+            .is_err());
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM approval_decision_audit WHERE approval_reference=?",
+        )
+        .bind(request.public_reference.as_str())
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1);
+    }
+    #[tokio::test]
+    async fn hard_denied_requests_never_enter_pending_queue() {
+        let repository = RunRepository::open("sqlite::memory:").await.unwrap();
+        let (project, worktree) = approval_owner(&repository).await;
+        let request = repository
+            .create_approval_request(
+                &project,
+                &worktree,
+                "task",
+                ApprovalProfile::Autonomous,
+                "push",
+                "private /Users/marker token=secret",
+            )
+            .await
+            .unwrap();
+        assert_eq!(request.state, ApprovalState::HardDenied);
+        assert!(repository
+            .list_pending_approval_requests_owned(&project, &worktree, "task", None, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repository
+            .resolve_approval_request(&request, ApprovalDecision::AllowOnce)
+            .await
+            .is_err());
+        assert!(!request.summary.contains("secret"));
+        let audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM approval_decision_audit WHERE approval_reference=?",
+        )
+        .bind(request.public_reference.as_str())
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(audits, 1);
+    }
+    #[tokio::test]
+    async fn restart_marks_adapter_bound_pending_requests_unavailable_without_process_reconnection()
+    {
+        let repository = RunRepository::open("sqlite::memory:").await.unwrap();
+        let (project, worktree) = approval_owner(&repository).await;
+        let context = repository
+            .create_codex_run_context(CreateCodexRunContext {
+                project_id: project.clone(),
+                worktree_id: worktree.clone(),
+                task_key: "task".into(),
+            })
+            .await
+            .unwrap();
+        let request = repository
+            .create_approval_request_for_context(
+                &project,
+                &worktree,
+                "task",
+                Some(AgentKind::Codex),
+                Some(&context.public_reference),
+                ApprovalProfile::Safe,
+                "read_repository",
+                "summary",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .reconcile_approval_requests_on_startup()
+                .await
+                .unwrap(),
+            1
+        );
+        let reconciled = repository
+            .get_approval_request_owned(
+                &project,
+                &worktree,
+                "task",
+                Some(AgentKind::Codex),
+                Some(&context.public_reference),
+                &request.public_reference,
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciled.state, ApprovalState::Denied);
+        let source: String = sqlx::query_scalar(
+            "SELECT decision_source FROM approval_decision_audit WHERE approval_reference=?",
+        )
+        .bind(request.public_reference.as_str())
+        .fetch_one(&repository.pool)
+        .await
+        .unwrap();
+        assert_eq!(source, "restart_reconciliation");
     }
 }

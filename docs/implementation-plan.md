@@ -43,7 +43,7 @@ unsupported. It adds no approval/profile/policy behavior; that is Phase 7.
 
 ## Product Controls And Release Work
 
-Desktop UX adds the prompt, search, agent selection, tray state, task details, notifications, keyboard navigation, and autostart. Approval profiles, audit history, deterministic drift findings, and evidence checks follow. Reliability adds persistent logs, restart recovery, interrupted-task detection, process-group cleanup, output limits, rotation, worktree recovery, and migrations.
+Desktop UX adds the prompt, search, agent selection, tray state, task details, notifications, keyboard navigation, and autostart. Phase 7 adds approval profiles and an ownership-bound audit queue only: decisions are recorded, not delivered to a live agent. Runtime delivery, deterministic drift findings, and evidence checks follow in later authorized phases. Reliability adds persistent logs, restart recovery, interrupted-task detection, process-group cleanup, output limits, rotation, worktree recovery, and migrations.
 
 macOS packaging is the first release target: Apple Silicon and Intel/universal builds, menu-bar polish, DMG, signing, notarization, updater, and accessibility checks. Windows and Linux follow only with their platform-specific validation.
 
