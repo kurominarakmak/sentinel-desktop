@@ -531,6 +531,17 @@ const RUN_EVENT: &str = "phase2-run-event";
 #[allow(dead_code)]
 struct TrayState<R: tauri::Runtime>(TrayIcon<R>);
 
+fn codex_tray_title(snapshot: Option<&serde_json::Value>) -> String {
+    let percent = snapshot
+        .and_then(|value| value.get("primary"))
+        .and_then(|window| window.get("usedPercent"))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| (0.0..=100.0).contains(value))
+        .map(|value| format!("{value:.0}%"))
+        .unwrap_or_else(|| "—".into());
+    format!("Codex · {percent}")
+}
+
 #[tauri::command]
 fn spike_diagnostics() -> Diagnostics {
     Diagnostics {
@@ -3359,6 +3370,7 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
             return Err(error);
         }
     };
+    tray.set_title(Some(codex_tray_title(None)))?;
     app.manage(TrayState(tray));
     Ok(())
 }
@@ -3461,6 +3473,9 @@ fn main() {
                         .borrow()
                         .clone()
                         .map(|snapshot| snapshot.0);
+                    if let Some(tray) = usage_app.try_state::<TrayState<tauri::Wry>>() {
+                        let _ = tray.0.set_title(Some(codex_tray_title(payload.as_ref())));
+                    }
                     let _ = usage_app.emit("provider-usage:codex", payload);
                 }
             });
@@ -3566,6 +3581,19 @@ mod bridge_tests {
     use serde_json::json;
     use std::process::{Command, Stdio};
     use tempfile::tempdir;
+
+    #[test]
+    fn codex_tray_title_handles_initial_updated_and_unknown_snapshots() {
+        assert_eq!(codex_tray_title(None), "Codex · —");
+        assert_eq!(
+            codex_tray_title(Some(&serde_json::json!({"primary":{"usedPercent":90}}))),
+            "Codex · 90%"
+        );
+        assert_eq!(
+            codex_tray_title(Some(&serde_json::json!({"primary":{"usedPercent":"bad"}}))),
+            "Codex · —"
+        );
+    }
 
     const B1_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
