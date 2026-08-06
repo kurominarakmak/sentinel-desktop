@@ -1,52 +1,46 @@
 export type ProviderId = "codex" | "claude";
-
+export type UsageWindow = { id: "primary" | "secondary" | "five_hour" | "seven_day"; usedPercent: number; windowDurationMins?: number; resetsAt: string };
 export type ProviderUsage =
-  | { provider: ProviderId; state: "available"; usedPercent: number; remainingPercent: number; source: string }
+  | { provider: ProviderId; state: "available"; windows: UsageWindow[]; source: string }
   | { provider: ProviderId; state: "unavailable"; detail: string }
   | { provider: ProviderId; state: "unknown"; detail: string };
 
-export interface ProviderUsageAdapter {
-  provider: ProviderId;
-  fetch(): Promise<ProviderUsage>;
+export interface ProviderUsageAdapter { provider: ProviderId; fetch(): Promise<ProviderUsage>; }
+type Json = Record<string, unknown>;
+
+const object = (value: unknown): Json | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Json : null;
+const percent = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
+const text = (value: unknown): string | null => typeof value === "string" && value.trim() ? value : null;
+
+function window(id: UsageWindow["id"], value: unknown): UsageWindow | null {
+  const entry = object(value); if (!entry) return null;
+  const usedPercent = percent(entry.usedPercent ?? entry.used_percentage);
+  const resetsAt = text(entry.resetsAt ?? entry.resets_at);
+  if (usedPercent === null || !resetsAt) return null;
+  const duration = entry.windowDurationMins ?? entry.window_duration_mins;
+  return { id, usedPercent, resetsAt, ...(typeof duration === "number" && duration > 0 ? { windowDurationMins: duration } : {}) };
 }
 
-export function parseUsedLimitPercentage(text: string): { usedPercent: number; remainingPercent: number } | null {
-  const match = /\b(?:you(?:'|’)?ve\s+)?used\s+(\d{1,3})%/i.exec(text);
-  if (!match) return null;
-  const usedPercent = Number(match[1]);
-  return Number.isInteger(usedPercent) && usedPercent >= 0 && usedPercent <= 100
-    ? { usedPercent, remainingPercent: 100 - usedPercent }
-    : null;
+export function parseCodexRateLimits(payload: unknown): UsageWindow[] | null {
+  const limits = object(payload)?.rateLimits ?? payload;
+  const record = object(limits); if (!record) return null;
+  const windows = [window("primary", record.primary), window("secondary", record.secondary)].filter((entry): entry is UsageWindow => entry !== null);
+  return windows.length ? windows : null;
 }
 
-function unavailable(provider: ProviderId, detail: string): ProviderUsage {
-  return { provider, state: "unavailable", detail };
+export function parseClaudeStatusLine(payload: unknown): UsageWindow[] | null {
+  const rateLimits = object(payload)?.rate_limits; const record = object(rateLimits); if (!record) return null;
+  const windows = [window("five_hour", record.five_hour), window("seven_day", record.seven_day)].filter((entry): entry is UsageWindow => entry !== null);
+  return windows.length ? windows : null;
 }
 
-// Neither CLI exposes a stable, authenticated local quota/limit API. Do not
-// infer account allowance from transcript token counts or warning text.
-export const codexUsageAdapter: ProviderUsageAdapter = {
-  provider: "codex",
-  async fetch() {
-    return unavailable("codex", "No supported local Codex usage-limit source.");
-  },
-};
+export function codexUsageAdapter(read: () => Promise<unknown>): ProviderUsageAdapter {
+  return { provider: "codex", async fetch() { const windows = parseCodexRateLimits(await read()); return windows ? { provider: "codex", state: "available", windows, source: "Codex App Server account/rateLimits/read" } : { provider: "codex", state: "unavailable", detail: "Codex did not provide rate limits for this account." }; } };
+}
+export function claudeUsageAdapter(read: () => Promise<unknown>): ProviderUsageAdapter {
+  return { provider: "claude", async fetch() { const windows = parseClaudeStatusLine(await read()); return windows ? { provider: "claude", state: "available", windows, source: "Claude Code status-line JSON" } : { provider: "claude", state: "unavailable", detail: "Claude Code did not provide rate limits for this account." }; } };
+}
 
-export const claudeUsageAdapter: ProviderUsageAdapter = {
-  provider: "claude",
-  async fetch() {
-    return unavailable("claude", "No supported local Claude Code usage-limit source.");
-  },
-};
-
-export async function loadProviderUsage(
-  adapters: readonly ProviderUsageAdapter[] = [codexUsageAdapter, claudeUsageAdapter],
-): Promise<ProviderUsage[]> {
-  return Promise.all(adapters.map(async (adapter) => {
-    try {
-      return await adapter.fetch();
-    } catch {
-      return { provider: adapter.provider, state: "unknown", detail: "Usage status could not be retrieved." };
-    }
-  }));
+export async function loadProviderUsage(adapters: readonly ProviderUsageAdapter[]): Promise<ProviderUsage[]> {
+  return Promise.all(adapters.map(async adapter => { try { return await adapter.fetch(); } catch { return { provider: adapter.provider, state: "unknown", detail: "Usage status could not be retrieved." }; } }));
 }
