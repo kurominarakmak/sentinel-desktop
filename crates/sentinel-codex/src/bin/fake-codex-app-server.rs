@@ -44,7 +44,11 @@ fn main() {
             if method == "turn/start" {
                 println!(
                     "{}",
-                    json!({"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"hello"}})
+                    json!({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test"}}})
+                );
+                println!(
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"item-test","type":"agentMessage","text":"hello"}}})
                 );
             }
             let result = match method {

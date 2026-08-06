@@ -65,7 +65,10 @@ async fn app_server_starts_threads_turns_interrupts_and_persists_normalized_even
         .any(|event| matches!(event.kind, EventKind::SessionStarted)));
     assert!(events
         .iter()
-        .any(|event| matches!(event.kind, EventKind::Message)));
+        .any(|event| matches!(event.kind, EventKind::ToolCompleted)));
+    assert!(events.iter().any(|event| {
+        event.payload.get("turn_id").is_some() && event.payload.get("item_id").is_some()
+    }));
     assert!(events
         .iter()
         .any(|event| matches!(event.kind, EventKind::SessionCancelled)));

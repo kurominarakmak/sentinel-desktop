@@ -10,7 +10,7 @@ use sentinel_core::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -140,6 +140,9 @@ pub struct CodexAppServer {
     incoming: mpsc::Receiver<Incoming>,
     next_request_id: u64,
     seen_notifications: HashSet<String>,
+    sessions_by_thread: HashMap<String, SessionId>,
+    pending_turn_thread: Option<String>,
+    buffered_turn_notifications: Vec<Value>,
     repository: RunRepository,
     task_id: TaskId,
     sequence: u64,
@@ -194,6 +197,9 @@ impl CodexAppServer {
             incoming,
             next_request_id: 1,
             seen_notifications: HashSet::new(),
+            sessions_by_thread: HashMap::new(),
+            pending_turn_thread: None,
+            buffered_turn_notifications: Vec::new(),
             repository,
             task_id,
             sequence: 0,
@@ -240,6 +246,8 @@ impl CodexAppServer {
             None,
         )
         .await?;
+        self.sessions_by_thread
+            .insert(thread_id.clone(), session.id.clone());
         Ok(CodexSession {
             session_id: session.id,
             thread_id,
@@ -281,6 +289,8 @@ impl CodexAppServer {
             None,
         )
         .await?;
+        self.sessions_by_thread
+            .insert(thread_id.clone(), session.id.clone());
         Ok(CodexSession {
             session_id: session.id,
             thread_id,
@@ -294,20 +304,34 @@ impl CodexAppServer {
         if prompt.trim().is_empty() || prompt.len() > 8000 || prompt.contains('\0') {
             return Err(CodexError::InvalidInput);
         }
+        self.pending_turn_thread = Some(session.thread_id.clone());
+        self.buffered_turn_notifications.clear();
         let result = self
             .request(
                 "turn/start",
                 json!({"threadId":session.thread_id,"input":[{"type":"text","text":prompt}]}),
             )
-            .await?;
+            .await;
+        let result = match result {
+            Ok(value) => value,
+            Err(error) => {
+                self.clear_turn_buffer();
+                return Err(error);
+            }
+        };
         let turn_id = identifier(&result, &["turn.id", "turn_id", "id"])?;
         self.emit(
             EventKind::ToolStarted,
             Some(session.session_id.clone()),
-            json!({"turn_id":turn_id}),
+            json!({"thread_id":session.thread_id,"turn_id":turn_id,"event":"turn_started"}),
             None,
         )
         .await?;
+        let buffered = std::mem::take(&mut self.buffered_turn_notifications);
+        self.pending_turn_thread = None;
+        for notification in buffered {
+            self.handle_notification(&notification).await?;
+        }
         Ok(CodexTurn { turn_id })
     }
     pub async fn interrupt_turn(
@@ -330,6 +354,7 @@ impl CodexAppServer {
         .await
     }
     pub async fn shutdown(&mut self) -> Result<(), CodexError> {
+        self.clear_turn_buffer();
         let _ = self.stdin.shutdown().await;
         match time::timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
             Ok(Ok(_)) => Ok(()),
@@ -405,6 +430,16 @@ impl CodexAppServer {
             .and_then(Value::as_str)
             .ok_or(CodexError::MalformedMessage)?;
         let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let thread_id = params.get("threadId").and_then(Value::as_str).or_else(|| {
+            params
+                .get("thread")
+                .and_then(|v| v.get("id"))
+                .and_then(Value::as_str)
+        });
+        if self.pending_turn_thread.as_deref() == thread_id && !matches!(method, "turn/started") {
+            self.buffered_turn_notifications.push(value.clone());
+            return Ok(());
+        }
         let provider_id = value
             .get("id")
             .and_then(Value::as_str)
@@ -419,11 +454,13 @@ impl CodexAppServer {
             return Ok(());
         }
         let kind = match method {
+            "turn/started" => EventKind::ToolStarted,
             "item/agentMessage/delta" => EventKind::Message,
             "item/started" | "item/updated" => EventKind::ToolStarted,
             "item/completed" => EventKind::ToolCompleted,
             "thread/updated" => EventKind::FileChanged,
-            "turn/completed" => EventKind::SessionCompleted,
+            // Provider completion is recorded as activity only; it never completes a Sentinel task.
+            "turn/completed" => EventKind::ToolCompleted,
             "turn/failed" => EventKind::SessionFailed,
             "turn/cancelled" => EventKind::SessionCancelled,
             "approval/requested" => EventKind::ApprovalRequested,
@@ -433,11 +470,15 @@ impl CodexAppServer {
         };
         self.emit(
             kind,
-            None,
-            json!({"provider_event_id":provider_id,"method":method,"params":bounded_value(params)}),
+            thread_id.and_then(|id| self.sessions_by_thread.get(id).cloned()),
+            json!({"provider_event_id":provider_id,"method":method,"thread_id":thread_id,"turn_id":params.get("turnId"),"item_id":params.get("item").and_then(|item|item.get("id")),"params":bounded_value(params)}),
             Some(json!({"method":method})),
         )
         .await
+    }
+    fn clear_turn_buffer(&mut self) {
+        self.pending_turn_thread = None;
+        self.buffered_turn_notifications.clear();
     }
     async fn emit(
         &mut self,
