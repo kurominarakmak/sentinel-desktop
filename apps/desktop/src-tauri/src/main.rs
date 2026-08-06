@@ -36,11 +36,12 @@ use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
     tray::{TrayIcon, TrayIconBuilder},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use windowing::{
     should_hide_on_close, tray_action, TrayAction, DEFAULT_GLOBAL_SHORTCUT, PROMPT_WINDOW_LABEL,
+    STATUS_WINDOW_LABEL,
 };
 
 #[cfg(target_os = "macos")]
@@ -3288,6 +3289,22 @@ fn show_prompt(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+fn show_status(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(STATUS_WINDOW_LABEL) {
+        window.show()?;
+        window.unminimize()?;
+        return window.set_focus();
+    }
+    WebviewWindowBuilder::new(app, STATUS_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+        .title("Agent Sentinel Status")
+        .inner_size(320.0, 210.0)
+        .resizable(false)
+        .always_on_top(true)
+        .visible(true)
+        .build()?
+        .set_focus()
+}
+
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     eprintln!("agent-sentinel: tray setup started");
     let icon = match Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
@@ -3301,7 +3318,7 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
         }
     };
     let open = MenuItem::with_id(app, "open-prompt", "Open Prompt", true, None::<&str>)?;
-    let status = MenuItem::with_id(app, "show-status", "Show Spike Status", true, None::<&str>)?;
+    let status = MenuItem::with_id(app, "show-status", "Show Status", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &status, &quit])?;
     let builder = TrayIconBuilder::with_id("spike-tray")
@@ -3309,9 +3326,10 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .tooltip("Agent Sentinel")
         .on_menu_event(|app, event| match tray_action(event.id.as_ref()) {
-            TrayAction::OpenPrompt | TrayAction::ShowSpikeStatus => {
+            TrayAction::OpenPrompt => {
                 let _ = show_prompt(app);
             }
+            TrayAction::ShowStatus => { let _ = show_status(app); }
             TrayAction::Quit => app.exit(0),
             TrayAction::Ignore => {}
         });

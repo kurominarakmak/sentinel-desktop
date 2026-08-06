@@ -1,0 +1,6 @@
+.provider-usage { display: grid; gap: 7px; }
+.provider-usage h2 { margin: 0; }
+.provider-usage-row { align-items: center; display: grid; gap: 7px; grid-template-columns: 18px minmax(86px, 1fr) auto; font-size: 12px; }
+.provider-usage-row img { height: 16px; width: 16px; }
+.provider-usage-row meter { grid-column: 2 / -1; height: 8px; width: 100%; }
+.provider-usage-row small { color: var(--muted); grid-column: 2 / -1; }
