@@ -664,6 +664,26 @@ impl V3Repository {
             .transpose()?
             .ok_or(CoreError::NotFound)
     }
+    /// Looks up an opaque adapter session reference without interpreting it.
+    pub async fn get_session_by_provider_reference(
+        &self,
+        task_id: &TaskId,
+        provider: &str,
+        provider_session_ref: &str,
+    ) -> Result<AgentSession, CoreError> {
+        sqlx::query(
+            "SELECT * FROM v3_sessions WHERE task_id=? AND provider=? AND provider_session_ref=?",
+        )
+        .bind(task_id.to_string())
+        .bind(provider)
+        .bind(provider_session_ref)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| CoreError::Storage)?
+        .map(|row| session_from(&row))
+        .transpose()?
+        .ok_or(CoreError::NotFound)
+    }
     pub async fn transition_session(
         &self,
         session: &AgentSession,
