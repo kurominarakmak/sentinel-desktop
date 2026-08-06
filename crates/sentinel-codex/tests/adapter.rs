@@ -183,6 +183,37 @@ async fn initial_rate_limit_read_and_live_update_are_retained() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn unsupported_versions_payloads_and_provider_methods_remain_safe_diagnostics() {
+    let _guard = fake_server_env_lock();
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "unsupported-version");
+    let (d, r, t) = fixture().await;
+    let p = CodexProgram::from_executable(fake()).unwrap();
+    assert!(matches!(
+        CodexAppServer::start(p, r, t.id, d.path()).await,
+        Err(CodexError::Unsupported)
+    ));
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "unsupported-payload");
+    let (d, _r, _t, mut server) =
+        start_with_scenario("unsupported-payload", CodexTimeouts::default()).await;
+    assert_eq!(
+        server.start_thread(d.path()).await,
+        Err(CodexError::MissingIdentifier)
+    );
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    let (d, r, t, mut server) =
+        start_with_scenario("unsupported-notification", CodexTimeouts::default()).await;
+    server.start_thread(d.path()).await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert!(events.iter().any(|event| matches!(&event.kind, EventKind::Unknown { discriminator } if discriminator == "future/unsupported")));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn child_exit_fans_out_to_one_and_many_pending_requests() {
     let _guard = fake_server_env_lock();
     let (d, _r, _t, mut server) =

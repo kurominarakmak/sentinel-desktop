@@ -165,10 +165,22 @@ fn main() {
                     json!({"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":77,"windowDurationMins":300,"resetsAt":"2026-08-06T13:00:00Z"}}}})
                 );
             }
+            if scenario == "unsupported-notification" && method == "thread/start" {
+                println!(
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"future/unsupported","params":{"threadId":"thread-test","providerId":"future-1"}})
+                );
+            }
             let result = match method {
+                "initialize" if scenario == "unsupported-version" => {
+                    json!({"protocolVersion":"999"})
+                }
                 "initialize" => json!({"protocolVersion":"1"}),
                 "account/rateLimits/read" => {
                     json!({"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":"2026-08-06T12:00:00Z"}}})
+                }
+                "thread/start" | "thread/resume" if scenario == "unsupported-payload" => {
+                    json!({"thread":{}})
                 }
                 "thread/start" | "thread/resume" => json!({"thread":{"id":"thread-test"}}),
                 "turn/start" => json!({"turn":{"id":"turn-test"}}),

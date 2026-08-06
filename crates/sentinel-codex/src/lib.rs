@@ -133,6 +133,8 @@ pub enum CodexError {
     UnexpectedResponse,
     #[error("Codex App Server returned an error")]
     RpcError,
+    #[error("Codex App Server does not support this protocol version or method")]
+    Unsupported,
     #[error("Codex thread or turn identifier is missing")]
     MissingIdentifier,
     #[error("invalid adapter input")]
@@ -307,7 +309,7 @@ impl CodexAppServer {
             rate_limits_tx,
         };
         let initialize = json!({"clientInfo":{"name":"agent-sentinel","title":"Agent Sentinel","version":"3"},"capabilities":{}});
-        if let Err(error) = time::timeout(
+        let initialized = match time::timeout(
             server.timeouts.startup,
             server.request("initialize", initialize),
         )
@@ -315,10 +317,17 @@ impl CodexAppServer {
         .map_err(|_| CodexError::Timeout)
         .and_then(|v| v)
         {
-            let _ = server.shutdown().await;
-            return Err(error);
-        }
+            Ok(value) => value,
+            Err(error) => {
+                let _ = server.shutdown().await;
+                return Err(error);
+            }
+        };
         server.notify("initialized", json!({})).await?;
+        if initialized.get("protocolVersion").and_then(Value::as_str) != Some("1") {
+            let _ = server.shutdown().await;
+            return Err(CodexError::Unsupported);
+        }
         // Unsupported and unavailable accounts must not manufacture a value.
         // A later update remains authoritative if this read races startup.
         let _ = server.read_rate_limits().await;
