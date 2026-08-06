@@ -1,5 +1,11 @@
 # Sentinel V3 Workflow State Machine
 
+**Workflow source of truth for V3.** This document defines V3 task states, transition guards, and final-action boundaries for the product in [V3 product scope](v3-product-scope.md) and the architecture in [V3 target architecture](v3-target-architecture.md). The V1 state-machine and phase documents remain historical records.
+
+## Scope boundary
+
+This is the V3 target state machine. It does not revise the existing V1 `Run` lifecycle or claim that V1's bounded Codex/Claude paths are active production sessions. V3 will migrate through compatible durable projections, preserving V1 task history and keeping the UI non-authoritative. The current tray, global hotkey, floating prompt, and status/settings windows remain presentation surfaces; they request actions and render state but never transition it.
+
 ## Task states
 
 ```mermaid
@@ -47,7 +53,7 @@ stateDiagram-v2
 
 ## Repair and finding disposition
 
-Deterministic failures are blocking by profile configuration. Reviewer findings are initially `reported`; Sentinel validates shape/evidence, then a user or configured deterministic rule marks each `confirmed_blocking`, `non_blocking`, `duplicate`, or `rejected`. Only `confirmed_blocking` findings are sent to the implementer. If the cap is reached, Sentinel stops and exposes the diff, attempts, check artifacts, and findings for human decision; it never retries indefinitely.
+Deterministic failures are blocking by profile configuration. Another model may provide review only through a read-only reviewer session. Its findings are initially `reported`; Sentinel validates shape/evidence, then a user or configured deterministic rule marks each `confirmed_blocking`, `non_blocking`, `duplicate`, or `rejected`. Only `confirmed_blocking` findings are sent to the implementer. If the cap is reached, Sentinel stops and exposes the diff, attempts, check artifacts, and findings for human decision; it never retries indefinitely.
 
 ## Failure, cancellation, and rollback
 

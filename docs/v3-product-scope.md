@@ -1,8 +1,14 @@
 # Sentinel V3 Product Scope
 
+**Product source of truth for V3.** This document defines V3 product scope. [V3 target architecture](v3-target-architecture.md) and [V3 workflow state machine](v3-workflow-state-machine.md) define its architecture and workflow boundaries. Earlier V1 product and phase documents are preserved historical records and do not redefine V3 scope.
+
 ## Product definition
 
 Agent Sentinel is an ambient macOS supervisor for coding agents. It is available over the user's active Safari, VS Code, or other application without taking over their workspace. A user supplies a prompt, selects a repository and workflow, and Sentinel creates an isolated worktree, runs a supported coding agent, verifies and reviews the result, manages a bounded repair loop, and asks a human to approve any consequential final action.
+
+## Existing V1 implementation and preserved foundation
+
+V1 is the current implementation baseline, not the V3 target. It already provides the Tauri + React + Rust application foundation, SQLite-backed core/runtime records, Rust process, Git, and agent-API crates, a fake-agent test path, a macOS tray application, `Command+Shift+Space` global hotkey, a hidden floating prompt window, and status/settings window routes. Current real Codex and Claude Code execution is not a V1 product capability; it remains unavailable/experimental behind bounded interfaces. V3 preserves these working foundations and evolves them without deleting or silently redefining their historical phase contracts.
 
 ## Primary workflow
 
@@ -37,4 +43,4 @@ V3 does not promise a sandbox against a compromised local account, repository, a
 
 ## Deferred capabilities
 
-No cloud service, teams, remote runners, IDE/browser extensions, mobile client, background daemon, automatic PR creation, autonomous commit/merge/push, automatic deletion of unreviewed worktrees, semantic undo, agent-generated permissions, or third-party adapter is included. ACP, OpenCode, Hermes, and quant-development workflows are future optional packs, not V3 dependencies.
+No cloud service, teams, remote runners, IDE/browser extensions, mobile client, background daemon, automatic PR creation, autonomous commit/merge/push, automatic deletion of unreviewed worktrees, semantic undo, agent-generated permissions, or third-party adapter is included. ACP, OpenCode, Gemini CLI, Hermes, and quant-development workflows are future optional packs, not V3 dependencies.

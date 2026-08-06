@@ -1,19 +1,18 @@
 # Agent Sentinel V3 Roadmap
 
-**V3 operational source of truth.** This document and the `docs/v3-*.md` documents define future work. The earlier V1 phase documents remain in the repository as historical implementation records; they are superseded for product scope and must not be silently rewritten or removed.
+## Authority and historical record
 
-## Product outcome
+V3 scope is defined by [V3 product scope](docs/v3-product-scope.md). Its implementation boundaries are defined by [V3 target architecture](docs/v3-target-architecture.md), and its task transitions by [V3 workflow state machine](docs/v3-workflow-state-machine.md). This roadmap orders V3 delivery; it does not redefine product, architecture, or workflow decisions.
 
-Agent Sentinel V3 is an ambient macOS coding-agent supervisor. From Safari, VS Code, or another app, a developer can invoke a prompt, select a repository and workflow, and have Sentinel create an isolated Git worktree, supervise a Codex or Claude Code session, validate and review its work, run bounded repairs, and present the final diff and approval actions. Sentinel—not an agent or the UI—owns task state, permissions, worktrees, validation, and completion decisions.
+The earlier V1 roadmap, architecture, adapter, state-machine, and phase-contract documents remain preserved historical records of the implementation foundation. They are superseded for future V3 planning where they conflict with the three V3 source documents; no V1 code or historical document is removed by this scope migration.
 
-## V3 commitments
+## Current V1 foundation
 
-- Preserve the Tauri + React + Rust foundation and all working V1 behavior.
-- One implementation task maps to one Sentinel task, Git branch, and worktree; the main working tree is protected.
-- Use supported Codex and Claude Code interfaces through native adapters. Hermes is not a core dependency.
-- Persist normalized events, task state, artifacts, approvals, and recovery facts locally.
-- Deterministic checks outrank reviewer opinions. A human must approve commit, merge, push, cleanup that discards work, and other destructive operations.
-- Keep the app ambient: tray-first, global hotkey, floating prompt, attention/status widget, focus restoration, and no unnecessary Dock or Cmd+Tab presence.
+The current repository provides a macOS Tauri 2 + React + Rust application with SQLite persistence; reusable core, runtime, process, Git, and agent-API crates; a fake-agent execution/test path; Git worktree management; a tray app; `Command+Shift+Space` global hotkey; a hidden floating prompt; and status/settings window routes. The existing bounded Codex and Claude records/interfaces are not released as fully available V3 sessions. Existing approvals, drift, evidence, and recovery foundations do not yet provide the complete V3 supervisor workflow.
+
+## Planned V3 capabilities
+
+V3 adds a supervisor-owned durable workflow that maps supported Codex and Claude Code sessions to isolated task worktrees, normalizes events, runs configurable deterministic validation, performs read-only review with strict bounded repair rounds, recovers safely after crashes, and presents human-gated final actions. It evolves the current ambient UI into Quick Prompt, Attention Widget, and Task Detail without making the UI authoritative.
 
 ## Ordered V3 delivery
 
@@ -29,12 +28,12 @@ Agent Sentinel V3 is an ambient macOS coding-agent supervisor. From Safari, VS C
 | 8 | Recovery, security, and license hardening | Restart, permission, artifact redaction, provenance, and license gates pass. |
 | 9 | Final UI redesign | The end-to-end V3 workflow is usable without disrupting the current app. |
 
-Detailed scope, dependencies, validation, rollback, commit boundaries, and deferrals are in [docs/v3-implementation-plan.md](docs/v3-implementation-plan.md).
+Detailed phase scope, dependencies, validation, rollback, commit boundaries, and deferrals are in [V3 implementation plan](docs/v3-implementation-plan.md).
 
-## Explicitly deferred from V3 core
+## Deferred from V3 core
 
-Cloud synchronization, teams, remote execution, automatic pull requests, IDE/browser plugins, mobile clients, background daemon extraction, autonomous commit/merge/push, automatic worktree deletion, LLM-based approval decisions, arbitrary third-party adapter packs, ACP/OpenCode/Hermes adapters, and quant-development workflow packs are deferred. These may become optional packs only after the V3 core is stable.
+Cloud synchronization, teams, remote execution, automatic pull requests, IDE/browser plugins, mobile clients, background-daemon extraction, autonomous commit/merge/push, automatic worktree deletion, LLM-based approval decisions, and third-party adapter packs are deferred. ACP, OpenCode, Gemini CLI, Hermes, and quant-development workflows remain future optional integrations, not V3 core dependencies.
 
 ## Immediate next action
 
-V3 planning and scope migration is complete. Do not begin implementation until a focused Phase 1 design/implementation task is approved against the V3 documents.
+V3 planning is complete and V3 implementation is not started. Begin only Phase 1 after approval of a focused implementation task that follows the V3 source documents.
