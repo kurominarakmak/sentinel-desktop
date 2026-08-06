@@ -45,6 +45,54 @@ fn main() {
             if scenario == "timeout-one" && method != "initialize" && non_initialize_requests == 1 {
                 continue;
             }
+            if method == "thread/start"
+                && matches!(
+                    scenario.as_str(),
+                    "split-frame"
+                        | "multiple-frames"
+                        | "malformed-followed-valid"
+                        | "oversized-followed-valid"
+                )
+            {
+                let response =
+                    json!({"jsonrpc":"2.0","id":id,"result":{"thread":{"id":"thread-test"}}});
+                match scenario.as_str() {
+                    "split-frame" => {
+                        let encoded = response.to_string();
+                        let split = encoded.len() / 2;
+                        output.write_all(encoded[..split].as_bytes()).unwrap();
+                        output.flush().unwrap();
+                        output.write_all(encoded[split..].as_bytes()).unwrap();
+                        output.write_all(b"\n").unwrap();
+                    }
+                    "multiple-frames" => {
+                        output
+                            .write_all(
+                                format!(
+                                    "{}\n{}\n",
+                                    json!({"jsonrpc":"2.0","method":"thread/updated","params":{"threadId":"thread-test","id":"coalesced-notification"}}),
+                                    response
+                                )
+                                .as_bytes(),
+                            )
+                            .unwrap();
+                    }
+                    "malformed-followed-valid" => {
+                        output
+                            .write_all(format!("not-json\n{}\n", response).as_bytes())
+                            .unwrap();
+                    }
+                    "oversized-followed-valid" => {
+                        output.write_all(&vec![b'x'; 16 * 1024 + 32]).unwrap();
+                        output
+                            .write_all(format!("\n{}\n", response).as_bytes())
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                output.flush().unwrap();
+                continue;
+            }
             if scenario == "reverse" && method == "thread/start" {
                 if let Some(first) = deferred.take() {
                     println!(
@@ -73,6 +121,37 @@ fn main() {
                     println!(
                         "{}",
                         json!({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"second"}}})
+                    );
+                }
+                if scenario == "duplicate-notification" {
+                    let notification = json!({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"duplicate-item"}}});
+                    println!("{notification}");
+                    println!("{notification}");
+                }
+                if scenario == "out-of-order-item" {
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"out-of-order"}}})
+                    );
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"item/started","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"out-of-order"}}})
+                    );
+                }
+                if scenario == "late-notification" {
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test"}}})
+                    );
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"late-item"}}})
+                    );
+                }
+                if scenario == "bounded-diagnostic" {
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"item/updated","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"large-item","text":"x".repeat(8 * 1024)}}})
                     );
                 }
                 println!(

@@ -21,7 +21,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
     sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
@@ -163,13 +163,24 @@ struct EventState {
     repository: RunRepository,
     task_id: TaskId,
     sequence: u64,
+    arrival_sequence: u64,
     seen: HashSet<String>,
     sessions: HashMap<String, SessionId>,
     pending_turn: Option<String>,
-    buffered: Vec<Value>,
+    buffered: Vec<BufferedNotification>,
+    completed_turns: HashSet<String>,
+    started_items: HashSet<(String, String)>,
+}
+struct BufferedNotification {
+    value: Value,
+    arrival_sequence: u64,
 }
 enum NotificationCommand {
     Event(Value),
+    Diagnostic {
+        kind: &'static str,
+        frame_bytes: usize,
+    },
     Activate(String),
     Flush {
         thread: String,
@@ -238,10 +249,13 @@ impl CodexAppServer {
             repository,
             task_id,
             sequence: 0,
+            arrival_sequence: 0,
             seen: HashSet::new(),
             sessions: HashMap::new(),
             pending_turn: None,
             buffered: Vec::new(),
+            completed_turns: HashSet::new(),
+            started_items: HashSet::new(),
         }));
         let notification_worker = tokio::spawn(notification_worker(notification_rx, state.clone()));
         let dispatcher = tokio::spawn(dispatch_stdout(stdout, shared.clone()));
@@ -278,6 +292,10 @@ impl CodexAppServer {
     /// Exposed for deterministic transport diagnostics and tests.
     pub async fn pending_request_count(&self) -> usize {
         self.shared.pending.lock().await.len()
+    }
+    /// Exposed for deterministic transport diagnostics and tests.
+    pub async fn correlation_buffer_count(&self) -> usize {
+        self.state.lock().await.buffered.len()
     }
 
     pub async fn start_thread(&self, cwd: &Path) -> Result<CodexSession, CodexError> {
@@ -552,54 +570,105 @@ impl Drop for CodexAppServer {
 }
 
 async fn dispatch_stdout(stdout: tokio::process::ChildStdout, shared: Arc<Shared>) {
-    let mut reader = BufReader::new(stdout);
+    let mut stdout = stdout;
+    let mut chunk = [0_u8; 4096];
+    let mut frame = Vec::new();
+    let mut discarding_oversized_frame = false;
     loop {
-        let mut bytes = Vec::new();
-        match reader.read_until(b'\n', &mut bytes).await {
+        match stdout.read(&mut chunk).await {
             Ok(0) | Err(_) => {
                 complete_all(&shared.pending, CodexError::UnexpectedExit).await;
                 let _ = shared.notifications.send(NotificationCommand::Clear).await;
                 break;
             }
-            Ok(_) if bytes.len() > MAX_JSON_LINE_BYTES => {
-                complete_all(&shared.pending, CodexError::MalformedMessage).await;
-                break;
-            }
-            Ok(_) => match parse_message(&bytes) {
-                Err(error) => {
-                    complete_all(&shared.pending, error).await;
-                    break;
-                }
-                Ok(value) if value.get("method").is_some() => {
-                    if shared
-                        .notifications
-                        .send(NotificationCommand::Event(value))
-                        .await
-                        .is_err()
-                    {
-                        complete_all(&shared.pending, CodexError::UnexpectedExit).await;
-                        break;
-                    }
-                }
-                Ok(value) => {
-                    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+            Ok(read) => {
+                for byte in &chunk[..read] {
+                    if discarding_oversized_frame {
+                        if *byte == b'\n' {
+                            discarding_oversized_frame = false;
+                        }
                         continue;
-                    };
-                    let outcome = if value.get("error").is_some() {
-                        Err(CodexError::RpcError)
+                    }
+                    if *byte == b'\n' {
+                        process_frame(&frame, &shared).await;
+                        frame.clear();
                     } else {
-                        value
-                            .get("result")
-                            .cloned()
-                            .ok_or(CodexError::MalformedMessage)
-                    };
-                    // Remove before completing: response races, duplicates, timeout, exit and shutdown all have one winner.
-                    if let Some(sender) = shared.pending.lock().await.remove(&id) {
-                        let _ = sender.send(outcome);
+                        frame.push(*byte);
+                        if frame.len() > MAX_JSON_LINE_BYTES {
+                            frame.clear();
+                            discarding_oversized_frame = true;
+                            let _ = shared
+                                .notifications
+                                .send(NotificationCommand::Diagnostic {
+                                    kind: "oversized_frame",
+                                    frame_bytes: MAX_JSON_LINE_BYTES + 1,
+                                })
+                                .await;
+                        }
                     }
                 }
-            },
+            }
         }
+    }
+}
+async fn process_frame(frame: &[u8], shared: &Arc<Shared>) {
+    let frame = if frame.last() == Some(&b'\r') {
+        &frame[..frame.len() - 1]
+    } else {
+        frame
+    };
+    if frame.is_empty() {
+        return;
+    }
+    let value = match parse_message(frame) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = shared
+                .notifications
+                .send(NotificationCommand::Diagnostic {
+                    kind: "malformed_frame",
+                    frame_bytes: frame.len(),
+                })
+                .await;
+            return;
+        }
+    };
+    if value.get("method").is_some() {
+        let _ = shared
+            .notifications
+            .send(NotificationCommand::Event(value))
+            .await;
+        return;
+    }
+    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+        let _ = shared
+            .notifications
+            .send(NotificationCommand::Diagnostic {
+                kind: "invalid_frame_shape",
+                frame_bytes: frame.len(),
+            })
+            .await;
+        return;
+    };
+    let outcome = if value.get("error").is_some() {
+        Err(CodexError::RpcError)
+    } else {
+        value
+            .get("result")
+            .cloned()
+            .ok_or(CodexError::MalformedMessage)
+    };
+    // Remove before completing: duplicate or stale responses cannot settle another request.
+    if let Some(sender) = shared.pending.lock().await.remove(&id) {
+        let _ = sender.send(outcome);
+    } else {
+        let _ = shared
+            .notifications
+            .send(NotificationCommand::Diagnostic {
+                kind: "unmatched_response",
+                frame_bytes: frame.len(),
+            })
+            .await;
     }
 }
 async fn watch_child(
@@ -640,7 +709,25 @@ async fn notification_worker(
     while let Some(command) = receiver.recv().await {
         match command {
             NotificationCommand::Event(value) => {
-                let _ = handle_notification(&mut *state.lock().await, &value).await;
+                let mut state = state.lock().await;
+                state.arrival_sequence += 1;
+                let arrival_sequence = state.arrival_sequence;
+                let _ = handle_notification(&mut state, &value, arrival_sequence).await;
+            }
+            NotificationCommand::Diagnostic { kind, frame_bytes } => {
+                let mut state = state.lock().await;
+                state.arrival_sequence += 1;
+                let arrival_sequence = state.arrival_sequence;
+                let _ = emit_state(
+                    &mut state,
+                    EventKind::Unknown {
+                        discriminator: format!("transport/{kind}"),
+                    },
+                    None,
+                    json!({"transport_diagnostic":kind,"arrival_sequence":arrival_sequence,"frame_bytes":frame_bytes.min(MAX_JSON_LINE_BYTES)}),
+                    None,
+                )
+                .await;
             }
             NotificationCommand::Activate(thread) => {
                 let mut state = state.lock().await;
@@ -670,12 +757,16 @@ async fn flush_notifications(state: &mut EventState, thread: &str) -> Result<(),
     } else {
         Vec::new()
     };
-    for value in buffered {
-        handle_notification(state, &value).await?;
+    for notification in buffered {
+        handle_notification(state, &notification.value, notification.arrival_sequence).await?;
     }
     Ok(())
 }
-async fn handle_notification(state: &mut EventState, value: &Value) -> Result<(), CodexError> {
+async fn handle_notification(
+    state: &mut EventState,
+    value: &Value,
+    arrival_sequence: u64,
+) -> Result<(), CodexError> {
     let method = value
         .get("method")
         .and_then(Value::as_str)
@@ -688,21 +779,48 @@ async fn handle_notification(state: &mut EventState, value: &Value) -> Result<()
             .and_then(Value::as_str)
     });
     if state.pending_turn.as_deref() == thread_id && !matches!(method, "turn/started") {
-        state.buffered.push(value.clone());
+        state.buffered.push(BufferedNotification {
+            value: value.clone(),
+            arrival_sequence,
+        });
         return Ok(());
     }
-    let provider_id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            format!(
-                "{method}:{}",
-                serde_json::to_string(&params).unwrap_or_default()
-            )
-        });
-    if !state.seen.insert(provider_id.clone()) {
+    let fingerprint = serde_json::to_string(value).unwrap_or_default();
+    if !state.seen.insert(fingerprint) {
         return Ok(());
+    }
+    let provider_id = provider_notification_id(value, &params, method);
+    let turn_id = notification_turn_id(&params);
+    let item_id = params
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let item_key = turn_id.clone().zip(item_id.clone());
+    let transport_diagnostic = if turn_id
+        .as_ref()
+        .is_some_and(|turn_id| state.completed_turns.contains(turn_id))
+        && method != "turn/completed"
+    {
+        Some("late_notification")
+    } else if method == "item/completed"
+        && item_key
+            .as_ref()
+            .is_some_and(|item| !state.started_items.contains(item))
+    {
+        Some("out_of_order_item_notification")
+    } else {
+        None
+    };
+    if method == "item/started" {
+        if let Some(item) = item_key.clone() {
+            state.started_items.insert(item);
+        }
+    }
+    if method == "turn/completed" {
+        if let Some(turn_id) = &turn_id {
+            state.completed_turns.insert(turn_id.clone());
+        }
     }
     let kind = match method {
         "turn/started" => EventKind::ToolStarted,
@@ -717,7 +835,44 @@ async fn handle_notification(state: &mut EventState, value: &Value) -> Result<()
             discriminator: method.into(),
         },
     };
-    emit_state(state, kind, thread_id.and_then(|id| state.sessions.get(id).cloned()), json!({"provider_event_id":provider_id,"method":method,"thread_id":thread_id,"turn_id":params.get("turnId"),"item_id":params.get("item").and_then(|item|item.get("id")),"params":bounded_value(params)}), Some(json!({"method":method}))).await
+    emit_state(state, kind, thread_id.and_then(|id| state.sessions.get(id).cloned()), json!({"provider_event_id":provider_id,"arrival_sequence":arrival_sequence,"method":method,"thread_id":thread_id,"turn_id":turn_id,"item_id":item_id,"transport_diagnostic":transport_diagnostic,"params":bounded_value(params)}), Some(bounded_value(json!({"method":method,"provider_event_id":provider_id,"arrival_sequence":arrival_sequence,"transport_diagnostic":transport_diagnostic})))).await
+}
+fn provider_notification_id(value: &Value, params: &Value, method: &str) -> String {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("id").and_then(Value::as_str))
+        .or_else(|| {
+            params
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{method}:{}",
+                serde_json::to_string(params).unwrap_or_default()
+            )
+        })
+}
+fn notification_turn_id(params: &Value) -> Option<String> {
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            params
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
 }
 async fn emit_state(
     state: &mut EventState,
@@ -784,8 +939,27 @@ fn bounded_value(value: Value) -> Value {
     if text.len() <= MAX_DIAGNOSTIC_BYTES {
         value
     } else {
-        json!({"truncated":true,"diagnostic":redact(&text[..MAX_DIAGNOSTIC_BYTES])})
+        let diagnostic = redact(truncate_utf8(&text, 512));
+        let bounded = json!({"truncated":true,"diagnostic":diagnostic});
+        if serde_json::to_vec(&bounded)
+            .map(|bytes| bytes.len() <= MAX_DIAGNOSTIC_BYTES)
+            .unwrap_or(false)
+        {
+            bounded
+        } else {
+            json!({"truncated":true,"diagnostic":"diagnostic omitted"})
+        }
     }
+}
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 fn now_ms() -> i64 {
     std::time::SystemTime::now()

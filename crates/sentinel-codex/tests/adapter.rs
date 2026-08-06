@@ -11,6 +11,12 @@ use tempfile::TempDir;
 
 static FAKE_SERVER_ENV: Mutex<()> = Mutex::new(());
 
+fn fake_server_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    FAKE_SERVER_ENV
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 fn url(dir: &TempDir) -> String {
     format!("sqlite://{}", dir.path().join("db.sqlite").display())
 }
@@ -50,7 +56,7 @@ async fn detects_a_supported_explicit_executable_and_missing_file() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn app_server_starts_threads_turns_interrupts_and_persists_normalized_events() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let _guard = fake_server_env_lock();
     let (d, r, t) = fixture().await;
     let p = CodexProgram::from_executable(fake()).unwrap();
     let mut s = CodexAppServer::start(p, r.clone(), t.id.clone(), d.path())
@@ -85,14 +91,19 @@ async fn app_server_starts_threads_turns_interrupts_and_persists_normalized_even
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn malformed_protocol_fails_closed() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
-    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "malformed");
-    let (d, r, t) = fixture().await;
-    let p = CodexProgram::from_executable(fake()).unwrap();
-    let result = CodexAppServer::start(p, r, t.id, d.path()).await;
+async fn malformed_frame_isolated_from_following_valid_response() {
+    let _guard = fake_server_env_lock();
+    let (d, r, t, mut server) =
+        start_with_scenario("malformed-followed-valid", CodexTimeouts::default()).await;
+    server.start_thread(d.path()).await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert!(events.iter().any(|event| {
+        matches!(&event.kind, EventKind::Unknown { discriminator } if discriminator == "transport/malformed_frame")
+    }));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
     std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
-    assert!(matches!(result, Err(CodexError::MalformedMessage)));
 }
 
 async fn start_with_scenario(
@@ -116,7 +127,7 @@ async fn start_with_scenario(
 
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_requests_are_dispatched_by_id_when_responses_are_reversed() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let _guard = fake_server_env_lock();
     let (d, _r, _t, mut server) = start_with_scenario("reverse", CodexTimeouts::default()).await;
     let (first, second) =
         tokio::join!(server.start_thread(d.path()), server.start_thread(d.path()));
@@ -129,7 +140,7 @@ async fn concurrent_requests_are_dispatched_by_id_when_responses_are_reversed() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn one_timeout_does_not_complete_another_request() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let _guard = fake_server_env_lock();
     let timeouts = CodexTimeouts {
         request: Duration::from_millis(50),
         ..CodexTimeouts::default()
@@ -150,7 +161,7 @@ async fn one_timeout_does_not_complete_another_request() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn child_exit_fans_out_to_one_and_many_pending_requests() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let _guard = fake_server_env_lock();
     let (d, _r, _t, mut server) =
         start_with_scenario("exit-during-request", CodexTimeouts::default()).await;
     assert_eq!(
@@ -173,7 +184,7 @@ async fn child_exit_fans_out_to_one_and_many_pending_requests() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn duplicate_response_is_ignored_after_remove_before_complete() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let _guard = fake_server_env_lock();
     let (d, _r, _t, mut server) =
         start_with_scenario("duplicate-response", CodexTimeouts::default()).await;
     assert_eq!(
@@ -187,7 +198,7 @@ async fn duplicate_response_is_ignored_after_remove_before_complete() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn notification_worker_preserves_provider_order_and_shutdown_reaps_tasks() {
-    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let _guard = fake_server_env_lock();
     let (d, r, t, mut server) =
         start_with_scenario("notification-order", CodexTimeouts::default()).await;
     let session = server.start_thread(d.path()).await.unwrap();
@@ -205,5 +216,143 @@ async fn notification_worker_preserves_provider_order_and_shutdown_reaps_tasks()
     assert!(first < second);
     server.shutdown().await.unwrap();
     assert_eq!(server.pending_request_count().await, 0);
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn jsonl_frames_survive_split_and_coalesced_writes() {
+    let _guard = fake_server_env_lock();
+    let (d, _r, _t, mut server) =
+        start_with_scenario("split-frame", CodexTimeouts::default()).await;
+    assert_eq!(
+        server.start_thread(d.path()).await.unwrap().thread_id,
+        "thread-test"
+    );
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+
+    let (d, r, t, mut server) =
+        start_with_scenario("multiple-frames", CodexTimeouts::default()).await;
+    server.start_thread(d.path()).await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert!(events.iter().any(|event| {
+        event
+            .payload
+            .get("provider_event_id")
+            .and_then(|id| id.as_str())
+            == Some("coalesced-notification")
+            && event
+                .payload
+                .get("arrival_sequence")
+                .and_then(|sequence| sequence.as_u64())
+                == Some(1)
+    }));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_frame_isolated_from_following_valid_response() {
+    let _guard = fake_server_env_lock();
+    let (d, r, t, mut server) =
+        start_with_scenario("oversized-followed-valid", CodexTimeouts::default()).await;
+    server.start_thread(d.path()).await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert!(events.iter().any(|event| {
+        matches!(&event.kind, EventKind::Unknown { discriminator } if discriminator == "transport/oversized_frame")
+    }));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_notifications_are_idempotent_and_order_anomalies_are_diagnostic() {
+    let _guard = fake_server_env_lock();
+    let (d, r, t, mut server) =
+        start_with_scenario("duplicate-notification", CodexTimeouts::default()).await;
+    let session = server.start_thread(d.path()).await.unwrap();
+    server.start_turn(&session, "dedupe").await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| event.payload.get("item_id").and_then(|id| id.as_str())
+                    == Some("duplicate-item")
+            )
+            .count(),
+        1
+    );
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+
+    let (d, r, t, mut server) =
+        start_with_scenario("late-notification", CodexTimeouts::default()).await;
+    let session = server.start_thread(d.path()).await.unwrap();
+    server.start_turn(&session, "late").await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert!(events.iter().any(|event| event
+        .payload
+        .get("transport_diagnostic")
+        .and_then(|value| value.as_str())
+        == Some("late_notification")));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+
+    let (d, r, t, mut server) =
+        start_with_scenario("out-of-order-item", CodexTimeouts::default()).await;
+    let session = server.start_thread(d.path()).await.unwrap();
+    server.start_turn(&session, "out of order").await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    assert!(events.iter().any(|event| event
+        .payload
+        .get("transport_diagnostic")
+        .and_then(|value| value.as_str())
+        == Some("out_of_order_item_notification")));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn diagnostic_payloads_are_bounded() {
+    let _guard = fake_server_env_lock();
+    let (d, r, t, mut server) =
+        start_with_scenario("bounded-diagnostic", CodexTimeouts::default()).await;
+    let session = server.start_thread(d.path()).await.unwrap();
+    server.start_turn(&session, "bounded").await.unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    let event = events
+        .iter()
+        .find(|event| event.payload.get("item_id").and_then(|id| id.as_str()) == Some("large-item"))
+        .unwrap();
+    assert!(event
+        .payload
+        .get("params")
+        .and_then(|params| params.get("truncated"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false));
+    assert!(
+        serde_json::to_vec(&event.payload).unwrap().len() <= sentinel_codex::MAX_DIAGNOSTIC_BYTES
+    );
+    assert!(event
+        .raw_diagnostic_payload
+        .as_ref()
+        .map(|raw| serde_json::to_vec(raw).unwrap().len() <= sentinel_codex::MAX_DIAGNOSTIC_BYTES)
+        .unwrap_or(true));
+    assert_eq!(server.pending_request_count().await, 0);
+    assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
     std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
 }

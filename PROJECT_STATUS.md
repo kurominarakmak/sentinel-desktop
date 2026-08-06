@@ -18,7 +18,7 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 
 ### PARTIAL
 
-- Codex App Server has an isolated native JSON-RPC transport with a locked child writer, one stdout dispatcher, bounded request registry, ordered notification worker, exit fan-out, and deterministic shutdown. It remains a PARTIAL Phase 2 adapter: malformed-frame recovery, capability negotiation, production protocol-fixture breadth, and operational/recovery hardening remain before enablement.
+- Codex App Server has an isolated native JSON-RPC transport with a locked child writer, one stdout dispatcher, bounded request registry, ordered notification worker, exit fan-out, deterministic shutdown, and bounded/recoverable JSONL frame handling. It remains a PARTIAL Phase 2 adapter: Phase 2D still needs capability negotiation, real-Codex smoke validation, broader version/protocol fixtures, and operational restart/reconciliation hardening before enablement.
 - Codex has bounded structured-execution/App Server feasibility interfaces, but not a supported V3 session lifecycle.
 - Claude Code has bounded stream/session records and fixtures, but not a supported V3 session lifecycle.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
