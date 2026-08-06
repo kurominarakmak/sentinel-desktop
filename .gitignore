@@ -5,3 +5,4 @@
 /apps/desktop/src-tauri/binaries/
 /target/
 /.DS_Store
+/.sentinel/local.toml

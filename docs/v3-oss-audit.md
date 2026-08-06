@@ -6,6 +6,25 @@ This is a source-selection audit, not implementation. On 2026-08-06, each reques
 
 Sentinel remains the only owner of task/workflow state, provider-session mapping, worktrees, permission decisions, validation, repair bounds, and completion. Provider adapters translate supported interfaces; the UI only renders state and requests user actions.
 
+## Local OSS research directory
+
+The V3 donor checkouts stay outside this repository and are read-only research
+inputs. Resolve their location in this order:
+
+```text
+SENTINEL_V3_OSS_DIR environment variable
+→ .sentinel/local.toml
+→ ../sentinel-v3-oss fallback
+```
+
+Copy `.sentinel/local.example.toml` to `.sentinel/local.toml` only for a
+machine-specific override; the local file is ignored and must not be committed.
+Validate the checkout without modifying it with:
+
+```sh
+scripts/validate-oss-research-dir.sh
+```
+
 ## Repository findings
 
 | Repository @ inspected HEAD | License; language/framework | Relevant inspected source | Capability and ownership observations | Reuse classification; risk |
