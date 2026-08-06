@@ -1,7 +1,7 @@
 //! Supported Codex App Server transport owned by the Sentinel supervisor.
 //!
-//! This crate owns only one child it started. It never changes workflow state,
-//! grants approvals, or uses transcript text as a completion signal.
+//! The transport has one owner for each direction: a locked writer owns child
+//! stdin and one dispatcher owns stdout.  Requests never read stdout directly.
 
 use sentinel_core::{
     redact,
@@ -13,19 +13,25 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::mpsc,
+    sync::{mpsc, oneshot, Mutex},
+    task::JoinHandle,
     time,
 };
 
 pub const PROVIDER: &str = "openai.codex.app_server";
 pub const MAX_JSON_LINE_BYTES: usize = 16 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+pub const MAX_PENDING_REQUESTS: usize = 64;
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -75,7 +81,6 @@ impl CodexProgram {
         &self.executable
     }
 }
-
 pub async fn detect_installation(executable: impl Into<PathBuf>) -> CodexInstallation {
     let executable = executable.into();
     if !executable.is_file() {
@@ -112,7 +117,7 @@ pub async fn detect_installation(executable: impl Into<PathBuf>) -> CodexInstall
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CodexError {
     #[error("Codex executable is missing or not a regular file")]
     MissingExecutable,
@@ -132,10 +137,11 @@ pub enum CodexError {
     MissingIdentifier,
     #[error("invalid adapter input")]
     InvalidInput,
+    #[error("too many in-flight Codex requests")]
+    RequestCapacity,
     #[error("persistence failure")]
     Storage,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexSession {
     pub session_id: SessionId,
@@ -146,25 +152,49 @@ pub struct CodexTurn {
     pub turn_id: String,
 }
 
-enum Incoming {
-    Line(Vec<u8>),
-    Closed,
+type Pending = HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>;
+struct Shared {
+    stdin: Mutex<ChildStdin>,
+    pending: Mutex<Pending>,
+    next_id: AtomicU64,
+    notifications: mpsc::Sender<NotificationCommand>,
+}
+struct EventState {
+    repository: RunRepository,
+    task_id: TaskId,
+    sequence: u64,
+    seen: HashSet<String>,
+    sessions: HashMap<String, SessionId>,
+    pending_turn: Option<String>,
+    buffered: Vec<Value>,
+}
+enum NotificationCommand {
+    Event(Value),
+    Activate(String),
+    Flush {
+        thread: String,
+        done: oneshot::Sender<Result<(), CodexError>>,
+    },
+    Clear,
+    Stop(oneshot::Sender<()>),
+}
+enum ExitCommand {
+    Shutdown {
+        timeout: Duration,
+        done: oneshot::Sender<Result<(), CodexError>>,
+    },
 }
 
 /// A direct JSONL connection to exactly one child started by this object.
 pub struct CodexAppServer {
-    child: Child,
-    stdin: ChildStdin,
-    incoming: mpsc::Receiver<Incoming>,
-    next_request_id: u64,
-    seen_notifications: HashSet<String>,
-    sessions_by_thread: HashMap<String, SessionId>,
-    pending_turn_thread: Option<String>,
-    buffered_turn_notifications: Vec<Value>,
-    repository: RunRepository,
-    task_id: TaskId,
-    sequence: u64,
+    shared: Arc<Shared>,
+    state: Arc<Mutex<EventState>>,
+    exit: mpsc::Sender<ExitCommand>,
+    dispatcher: Option<JoinHandle<()>>,
+    notification_worker: Option<JoinHandle<()>>,
+    exit_watcher: Option<JoinHandle<()>>,
     timeouts: CodexTimeouts,
+    pid: Option<u32>,
 }
 
 impl CodexAppServer {
@@ -194,44 +224,38 @@ impl CodexAppServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         let mut child = command.spawn().map_err(|_| CodexError::StartFailed)?;
+        let pid = child.id();
         let stdin = child.stdin.take().ok_or(CodexError::StartFailed)?;
         let stdout = child.stdout.take().ok_or(CodexError::StartFailed)?;
-        let (sender, incoming) = mpsc::channel(64);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            loop {
-                let mut bytes = Vec::new();
-                match reader.read_until(b'\n', &mut bytes).await {
-                    Ok(0) => {
-                        let _ = sender.send(Incoming::Closed).await;
-                        break;
-                    }
-                    Ok(_) if bytes.len() > MAX_JSON_LINE_BYTES => {
-                        let _ = sender.send(Incoming::Line(Vec::new())).await;
-                    }
-                    Ok(_) => {
-                        let _ = sender.send(Incoming::Line(bytes)).await;
-                    }
-                    Err(_) => {
-                        let _ = sender.send(Incoming::Closed).await;
-                        break;
-                    }
-                }
-            }
+        let (notification_tx, notification_rx) = mpsc::channel(128);
+        let shared = Arc::new(Shared {
+            stdin: Mutex::new(stdin),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            notifications: notification_tx.clone(),
         });
-        let mut server = Self {
-            child,
-            stdin,
-            incoming,
-            next_request_id: 1,
-            seen_notifications: HashSet::new(),
-            sessions_by_thread: HashMap::new(),
-            pending_turn_thread: None,
-            buffered_turn_notifications: Vec::new(),
+        let state = Arc::new(Mutex::new(EventState {
             repository,
             task_id,
             sequence: 0,
+            seen: HashSet::new(),
+            sessions: HashMap::new(),
+            pending_turn: None,
+            buffered: Vec::new(),
+        }));
+        let notification_worker = tokio::spawn(notification_worker(notification_rx, state.clone()));
+        let dispatcher = tokio::spawn(dispatch_stdout(stdout, shared.clone()));
+        let (exit_tx, exit_rx) = mpsc::channel(1);
+        let exit_watcher = tokio::spawn(watch_child(child, exit_rx, shared.clone()));
+        let mut server = Self {
+            shared,
+            state,
+            exit: exit_tx,
+            dispatcher: Some(dispatcher),
+            notification_worker: Some(notification_worker),
+            exit_watcher: Some(exit_watcher),
             timeouts,
+            pid,
         };
         let initialize = json!({"clientInfo":{"name":"agent-sentinel","title":"Agent Sentinel","version":"3"},"capabilities":{}});
         if let Err(error) = time::timeout(
@@ -240,76 +264,73 @@ impl CodexAppServer {
         )
         .await
         .map_err(|_| CodexError::Timeout)
-        .and_then(|value| value)
+        .and_then(|v| v)
         {
-            let _ = server.cleanup_owned_child().await;
+            let _ = server.shutdown().await;
             return Err(error);
         }
         server.notify("initialized", json!({})).await?;
         Ok(server)
     }
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.pid
     }
-    pub async fn start_thread(&mut self, cwd: &Path) -> Result<CodexSession, CodexError> {
-        let result = self.request("thread/start", json!({"cwd": cwd})).await?;
-        let thread_id = identifier(&result, &["thread.id", "thread_id", "id"])?;
-        let session = match self
-            .repository
-            .v3()
-            .get_session_by_provider_reference(&self.task_id, PROVIDER, &thread_id)
+    /// Exposed for deterministic transport diagnostics and tests.
+    pub async fn pending_request_count(&self) -> usize {
+        self.shared.pending.lock().await.len()
+    }
+
+    pub async fn start_thread(&self, cwd: &Path) -> Result<CodexSession, CodexError> {
+        let result = self.request("thread/start", json!({"cwd":cwd})).await?;
+        self.session_from_result(result, EventKind::SessionStarted)
             .await
-        {
-            Ok(session) => session,
-            Err(CoreError::NotFound) => self
-                .repository
-                .v3()
-                .create_session(
-                    CreateSession {
-                        task_id: self.task_id.clone(),
-                        provider: PROVIDER.into(),
-                        provider_session_ref: thread_id.clone(),
-                    },
-                    now_ms(),
-                )
-                .await
-                .map_err(|_| CodexError::Storage)?,
-            Err(_) => return Err(CodexError::Storage),
-        };
-        self.emit(
-            EventKind::SessionStarted,
-            Some(session.id.clone()),
-            json!({"thread_id":thread_id}),
-            None,
-        )
-        .await?;
-        self.sessions_by_thread
-            .insert(thread_id.clone(), session.id.clone());
-        Ok(CodexSession {
-            session_id: session.id,
-            thread_id,
-        })
     }
-    pub async fn resume_thread(&mut self, thread_id: &str) -> Result<CodexSession, CodexError> {
+    pub async fn resume_thread(&self, thread_id: &str) -> Result<CodexSession, CodexError> {
         valid_id(thread_id)?;
         let result = self
             .request("thread/resume", json!({"threadId":thread_id}))
             .await?;
-        let thread_id = identifier(&result, &["thread.id", "thread_id", "id"])
-            .unwrap_or_else(|_| thread_id.into());
-        let session = match self
-            .repository
+        self.session_from_result_with_fallback(result, thread_id, EventKind::SessionResumed)
+            .await
+    }
+    async fn session_from_result(
+        &self,
+        result: Value,
+        kind: EventKind,
+    ) -> Result<CodexSession, CodexError> {
+        let thread = identifier(&result, &["thread.id", "thread_id", "id"])?;
+        self.session_for_thread(thread, kind).await
+    }
+    async fn session_from_result_with_fallback(
+        &self,
+        result: Value,
+        fallback: &str,
+        kind: EventKind,
+    ) -> Result<CodexSession, CodexError> {
+        let thread = identifier(&result, &["thread.id", "thread_id", "id"])
+            .unwrap_or_else(|_| fallback.into());
+        self.session_for_thread(thread, kind).await
+    }
+    async fn session_for_thread(
+        &self,
+        thread_id: String,
+        kind: EventKind,
+    ) -> Result<CodexSession, CodexError> {
+        let (repository, task_id) = {
+            let state = self.state.lock().await;
+            (state.repository.clone(), state.task_id.clone())
+        };
+        let session = match repository
             .v3()
-            .get_session_by_provider_reference(&self.task_id, PROVIDER, &thread_id)
+            .get_session_by_provider_reference(&task_id, PROVIDER, &thread_id)
             .await
         {
-            Ok(session) => session,
-            Err(CoreError::NotFound) => self
-                .repository
+            Ok(s) => s,
+            Err(CoreError::NotFound) => repository
                 .v3()
                 .create_session(
                     CreateSession {
-                        task_id: self.task_id.clone(),
+                        task_id,
                         provider: PROVIDER.into(),
                         provider_session_ref: thread_id.clone(),
                     },
@@ -320,13 +341,16 @@ impl CodexAppServer {
             Err(_) => return Err(CodexError::Storage),
         };
         self.emit(
-            EventKind::SessionResumed,
+            kind,
             Some(session.id.clone()),
             json!({"thread_id":thread_id}),
             None,
         )
         .await?;
-        self.sessions_by_thread
+        self.state
+            .lock()
+            .await
+            .sessions
             .insert(thread_id.clone(), session.id.clone());
         Ok(CodexSession {
             session_id: session.id,
@@ -334,15 +358,18 @@ impl CodexAppServer {
         })
     }
     pub async fn start_turn(
-        &mut self,
+        &self,
         session: &CodexSession,
         prompt: &str,
     ) -> Result<CodexTurn, CodexError> {
         if prompt.trim().is_empty() || prompt.len() > 8000 || prompt.contains('\0') {
             return Err(CodexError::InvalidInput);
         }
-        self.pending_turn_thread = Some(session.thread_id.clone());
-        self.buffered_turn_notifications.clear();
+        self.shared
+            .notifications
+            .send(NotificationCommand::Activate(session.thread_id.clone()))
+            .await
+            .map_err(|_| CodexError::UnexpectedExit)?;
         let result = self
             .request(
                 "turn/start",
@@ -350,13 +377,19 @@ impl CodexAppServer {
             )
             .await;
         let result = match result {
-            Ok(value) => value,
-            Err(error) => {
-                self.clear_turn_buffer();
-                return Err(error);
+            Ok(v) => v,
+            Err(e) => {
+                self.clear_turn().await;
+                return Err(e);
             }
         };
-        let turn_id = identifier(&result, &["turn.id", "turn_id", "id"])?;
+        let turn_id = match identifier(&result, &["turn.id", "turn_id", "id"]) {
+            Ok(v) => v,
+            Err(e) => {
+                self.clear_turn().await;
+                return Err(e);
+            }
+        };
         self.emit(
             EventKind::ToolStarted,
             Some(session.session_id.clone()),
@@ -364,20 +397,25 @@ impl CodexAppServer {
             None,
         )
         .await?;
-        let buffered = std::mem::take(&mut self.buffered_turn_notifications);
-        self.pending_turn_thread = None;
-        for notification in buffered {
-            self.handle_notification(&notification).await?;
-        }
+        let (done_tx, done_rx) = oneshot::channel();
+        self.shared
+            .notifications
+            .send(NotificationCommand::Flush {
+                thread: session.thread_id.clone(),
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| CodexError::UnexpectedExit)?;
+        done_rx.await.map_err(|_| CodexError::UnexpectedExit)??;
         Ok(CodexTurn { turn_id })
     }
     pub async fn interrupt_turn(
-        &mut self,
+        &self,
         session: &CodexSession,
         turn: &CodexTurn,
     ) -> Result<(), CodexError> {
         valid_id(&turn.turn_id)?;
-        let interrupt = time::timeout(
+        time::timeout(
             self.timeouts.interrupt,
             self.request(
                 "turn/interrupt",
@@ -385,8 +423,7 @@ impl CodexAppServer {
             ),
         )
         .await
-        .map_err(|_| CodexError::Timeout)?;
-        interrupt?;
+        .map_err(|_| CodexError::Timeout)??;
         self.emit(
             EventKind::SessionCancelled,
             Some(session.session_id.clone()),
@@ -396,171 +433,319 @@ impl CodexAppServer {
         .await
     }
     pub async fn shutdown(&mut self) -> Result<(), CodexError> {
-        self.clear_turn_buffer();
-        let _ = self.stdin.shutdown().await;
-        self.clear_turn_buffer();
-        match time::timeout(self.timeouts.shutdown, self.child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(_)) => Err(CodexError::UnexpectedExit),
-            Err(_) => {
-                self.child
-                    .kill()
-                    .await
-                    .map_err(|_| CodexError::UnexpectedExit)?;
-                Ok(())
-            }
+        self.clear_turn().await;
+        let (done_tx, done_rx) = oneshot::channel();
+        let _ = self
+            .exit
+            .send(ExitCommand::Shutdown {
+                timeout: self.timeouts.shutdown,
+                done: done_tx,
+            })
+            .await;
+        let result = done_rx.await.unwrap_or(Err(CodexError::UnexpectedExit));
+        if let Some(task) = self.exit_watcher.take() {
+            let _ = task.await;
         }
+        if let Some(task) = self.dispatcher.take() {
+            let _ = task.await;
+        }
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let _ = self
+            .shared
+            .notifications
+            .send(NotificationCommand::Stop(stop_tx))
+            .await;
+        let _ = stop_rx.await;
+        if let Some(task) = self.notification_worker.take() {
+            let _ = task.await;
+        }
+        result
     }
-    async fn notify(&mut self, method: &str, params: Value) -> Result<(), CodexError> {
+    async fn clear_turn(&self) {
+        let _ = self
+            .shared
+            .notifications
+            .send(NotificationCommand::Clear)
+            .await;
+    }
+    async fn notify(&self, method: &str, params: Value) -> Result<(), CodexError> {
         self.write(json!({"jsonrpc":"2.0","method":method,"params":params}))
             .await
     }
-    async fn request(&mut self, method: &str, params: Value) -> Result<Value, CodexError> {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
-            .await?;
-        let deadline = time::Instant::now() + self.timeouts.request;
-        loop {
-            let remaining = deadline
-                .checked_duration_since(time::Instant::now())
-                .ok_or(CodexError::Timeout)?;
-            let incoming = time::timeout(remaining, self.incoming.recv())
-                .await
-                .map_err(|_| CodexError::Timeout)?
-                .ok_or(CodexError::UnexpectedExit)?;
-            let value = match incoming {
-                Incoming::Closed => return Err(CodexError::UnexpectedExit),
-                Incoming::Line(bytes) => parse_message(&bytes)?,
-            };
-            if value.get("method").is_some() {
-                self.handle_notification(&value).await?;
-                continue;
+    async fn request(&self, method: &str, params: Value) -> Result<Value, CodexError> {
+        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.shared.pending.lock().await;
+            if pending.len() >= MAX_PENDING_REQUESTS {
+                return Err(CodexError::RequestCapacity);
             }
-            if value.get("id").and_then(Value::as_u64) != Some(id) {
-                return Err(CodexError::UnexpectedResponse);
+            pending.insert(id, tx);
+        }
+        if let Err(error) = self
+            .write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+            .await
+        {
+            self.shared.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        match time::timeout(self.timeouts.request, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(CodexError::UnexpectedExit),
+            Err(_) => {
+                self.shared.pending.lock().await.remove(&id);
+                Err(CodexError::Timeout)
             }
-            if value.get("error").is_some() {
-                return Err(CodexError::RpcError);
-            }
-            return value
-                .get("result")
-                .cloned()
-                .ok_or(CodexError::MalformedMessage);
         }
     }
-    async fn cleanup_owned_child(&mut self) -> Result<(), CodexError> {
-        self.clear_turn_buffer();
-        let _ = self.stdin.shutdown().await;
-        if self.child.id().is_some() {
-            self.child
-                .kill()
-                .await
-                .map_err(|_| CodexError::UnexpectedExit)?;
-        }
-        Ok(())
-    }
-    async fn write(&mut self, value: Value) -> Result<(), CodexError> {
+    async fn write(&self, value: Value) -> Result<(), CodexError> {
         let encoded = serde_json::to_vec(&value).map_err(|_| CodexError::MalformedMessage)?;
         if encoded.len() > MAX_JSON_LINE_BYTES {
             return Err(CodexError::InvalidInput);
         }
-        self.stdin
+        let mut stdin = self.shared.stdin.lock().await;
+        stdin
             .write_all(&encoded)
             .await
             .map_err(|_| CodexError::UnexpectedExit)?;
-        self.stdin
+        stdin
             .write_all(b"\n")
             .await
             .map_err(|_| CodexError::UnexpectedExit)?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|_| CodexError::UnexpectedExit)
-    }
-    async fn handle_notification(&mut self, value: &Value) -> Result<(), CodexError> {
-        let method = value
-            .get("method")
-            .and_then(Value::as_str)
-            .ok_or(CodexError::MalformedMessage)?;
-        let params = value.get("params").cloned().unwrap_or(Value::Null);
-        let thread_id = params.get("threadId").and_then(Value::as_str).or_else(|| {
-            params
-                .get("thread")
-                .and_then(|v| v.get("id"))
-                .and_then(Value::as_str)
-        });
-        if self.pending_turn_thread.as_deref() == thread_id && !matches!(method, "turn/started") {
-            self.buffered_turn_notifications.push(value.clone());
-            return Ok(());
-        }
-        let provider_id = value
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "{method}:{}",
-                    serde_json::to_string(&params).unwrap_or_default()
-                )
-            });
-        if !self.seen_notifications.insert(provider_id.clone()) {
-            return Ok(());
-        }
-        let kind = match method {
-            "turn/started" => EventKind::ToolStarted,
-            "item/agentMessage/delta" => EventKind::Message,
-            "item/started" | "item/updated" => EventKind::ToolStarted,
-            "item/completed" => EventKind::ToolCompleted,
-            "thread/updated" => EventKind::FileChanged,
-            // Provider completion is recorded as activity only; it never completes a Sentinel task.
-            "turn/completed" => EventKind::ToolCompleted,
-            "turn/failed" => EventKind::SessionFailed,
-            "turn/cancelled" => EventKind::SessionCancelled,
-            "approval/requested" => EventKind::ApprovalRequested,
-            _ => EventKind::Unknown {
-                discriminator: method.into(),
-            },
-        };
-        self.emit(
-            kind,
-            thread_id.and_then(|id| self.sessions_by_thread.get(id).cloned()),
-            json!({"provider_event_id":provider_id,"method":method,"thread_id":thread_id,"turn_id":params.get("turnId"),"item_id":params.get("item").and_then(|item|item.get("id")),"params":bounded_value(params)}),
-            Some(json!({"method":method})),
-        )
-        .await
-    }
-    fn clear_turn_buffer(&mut self) {
-        self.pending_turn_thread = None;
-        self.buffered_turn_notifications.clear();
+        stdin.flush().await.map_err(|_| CodexError::UnexpectedExit)
     }
     async fn emit(
-        &mut self,
+        &self,
         kind: EventKind,
         session_id: Option<SessionId>,
         payload: Value,
         raw: Option<Value>,
     ) -> Result<(), CodexError> {
-        self.sequence += 1;
-        self.repository
-            .v3()
-            .append_event(&NormalizedEventEnvelope {
-                event_id: EventId::new(),
-                task_id: self.task_id.clone(),
-                session_id,
-                provider: PROVIDER.into(),
-                kind,
-                schema_version: 1,
-                occurred_at_ms: now_ms(),
-                sequence_number: self.sequence,
-                causation_id: None,
-                correlation_id: None,
-                payload: bounded_value(payload),
-                raw_diagnostic_payload: raw.map(bounded_value),
-            })
-            .await
-            .map_err(|_| CodexError::Storage)
+        emit_state(
+            &mut *self.state.lock().await,
+            kind,
+            session_id,
+            payload,
+            raw,
+        )
+        .await
     }
+}
+impl Drop for CodexAppServer {
+    fn drop(&mut self) {
+        // `Child` does not kill on drop. Hand shutdown to its sole owner before
+        // detaching; the completion receiver can be dropped safely.
+        let (done, _) = oneshot::channel();
+        let _ = self.exit.try_send(ExitCommand::Shutdown {
+            timeout: self.timeouts.shutdown,
+            done,
+        });
+        if let Some(task) = self.dispatcher.take() {
+            task.abort();
+        }
+        if let Some(task) = self.notification_worker.take() {
+            task.abort();
+        }
+        // Keep the watcher alive: it owns and reaps the child.
+        let _ = self.exit_watcher.take();
+    }
+}
+
+async fn dispatch_stdout(stdout: tokio::process::ChildStdout, shared: Arc<Shared>) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut bytes = Vec::new();
+        match reader.read_until(b'\n', &mut bytes).await {
+            Ok(0) | Err(_) => {
+                complete_all(&shared.pending, CodexError::UnexpectedExit).await;
+                let _ = shared.notifications.send(NotificationCommand::Clear).await;
+                break;
+            }
+            Ok(_) if bytes.len() > MAX_JSON_LINE_BYTES => {
+                complete_all(&shared.pending, CodexError::MalformedMessage).await;
+                break;
+            }
+            Ok(_) => match parse_message(&bytes) {
+                Err(error) => {
+                    complete_all(&shared.pending, error).await;
+                    break;
+                }
+                Ok(value) if value.get("method").is_some() => {
+                    if shared
+                        .notifications
+                        .send(NotificationCommand::Event(value))
+                        .await
+                        .is_err()
+                    {
+                        complete_all(&shared.pending, CodexError::UnexpectedExit).await;
+                        break;
+                    }
+                }
+                Ok(value) => {
+                    let Some(id) = value.get("id").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let outcome = if value.get("error").is_some() {
+                        Err(CodexError::RpcError)
+                    } else {
+                        value
+                            .get("result")
+                            .cloned()
+                            .ok_or(CodexError::MalformedMessage)
+                    };
+                    // Remove before completing: response races, duplicates, timeout, exit and shutdown all have one winner.
+                    if let Some(sender) = shared.pending.lock().await.remove(&id) {
+                        let _ = sender.send(outcome);
+                    }
+                }
+            },
+        }
+    }
+}
+async fn watch_child(
+    mut child: Child,
+    mut commands: mpsc::Receiver<ExitCommand>,
+    shared: Arc<Shared>,
+) {
+    let result = tokio::select! {
+        status = child.wait() => status.map(|_| ()).map_err(|_| CodexError::UnexpectedExit),
+        command = commands.recv() => match command {
+            Some(ExitCommand::Shutdown { timeout, done }) => {
+                let _ = shared.stdin.lock().await.shutdown().await;
+                let outcome = match time::timeout(timeout, child.wait()).await { Ok(Ok(_)) => Ok(()), Ok(Err(_)) => Err(CodexError::UnexpectedExit), Err(_) => match child.kill().await { Ok(()) => child.wait().await.map(|_| ()).map_err(|_| CodexError::UnexpectedExit), Err(_) => Err(CodexError::UnexpectedExit) } };
+                let _ = done.send(outcome.clone()); outcome
+            }
+            None => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(CodexError::UnexpectedExit)
+            }
+        }
+    };
+    complete_all(&shared.pending, CodexError::UnexpectedExit).await;
+    let _ = shared.notifications.send(NotificationCommand::Clear).await;
+    let _ = result;
+}
+async fn complete_all(pending: &Mutex<Pending>, error: CodexError) {
+    let drained = std::mem::take(&mut *pending.lock().await);
+    for (_, sender) in drained {
+        let _ = sender.send(Err(error.clone()));
+    }
+}
+
+async fn notification_worker(
+    mut receiver: mpsc::Receiver<NotificationCommand>,
+    state: Arc<Mutex<EventState>>,
+) {
+    while let Some(command) = receiver.recv().await {
+        match command {
+            NotificationCommand::Event(value) => {
+                let _ = handle_notification(&mut *state.lock().await, &value).await;
+            }
+            NotificationCommand::Activate(thread) => {
+                let mut state = state.lock().await;
+                state.pending_turn = Some(thread);
+                state.buffered.clear();
+            }
+            NotificationCommand::Flush { thread, done } => {
+                let result = flush_notifications(&mut *state.lock().await, &thread).await;
+                let _ = done.send(result);
+            }
+            NotificationCommand::Clear => {
+                let mut state = state.lock().await;
+                state.pending_turn = None;
+                state.buffered.clear();
+            }
+            NotificationCommand::Stop(done) => {
+                let _ = done.send(());
+                break;
+            }
+        }
+    }
+}
+async fn flush_notifications(state: &mut EventState, thread: &str) -> Result<(), CodexError> {
+    let buffered = if state.pending_turn.as_deref() == Some(thread) {
+        state.pending_turn = None;
+        std::mem::take(&mut state.buffered)
+    } else {
+        Vec::new()
+    };
+    for value in buffered {
+        handle_notification(state, &value).await?;
+    }
+    Ok(())
+}
+async fn handle_notification(state: &mut EventState, value: &Value) -> Result<(), CodexError> {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or(CodexError::MalformedMessage)?;
+    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let thread_id = params.get("threadId").and_then(Value::as_str).or_else(|| {
+        params
+            .get("thread")
+            .and_then(|v| v.get("id"))
+            .and_then(Value::as_str)
+    });
+    if state.pending_turn.as_deref() == thread_id && !matches!(method, "turn/started") {
+        state.buffered.push(value.clone());
+        return Ok(());
+    }
+    let provider_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "{method}:{}",
+                serde_json::to_string(&params).unwrap_or_default()
+            )
+        });
+    if !state.seen.insert(provider_id.clone()) {
+        return Ok(());
+    }
+    let kind = match method {
+        "turn/started" => EventKind::ToolStarted,
+        "item/agentMessage/delta" => EventKind::Message,
+        "item/started" | "item/updated" => EventKind::ToolStarted,
+        "item/completed" | "turn/completed" => EventKind::ToolCompleted,
+        "thread/updated" => EventKind::FileChanged,
+        "turn/failed" => EventKind::SessionFailed,
+        "turn/cancelled" => EventKind::SessionCancelled,
+        "approval/requested" => EventKind::ApprovalRequested,
+        _ => EventKind::Unknown {
+            discriminator: method.into(),
+        },
+    };
+    emit_state(state, kind, thread_id.and_then(|id| state.sessions.get(id).cloned()), json!({"provider_event_id":provider_id,"method":method,"thread_id":thread_id,"turn_id":params.get("turnId"),"item_id":params.get("item").and_then(|item|item.get("id")),"params":bounded_value(params)}), Some(json!({"method":method}))).await
+}
+async fn emit_state(
+    state: &mut EventState,
+    kind: EventKind,
+    session_id: Option<SessionId>,
+    payload: Value,
+    raw: Option<Value>,
+) -> Result<(), CodexError> {
+    state.sequence += 1;
+    state
+        .repository
+        .v3()
+        .append_event(&NormalizedEventEnvelope {
+            event_id: EventId::new(),
+            task_id: state.task_id.clone(),
+            session_id,
+            provider: PROVIDER.into(),
+            kind,
+            schema_version: 1,
+            occurred_at_ms: now_ms(),
+            sequence_number: state.sequence,
+            causation_id: None,
+            correlation_id: None,
+            payload: bounded_value(payload),
+            raw_diagnostic_payload: raw.map(bounded_value),
+        })
+        .await
+        .map_err(|_| CodexError::Storage)
 }
 
 fn parse_message(bytes: &[u8]) -> Result<Value, CodexError> {

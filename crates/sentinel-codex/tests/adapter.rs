@@ -1,11 +1,12 @@
 use sentinel_codex::{
-    detect_installation, CodexAppServer, CodexError, CodexInstallation, CodexProgram,
+    detect_installation, CodexAppServer, CodexError, CodexInstallation, CodexProgram, CodexTimeouts,
 };
 use sentinel_core::{
     v3::{CreateTask, EventKind},
     RunRepository,
 };
 use std::sync::Mutex;
+use std::time::Duration;
 use tempfile::TempDir;
 
 static FAKE_SERVER_ENV: Mutex<()> = Mutex::new(());
@@ -92,4 +93,117 @@ async fn malformed_protocol_fails_closed() {
     let result = CodexAppServer::start(p, r, t.id, d.path()).await;
     std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
     assert!(matches!(result, Err(CodexError::MalformedMessage)));
+}
+
+async fn start_with_scenario(
+    scenario: &str,
+    timeouts: CodexTimeouts,
+) -> (
+    TempDir,
+    RunRepository,
+    sentinel_core::v3::Task,
+    CodexAppServer,
+) {
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", scenario);
+    let (d, r, t) = fixture().await;
+    let p = CodexProgram::from_executable(fake()).unwrap();
+    let server =
+        CodexAppServer::start_with_timeouts(p, r.clone(), t.id.clone(), d.path(), timeouts)
+            .await
+            .unwrap();
+    (d, r, t, server)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_requests_are_dispatched_by_id_when_responses_are_reversed() {
+    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let (d, _r, _t, mut server) = start_with_scenario("reverse", CodexTimeouts::default()).await;
+    let (first, second) =
+        tokio::join!(server.start_thread(d.path()), server.start_thread(d.path()));
+    assert_eq!(first.unwrap().thread_id, "thread-first");
+    assert_eq!(second.unwrap().thread_id, "thread-second");
+    assert_eq!(server.pending_request_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_timeout_does_not_complete_another_request() {
+    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let timeouts = CodexTimeouts {
+        request: Duration::from_millis(50),
+        ..CodexTimeouts::default()
+    };
+    let (d, _r, _t, mut server) = start_with_scenario("timeout-one", timeouts).await;
+    assert_eq!(
+        server.start_thread(d.path()).await,
+        Err(CodexError::Timeout)
+    );
+    assert_eq!(
+        server.start_thread(d.path()).await.unwrap().thread_id,
+        "thread-test"
+    );
+    assert_eq!(server.pending_request_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn child_exit_fans_out_to_one_and_many_pending_requests() {
+    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let (d, _r, _t, mut server) =
+        start_with_scenario("exit-during-request", CodexTimeouts::default()).await;
+    assert_eq!(
+        server.start_thread(d.path()).await,
+        Err(CodexError::UnexpectedExit)
+    );
+    assert_eq!(server.pending_request_count().await, 0);
+    let _ = server.shutdown().await;
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+
+    let (d, _r, _t, mut server) =
+        start_with_scenario("exit-during-request", CodexTimeouts::default()).await;
+    let (one, two) = tokio::join!(server.start_thread(d.path()), server.start_thread(d.path()));
+    assert_eq!(one, Err(CodexError::UnexpectedExit));
+    assert_eq!(two, Err(CodexError::UnexpectedExit));
+    assert_eq!(server.pending_request_count().await, 0);
+    let _ = server.shutdown().await;
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_response_is_ignored_after_remove_before_complete() {
+    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let (d, _r, _t, mut server) =
+        start_with_scenario("duplicate-response", CodexTimeouts::default()).await;
+    assert_eq!(
+        server.start_thread(d.path()).await.unwrap().thread_id,
+        "thread-test"
+    );
+    assert_eq!(server.pending_request_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn notification_worker_preserves_provider_order_and_shutdown_reaps_tasks() {
+    let _guard = FAKE_SERVER_ENV.lock().unwrap();
+    let (d, r, t, mut server) =
+        start_with_scenario("notification-order", CodexTimeouts::default()).await;
+    let session = server.start_thread(d.path()).await.unwrap();
+    server
+        .start_turn(&session, "ordered notifications")
+        .await
+        .unwrap();
+    let events = r.v3().list_events(&t.id).await.unwrap();
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.payload.get("item_id").and_then(|id| id.as_str()))
+        .collect();
+    let first = ids.iter().position(|id| *id == "first").unwrap();
+    let second = ids.iter().position(|id| *id == "second").unwrap();
+    assert!(first < second);
+    server.shutdown().await.unwrap();
+    assert_eq!(server.pending_request_count().await, 0);
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
 }
