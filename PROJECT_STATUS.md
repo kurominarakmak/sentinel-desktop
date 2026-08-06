@@ -1,39 +1,25 @@
 # Agent Sentinel Project Status
 
-Agent Sentinel is an open-source, local-first desktop application for supervising Codex and Claude Code tasks in isolated Git worktrees, with explicit approvals, deterministic drift detection, and evidence-based completion.
+**Current program: Sentinel V3 planning complete; implementation not started.**
 
-**Current phase: Phase 10 — COMPLETE / CLEAN. Phase 11 is NOT STARTED.**
+The repository contains working V1 foundations: a macOS Tauri 2 / React desktop shell with tray and global shortcut support; Rust crates for core state/storage, runtime/process supervision, agent APIs, Git worktrees, and fake-agent testing; SQLite migrations; and a substantial automated test suite. Existing uncommitted desktop changes were present before this documentation migration and are intentionally untouched.
 
-## Documentation Navigation
+## Scope status
 
-- [Operational implementation roadmap](PLAN.md)
-- [Contributor implementation plan](docs/implementation-plan.md)
-- [Product requirements](docs/product-requirements.md)
-- [Architecture](docs/architecture.md)
-- [Agent adapter contract](docs/agent-adapter-contract.md)
-- [Security model](docs/security-model.md) and [threat model](docs/threat-model.md)
-- [Contributing](docs/contributing.md)
+V1 phase contracts and documentation are preserved as historical records. Their previous MVP/phase sequencing is superseded by the V3 scope documents below; V1 code remains the migration base and is not deprecated for removal by this change.
 
-Dedicated files under `docs/` are authoritative for their technical domains.
+## V3 documentation navigation
 
-## Immediate Next Action
+- [V3 operational roadmap](PLAN.md)
+- [V3 product scope](docs/v3-product-scope.md)
+- [V3 target architecture](docs/v3-target-architecture.md)
+- [V3 implementation plan](docs/v3-implementation-plan.md)
+- [V3 workflow state machine](docs/v3-workflow-state-machine.md)
+- [V3 OSS integration plan](docs/v3-oss-integration-plan.md)
+- [V3 license policy](docs/v3-license-policy.md)
 
-Phase 1 established the verified Rust workspace, Tauri 2 desktop shell, React/TypeScript/Vite frontend, local validation scripts, non-interactive CI, and the dependency boundary that keeps reusable crates independent from Tauri.
+The prior [architecture](docs/architecture.md), [adapter contract](docs/agent-adapter-contract.md), and phase execution contracts describe the implemented V1 foundation. Where they conflict with V3 future scope, the V3 documents govern new work.
 
-Phase 2A completed the typed run domain, validated state machine, and SQLite persistence layer.
+## Next action
 
-Phase 2B completed the Tauri-independent fake-agent runtime, ordered event persistence, live event bus, process-group cancellation, storage-failure cleanup, and deterministic terminal-outcome resolution.
-
-Phase 2C1 is **COMPLETE**: it delivered the typed Tauri desktop bridge, trusted fake-agent sidecar preparation and resolution, safe command DTOs, live-event forwarding with SQLite replay and lag recovery, and temporary Phase 0 frontend compatibility.
-
-Phase 2C2 is **COMPLETE**: it delivered typed React/Tauri bridge integration; fake-run submission and history; live/persisted event reconciliation; lifecycle and terminal freshness protection; runtime-authoritative cancellation capability with RunId-scoped cancellation operations; scoped loading, error, and retry states; runtime-environment readiness; safe allowlisted event presentation; focus/listener lifecycle handling; error-boundary/bootstrap fallback; and comprehensive race/integration tests. Final evidence: 92 frontend tests passed, 76 Rust workspace tests passed in the final full Rust validation, frontend production and Tauri no-bundle builds passed, `cargo fmt --all --check` passed, workspace Clippy with warnings denied passed, and final review found no remaining P1/P2 issues.
-
-Phase 2C3 is **COMPLETE**: manual macOS Tauri desktop acceptance verified success, failure, delayed child-process cancellation, burst/replay ordering, malformed/incomplete protocol handling, SQLite persistence across restart, detached persisted-run capability, and Escape/reopen focus preservation.
-
-Phase 2 is **COMPLETE**. Its exit criterion is satisfied: a deterministic fake task traverses the desktop UI, typed Tauri bridge, Rust orchestrator and state machine, SQLite persistence, live/persisted event recovery, history, terminal handling, and cancellation.
-
-Phase 3–7 remain **COMPLETE / CLEAN** at their checkpoint tags. Phase 8 is **COMPLETE / CLEAN** under [its authoritative execution contract](docs/phase-8-authoritative-execution-contract.md): its fixed DG001/DG002 Drift Guardian catalog produces bounded, deterministic, factually explained, read-only findings over authoritative managed state. Phase 9 Evidence Gate is **COMPLETE / CLEAN** under its [authoritative execution contract](docs/phase-9-authoritative-execution-contract.md). Its fixed EG001 baseline evaluator is deterministic, ephemeral, read-only, and does not treat an agent claim as completion evidence. Phase 10 Reliability is **COMPLETE / CLEAN** under its [authoritative execution contract](docs/phase-10-authoritative-execution-contract.md): restart preserves persisted history and reliability failures fail closed without silent managed-worktree deletion. Phase 11 is **NOT STARTED**. Runtime approval delivery is not implemented. App Server remains unavailable/experimental, automatic worktree removal remains disabled, notifications and autostart remain unavailable, and direct-child containment remains the only claim.
-
-Phase 0 Codex validation remains **PASS**. Claude Code remains **DEFERRED**, not failed; cross-agent validation is incomplete. See the preserved [Phase 0 feasibility report](docs/spikes/phase-0-feasibility.md).
-
-Interactive macOS end-to-end verification completed through the real desktop application. Real Codex and Claude execution remain disabled; Phase 0 Codex validation remains feasibility-only and Claude remains deferred.
+Begin only V3 Phase 1: unify the durable task model and normalized events without changing active V1 user behavior. No real Codex/Claude integration, third-party source import, or UI redesign is authorized by the planning migration.
