@@ -30,6 +30,24 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodexTimeouts {
+    pub startup: Duration,
+    pub request: Duration,
+    pub interrupt: Duration,
+    pub shutdown: Duration,
+}
+impl Default for CodexTimeouts {
+    fn default() -> Self {
+        Self {
+            startup: START_TIMEOUT,
+            request: REQUEST_TIMEOUT,
+            interrupt: REQUEST_TIMEOUT,
+            shutdown: SHUTDOWN_TIMEOUT,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodexInstallation {
     Available {
@@ -146,6 +164,7 @@ pub struct CodexAppServer {
     repository: RunRepository,
     task_id: TaskId,
     sequence: u64,
+    timeouts: CodexTimeouts,
 }
 
 impl CodexAppServer {
@@ -154,6 +173,15 @@ impl CodexAppServer {
         repository: RunRepository,
         task_id: TaskId,
         cwd: &Path,
+    ) -> Result<Self, CodexError> {
+        Self::start_with_timeouts(program, repository, task_id, cwd, CodexTimeouts::default()).await
+    }
+    pub async fn start_with_timeouts(
+        program: CodexProgram,
+        repository: RunRepository,
+        task_id: TaskId,
+        cwd: &Path,
+        timeouts: CodexTimeouts,
     ) -> Result<Self, CodexError> {
         if !cwd.is_dir() {
             return Err(CodexError::InvalidInput);
@@ -203,11 +231,20 @@ impl CodexAppServer {
             repository,
             task_id,
             sequence: 0,
+            timeouts,
         };
         let initialize = json!({"clientInfo":{"name":"agent-sentinel","title":"Agent Sentinel","version":"3"},"capabilities":{}});
-        time::timeout(START_TIMEOUT, server.request("initialize", initialize))
-            .await
-            .map_err(|_| CodexError::Timeout)??;
+        if let Err(error) = time::timeout(
+            server.timeouts.startup,
+            server.request("initialize", initialize),
+        )
+        .await
+        .map_err(|_| CodexError::Timeout)
+        .and_then(|value| value)
+        {
+            let _ = server.cleanup_owned_child().await;
+            return Err(error);
+        }
         server.notify("initialized", json!({})).await?;
         Ok(server)
     }
@@ -340,11 +377,16 @@ impl CodexAppServer {
         turn: &CodexTurn,
     ) -> Result<(), CodexError> {
         valid_id(&turn.turn_id)?;
-        self.request(
-            "turn/interrupt",
-            json!({"threadId":session.thread_id,"turnId":turn.turn_id}),
+        let interrupt = time::timeout(
+            self.timeouts.interrupt,
+            self.request(
+                "turn/interrupt",
+                json!({"threadId":session.thread_id,"turnId":turn.turn_id}),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| CodexError::Timeout)?;
+        interrupt?;
         self.emit(
             EventKind::SessionCancelled,
             Some(session.session_id.clone()),
@@ -356,7 +398,8 @@ impl CodexAppServer {
     pub async fn shutdown(&mut self) -> Result<(), CodexError> {
         self.clear_turn_buffer();
         let _ = self.stdin.shutdown().await;
-        match time::timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await {
+        self.clear_turn_buffer();
+        match time::timeout(self.timeouts.shutdown, self.child.wait()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(_)) => Err(CodexError::UnexpectedExit),
             Err(_) => {
@@ -377,7 +420,7 @@ impl CodexAppServer {
         self.next_request_id += 1;
         self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
-        let deadline = time::Instant::now() + REQUEST_TIMEOUT;
+        let deadline = time::Instant::now() + self.timeouts.request;
         loop {
             let remaining = deadline
                 .checked_duration_since(time::Instant::now())
@@ -405,6 +448,17 @@ impl CodexAppServer {
                 .cloned()
                 .ok_or(CodexError::MalformedMessage);
         }
+    }
+    async fn cleanup_owned_child(&mut self) -> Result<(), CodexError> {
+        self.clear_turn_buffer();
+        let _ = self.stdin.shutdown().await;
+        if self.child.id().is_some() {
+            self.child
+                .kill()
+                .await
+                .map_err(|_| CodexError::UnexpectedExit)?;
+        }
+        Ok(())
     }
     async fn write(&mut self, value: Value) -> Result<(), CodexError> {
         let encoded = serde_json::to_vec(&value).map_err(|_| CodexError::MalformedMessage)?;
