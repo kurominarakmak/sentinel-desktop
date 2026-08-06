@@ -8,6 +8,9 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 
 ### PRESENT
 
+- V3 Phase 1 durable foundation in `sentinel-core`: provider-neutral task state, explicit transition guards, append-only normalized events, and additive SQLite migration `0010_v3_workflow_foundation.sql`.
+- Durable opaque provider-session metadata, approvals, validation results, review findings, repair rounds, and artifact metadata. The Rust repository is the only write authority exposed by this phase.
+- V3 restart posture: unfinished non-draft tasks restore as `Recovering` with `NoLiveProcessAssumed`; active sessions become `RecoveryRequired`. Completion is never inferred from a missing external process, and V1 rows remain intact.
 - macOS Tauri 2 + React + Rust application foundation with SQLite persistence.
 - Reusable `sentinel-core`, `sentinel-runtime`, `sentinel-process`, `sentinel-git`, and `sentinel-agent-api` crates, plus fake-agent fixtures and tests.
 - Tray application, `Command+Shift+Space` global hotkey, hidden floating prompt, and status/settings window routes.
@@ -22,7 +25,6 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 
 ### PLANNED
 
-- V3 durable workflow aggregate and versioned normalized event model.
 - Supported Codex and Claude Code adapters with start, stream, cancel, resume/reconcile, and recovery capability reporting.
 - Supervisor-owned worktree transaction lifecycle; configurable build/lint/test profiles; read-only review; confirmed-blocker repair loops; and human-gated final actions.
 - Attention Widget, focus restoration, complete Task Detail, security/recovery/provenance hardening, and final UI redesign.
@@ -38,4 +40,4 @@ Existing uncommitted desktop changes were present before this documentation reco
 
 ## Next action
 
-No V3 implementation has started. The next authorized implementation task is Phase 1 of [PLAN.md](PLAN.md): establish the durable task and normalized-event model without changing active V1 user behavior.
+Phase 1 of [PLAN.md](PLAN.md) is complete. The next authorized implementation task is Phase 2 only: add a supported Codex adapter that feeds the supervisor-owned V3 store without changing active V1 user behavior. No later V3 phase has started.

@@ -18,7 +18,7 @@ V3 adds a supervisor-owned durable workflow that maps supported Codex and Claude
 
 | Phase | Outcome | Exit criterion |
 | --- | --- | --- |
-| 1 | Unified event and durable task model | Versioned events, replay, state transitions, and crash recovery pass contract tests. |
+| 1 | Unified event and durable task model | **Complete.** Versioned events, replay, state transitions, additive SQLite migration, and fail-closed restart recovery pass contract tests. |
 | 2 | Native Codex adapter | Supported Codex interface starts, streams, cancels, resumes/recoverably reconciles, and passes adapter fixtures. |
 | 3 | Native Claude Code adapter | Supported Claude Code CLI/session interface meets the same bounded contract. |
 | 4 | Worktree task transactions | Create/diff/merge/discard/rollback/cleanup are ownership-bound and protect the main tree. |
@@ -34,6 +34,8 @@ Detailed phase scope, dependencies, validation, rollback, commit boundaries, and
 
 Cloud synchronization, teams, remote execution, automatic pull requests, IDE/browser plugins, mobile clients, background-daemon extraction, autonomous commit/merge/push, automatic worktree deletion, LLM-based approval decisions, and third-party adapter packs are deferred. ACP, OpenCode, Gemini CLI, Hermes, and quant-development workflows remain future optional integrations, not V3 core dependencies.
 
-## Immediate next action
+## Current implementation position
 
-V3 planning is complete and V3 implementation is not started. Begin only Phase 1 after approval of a focused implementation task that follows the V3 source documents.
+Phase 1 is implemented in `sentinel-core` only. It adds a provider-neutral V3 task aggregate, append-only normalized event envelopes, session/approval/validation/finding/repair/artifact records, and additive SQLite persistence. Restart reconciliation marks unfinished non-draft tasks `Recovering` and active sessions `RecoveryRequired`; it never assumes that an external agent process survived or infers completion. The React UI and provider adapters remain non-authoritative and unchanged.
+
+Only Phase 2 may begin next, after focused authorization: a supported Codex adapter that supplies normalized events to the Phase 1 supervisor store. No later phase has started.

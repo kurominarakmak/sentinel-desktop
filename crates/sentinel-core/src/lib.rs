@@ -12,6 +12,8 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod v3;
+
 pub const RUN_SCHEMA_VERSION: u16 = 1;
 pub const EVENT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_TASK_BYTES: usize = 8_000;
@@ -638,6 +640,14 @@ pub enum CoreError {
     RunContextNotFound,
     #[error("run context state or version conflict")]
     RunContextConflict,
+    #[error("invalid v3 record")]
+    InvalidV3Record,
+    #[error("invalid v3 state transition: {0}")]
+    V3InvalidTransition(String),
+    #[error("v3 record version or event sequence conflict")]
+    V3Conflict,
+    #[error("corrupt v3 stored state")]
+    CorruptV3State,
     #[error(transparent)]
     Transition(#[from] TransitionError),
     #[error("storage error")]
@@ -1012,6 +1022,13 @@ impl RunRepository {
             journal_mode,
             busy_timeout_ms,
         })
+    }
+
+    /// Returns the V3 supervisor-owned workflow store. The desktop UI and
+    /// provider adapters receive projections from a supervisor, never this
+    /// write-capable repository directly.
+    pub fn v3(&self) -> v3::V3Repository {
+        v3::V3Repository::new(self.pool.clone())
     }
     pub async fn register_project(
         &self,
