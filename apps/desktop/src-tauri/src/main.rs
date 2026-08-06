@@ -5358,6 +5358,11 @@ mod bridge_tests {
                 FakeAgentProgram::from_executable(executable).expect("test executable program"),
             ),
             codex_exec_available: false,
+            codex_usage: codex_usage::CodexUsageManager::new(
+                None,
+                repository.clone(),
+                worktree_root.clone(),
+            ),
             repository,
             database_path,
             forwarders: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
