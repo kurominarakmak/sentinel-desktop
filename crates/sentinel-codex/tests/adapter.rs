@@ -160,6 +160,29 @@ async fn one_timeout_does_not_complete_another_request() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn initial_rate_limit_read_and_live_update_are_retained() {
+    let _guard = fake_server_env_lock();
+    let (d, _r, _t, mut server) =
+        start_with_scenario("rate-limit-update", CodexTimeouts::default()).await;
+    assert_eq!(
+        server.latest_rate_limits().unwrap().0["primary"]["usedPercent"],
+        42
+    );
+    let mut updates = server.subscribe_rate_limits();
+    server.start_thread(d.path()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), updates.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        server.latest_rate_limits().unwrap().0["primary"]["usedPercent"],
+        77
+    );
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn child_exit_fans_out_to_one_and_many_pending_requests() {
     let _guard = fake_server_env_lock();
     let (d, _r, _t, mut server) =

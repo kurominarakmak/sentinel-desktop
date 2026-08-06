@@ -23,7 +23,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     task::JoinHandle,
     time,
 };
@@ -152,12 +152,39 @@ pub struct CodexTurn {
     pub turn_id: String,
 }
 
+/// The supported account-rate-limit payload, retained verbatim only after its
+/// two documented windows have passed basic shape validation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodexRateLimits(pub Value);
+
+fn rate_limits(value: &Value) -> Option<CodexRateLimits> {
+    let limits = value.get("rateLimits").unwrap_or(value);
+    let object = limits.as_object()?;
+    let valid_window = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_object)
+            .is_some_and(|window| {
+                window
+                    .get("usedPercent")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|used| (0.0..=100.0).contains(&used))
+                    && window
+                        .get("resetsAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reset| !reset.is_empty())
+            })
+    };
+    (valid_window("primary") || valid_window("secondary")).then(|| CodexRateLimits(limits.clone()))
+}
+
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, CodexError>>>;
 struct Shared {
     stdin: Mutex<ChildStdin>,
     pending: Mutex<Pending>,
     next_id: AtomicU64,
     notifications: mpsc::Sender<NotificationCommand>,
+    alive: std::sync::atomic::AtomicBool,
 }
 struct EventState {
     repository: RunRepository,
@@ -170,6 +197,7 @@ struct EventState {
     buffered: Vec<BufferedNotification>,
     completed_turns: HashSet<String>,
     started_items: HashSet<(String, String)>,
+    rate_limits: watch::Sender<Option<CodexRateLimits>>,
 }
 struct BufferedNotification {
     value: Value,
@@ -206,6 +234,8 @@ pub struct CodexAppServer {
     exit_watcher: Option<JoinHandle<()>>,
     timeouts: CodexTimeouts,
     pid: Option<u32>,
+    rate_limits: watch::Receiver<Option<CodexRateLimits>>,
+    rate_limits_tx: watch::Sender<Option<CodexRateLimits>>,
 }
 
 impl CodexAppServer {
@@ -244,7 +274,9 @@ impl CodexAppServer {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             notifications: notification_tx.clone(),
+            alive: std::sync::atomic::AtomicBool::new(true),
         });
+        let (rate_limits_tx, rate_limits_rx) = watch::channel(None);
         let state = Arc::new(Mutex::new(EventState {
             repository,
             task_id,
@@ -256,6 +288,7 @@ impl CodexAppServer {
             buffered: Vec::new(),
             completed_turns: HashSet::new(),
             started_items: HashSet::new(),
+            rate_limits: rate_limits_tx.clone(),
         }));
         let notification_worker = tokio::spawn(notification_worker(notification_rx, state.clone()));
         let dispatcher = tokio::spawn(dispatch_stdout(stdout, shared.clone()));
@@ -270,6 +303,8 @@ impl CodexAppServer {
             exit_watcher: Some(exit_watcher),
             timeouts,
             pid,
+            rate_limits: rate_limits_rx,
+            rate_limits_tx,
         };
         let initialize = json!({"clientInfo":{"name":"agent-sentinel","title":"Agent Sentinel","version":"3"},"capabilities":{}});
         if let Err(error) = time::timeout(
@@ -284,10 +319,16 @@ impl CodexAppServer {
             return Err(error);
         }
         server.notify("initialized", json!({})).await?;
+        // Unsupported and unavailable accounts must not manufacture a value.
+        // A later update remains authoritative if this read races startup.
+        let _ = server.read_rate_limits().await;
         Ok(server)
     }
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+    pub fn is_alive(&self) -> bool {
+        self.shared.alive.load(Ordering::Acquire)
     }
     /// Exposed for deterministic transport diagnostics and tests.
     pub async fn pending_request_count(&self) -> usize {
@@ -296,6 +337,20 @@ impl CodexAppServer {
     /// Exposed for deterministic transport diagnostics and tests.
     pub async fn correlation_buffer_count(&self) -> usize {
         self.state.lock().await.buffered.len()
+    }
+    pub fn subscribe_rate_limits(&self) -> watch::Receiver<Option<CodexRateLimits>> {
+        self.rate_limits.clone()
+    }
+    pub fn latest_rate_limits(&self) -> Option<CodexRateLimits> {
+        self.rate_limits.borrow().clone()
+    }
+    pub async fn read_rate_limits(&self) -> Result<Option<CodexRateLimits>, CodexError> {
+        let result = self.request("account/rateLimits/read", json!({})).await?;
+        let snapshot = rate_limits(&result);
+        if let Some(snapshot) = &snapshot {
+            let _ = self.rate_limits_tx.send(Some(snapshot.clone()));
+        }
+        Ok(snapshot)
     }
 
     pub async fn start_thread(&self, cwd: &Path) -> Result<CodexSession, CodexError> {
@@ -577,6 +632,7 @@ async fn dispatch_stdout(stdout: tokio::process::ChildStdout, shared: Arc<Shared
     loop {
         match stdout.read(&mut chunk).await {
             Ok(0) | Err(_) => {
+                shared.alive.store(false, Ordering::Release);
                 complete_all(&shared.pending, CodexError::UnexpectedExit).await;
                 let _ = shared.notifications.send(NotificationCommand::Clear).await;
                 break;
@@ -692,6 +748,7 @@ async fn watch_child(
         }
     };
     complete_all(&shared.pending, CodexError::UnexpectedExit).await;
+    shared.alive.store(false, Ordering::Release);
     let _ = shared.notifications.send(NotificationCommand::Clear).await;
     let _ = result;
 }
@@ -772,6 +829,11 @@ async fn handle_notification(
         .and_then(Value::as_str)
         .ok_or(CodexError::MalformedMessage)?;
     let params = value.get("params").cloned().unwrap_or(Value::Null);
+    if method == "account/rateLimits/updated" {
+        if let Some(snapshot) = rate_limits(&params) {
+            let _ = state.rate_limits.send(Some(snapshot));
+        }
+    }
     let thread_id = params.get("threadId").and_then(Value::as_str).or_else(|| {
         params
             .get("thread")

@@ -36,7 +36,7 @@ fn main() {
             continue;
         }
         if let Some(id) = id {
-            if method != "initialize" {
+            if method != "initialize" && method != "account/rateLimits/read" {
                 non_initialize_requests += 1;
             }
             if scenario == "exit-during-request" && method != "initialize" {
@@ -159,8 +159,17 @@ fn main() {
                     json!({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"item-test","type":"agentMessage","text":"hello"}}})
                 );
             }
+            if scenario == "rate-limit-update" && method == "thread/start" {
+                println!(
+                    "{}",
+                    json!({"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":77,"windowDurationMins":300,"resetsAt":"2026-08-06T13:00:00Z"}}}})
+                );
+            }
             let result = match method {
                 "initialize" => json!({"protocolVersion":"1"}),
+                "account/rateLimits/read" => {
+                    json!({"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":"2026-08-06T12:00:00Z"}}})
+                }
                 "thread/start" | "thread/resume" => json!({"thread":{"id":"thread-test"}}),
                 "turn/start" => json!({"turn":{"id":"turn-test"}}),
                 "turn/interrupt" => json!({}),

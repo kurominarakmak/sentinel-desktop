@@ -35,7 +35,7 @@ export function parseClaudeStatusLine(payload: unknown): UsageWindow[] | null {
 }
 
 export function codexUsageAdapter(read: () => Promise<unknown>): ProviderUsageAdapter {
-  return { provider: "codex", async fetch() { const windows = parseCodexRateLimits(await read()); return windows ? { provider: "codex", state: "available", windows, source: "Codex App Server account/rateLimits/read" } : { provider: "codex", state: "unavailable", detail: "Codex did not provide rate limits for this account." }; } };
+  return { provider: "codex", async fetch() { const windows = parseCodexRateLimits(await read()); return windows ? { provider: "codex", state: "available", windows, source: "Codex App Server account/rateLimits/read" } : { provider: "codex", state: "unknown", detail: "Waiting for a valid Codex rate-limit update." }; } };
 }
 export function claudeUsageAdapter(read: () => Promise<unknown>): ProviderUsageAdapter {
   return { provider: "claude", async fetch() { const windows = parseClaudeStatusLine(await read()); return windows ? { provider: "claude", state: "available", windows, source: "Claude Code status-line JSON" } : { provider: "claude", state: "unavailable", detail: "Claude Code did not provide rate limits for this account." }; } };

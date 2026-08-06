@@ -1,13 +1,17 @@
 import { useEffect, useState } from "react";
-import { loadProviderUsage, type ProviderUsage, type ProviderUsageAdapter } from "./providerUsage";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { codexUsageAdapter, loadProviderUsage, parseCodexRateLimits, type ProviderUsage, type ProviderUsageAdapter } from "./providerUsage";
 import codexLogo from "./assets/codex-mark.svg";
 import claudeLogo from "./assets/claude-mark.svg";
 import "./ProviderUsageWidget.css";
 
 const initial: ProviderUsage[] = ["codex", "claude"].map(provider => ({ provider: provider as "codex" | "claude", state: "unknown", detail: "Waiting for provider update…" }));
-export function ProviderUsageWidget({ adapters = [] }: { adapters?: readonly ProviderUsageAdapter[] }) {
+const liveAdapters: readonly ProviderUsageAdapter[] = [codexUsageAdapter(() => invoke("codex_rate_limits"))];
+export function ProviderUsageWidget({ adapters = liveAdapters }: { adapters?: readonly ProviderUsageAdapter[] }) {
   const [usage, setUsage] = useState<ProviderUsage[]>(initial);
   useEffect(() => { if (adapters.length) void loadProviderUsage(adapters).then(setUsage); }, [adapters]);
+  useEffect(() => { if (!("__TAURI_INTERNALS__" in window)) return; let unlisten: (() => void) | undefined; void listen<unknown>("provider-usage:codex", event => { const windows = parseCodexRateLimits(event.payload); if (windows) setUsage(previous => previous.map(entry => entry.provider === "codex" ? { provider: "codex", state: "available", windows, source: "Codex App Server account/rateLimits/updated" } : entry)); }).then(stop => { unlisten = stop; }); return () => unlisten?.(); }, []);
   return <section className="provider-usage" aria-label="Provider usage limits"><h2>Provider usage</h2>{usage.map(entry => <Row key={entry.provider} usage={entry} />)}</section>;
 }
 function Row({ usage }: { usage: ProviderUsage }) {

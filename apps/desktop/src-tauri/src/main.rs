@@ -1,10 +1,12 @@
 #[allow(dead_code)]
 mod b2_a;
+mod codex_usage;
 mod windowing;
 
 use sentinel_agent_api::{
     codex_capabilities, detect_installation, AgentKind, CodexCapabilities, InstallationStatus,
 };
+use sentinel_codex::CodexProgram;
 use sentinel_core::{
     ApprovalDecision, ApprovalRequest, ApprovalState, ClaudeRunContext, CodexRunContext,
     CodexRunLifecycle, CoreError, CreateClaudeRunContext, CreateCodexRunContext, DriftEvaluation,
@@ -270,6 +272,7 @@ struct DesktopState {
     protected_application_repository: Option<ProtectedRepository>,
     worktree_root: PathBuf,
     worktree_projects: Arc<tokio::sync::Mutex<HashSet<ProjectId>>>,
+    codex_usage: codex_usage::CodexUsageManager,
     #[cfg(test)]
     reconciliation_test_hooks: Option<ReconciliationTestHooks>,
     #[cfg(test)]
@@ -547,6 +550,17 @@ fn codex_capability() -> CodexCapabilityDto {
         exec_json,
         app_server_experimental,
     }
+}
+#[tauri::command]
+async fn codex_rate_limits(
+    state: State<'_, DesktopState>,
+) -> Result<Option<serde_json::Value>, SafeError> {
+    state
+        .codex_usage
+        .rate_limits()
+        .await
+        .map(|snapshot| snapshot.map(|value| value.0))
+        .map_err(safe_error)
 }
 fn parse_approval_owner(
     request: &ApprovalOwnerRequest,
@@ -3430,7 +3444,26 @@ fn main() {
             let codex = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
                 .map(PathBuf::from)
                 .and_then(|path| CodexExecProgram::from_executable(path).ok());
+            let codex_app_program = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
+                .map(PathBuf::from)
+                .and_then(|path| CodexProgram::from_executable(path).ok());
             let codex_exec_available = codex.is_some();
+            let codex_usage = codex_usage::CodexUsageManager::new(
+                codex_app_program,
+                repository.clone(),
+                std::env::current_dir().unwrap_or_else(|_| data_dir.clone()),
+            );
+            let mut codex_usage_updates = codex_usage.subscribe();
+            let usage_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while codex_usage_updates.changed().await.is_ok() {
+                    let payload = codex_usage_updates
+                        .borrow()
+                        .clone()
+                        .map(|snapshot| snapshot.0);
+                    let _ = usage_app.emit("provider-usage:codex", payload);
+                }
+            });
             app.manage(DesktopState {
                 orchestrator: match codex {
                     Some(program) => RunOrchestrator::new(repository.clone(), fake_agent)
@@ -3444,6 +3477,7 @@ fn main() {
                 protected_application_repository,
                 worktree_root,
                 worktree_projects: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                codex_usage,
                 #[cfg(test)]
                 reconciliation_test_hooks: None,
                 #[cfg(test)]
@@ -3468,6 +3502,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             spike_diagnostics,
             codex_capability,
+            codex_rate_limits,
             approval_capability,
             drift_guardian_capability,
             evaluate_drift_guardian,
