@@ -16,10 +16,14 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 - Tray application, `Command+Shift+Space` global hotkey, hidden floating prompt, and status/settings window routes.
 - Existing project/worktree, process-supervision, normalized-event, approval, drift, evidence, and restart-recovery foundations with automated regression coverage.
 
+### COMPLETE WITH KNOWN LIMITATIONS
+
+- V3 Phase 2 native Codex adapter: the Sentinel-owned desktop App Server manager lazily owns one process, starts and resumes task-scoped threads, streams normalized events into durable V3 state, persists thread/turn/session metadata, and supports cancellation without treating `turn/completed` as Sentinel task completion. Capability negotiation and deterministic protocol/lifecycle fixtures pass.
+- Real authenticated local validation in a disposable Git repository passed for App Server initialization, thread/turn start, normalized durable streaming, and clean-shutdown thread resume. Deterministic in-flight interruption and crash/recreation coverage pass.
+- A real turn could not be held in flight reliably for interruption, and a real `thread/resume` after abrupt owned-App-Server death currently returns `RpcError`; both are documented provider limitations, deferred to Phase 8 recovery hardening rather than Phase 2 blockers.
+
 ### PARTIAL
 
-- Codex App Server has an isolated native JSON-RPC transport with a locked child writer, one stdout dispatcher, bounded request registry, ordered notification worker, exit fan-out, deterministic shutdown, and bounded/recoverable JSONL frame handling. It remains a PARTIAL Phase 2 adapter: Phase 2D still needs capability negotiation, real-Codex smoke validation, broader version/protocol fixtures, and operational restart/reconciliation hardening before enablement.
-- Codex has bounded structured-execution/App Server feasibility interfaces, but not a supported V3 session lifecycle.
 - Claude Code has bounded stream/session records and fixtures, but not a supported V3 session lifecycle.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
@@ -41,4 +45,6 @@ Existing uncommitted desktop changes were present before this documentation reco
 
 ## Next action
 
-Phase 1 of [PLAN.md](PLAN.md) is complete. The next authorized implementation task is Phase 2 only: add a supported Codex adapter that feeds the supervisor-owned V3 store without changing active V1 user behavior. No later V3 phase has started.
+Phase 2 is complete with known provider limitations recorded in
+[Phase 2D validation](docs/v3-phase2d-validation.md). Phase 3 has not started
+and requires separate authorization. Phase 8 will harden abrupt-death recovery.
