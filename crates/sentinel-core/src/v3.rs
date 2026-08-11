@@ -531,14 +531,31 @@ impl V3Repository {
         let row = sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE task_id=?")
             .bind(task_id.to_string()).fetch_optional(&self.pool).await.map_err(|_| CoreError::Storage)?
             .ok_or(CoreError::NotFound)?;
-        Ok(TaskWorktree {
-            task_id: TaskId(row.get("task_id")),
-            repository_root: row.get("repository_root"),
-            worktree_path: row.get("worktree_path"),
-            branch: row.get("branch"),
-            base_commit: row.get("base_commit"),
-            state: row.get("state"),
-        })
+        task_worktree_from(&row)
+    }
+    pub async fn find_task_worktree_by_path(
+        &self,
+        worktree_path: &str,
+    ) -> Result<Option<TaskWorktree>, CoreError> {
+        sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE worktree_path=?")
+            .bind(worktree_path)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .map(|row| task_worktree_from(&row))
+            .transpose()
+    }
+    pub async fn find_task_worktree_by_branch(
+        &self,
+        branch: &str,
+    ) -> Result<Option<TaskWorktree>, CoreError> {
+        sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE branch=?")
+            .bind(branch)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .map(|row| task_worktree_from(&row))
+            .transpose()
     }
     pub async fn create_task_worktree(
         &self,
@@ -556,6 +573,22 @@ impl V3Repository {
         sqlx::query("INSERT INTO v3_task_worktrees (task_id,repository_root,worktree_path,branch,base_commit,state,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,'ready',?,?)")
             .bind(input.task_id.to_string()).bind(&input.repository_root).bind(&input.worktree_path).bind(&input.branch).bind(&input.base_commit).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
         self.get_task_worktree(&input.task_id).await
+    }
+    pub async fn set_task_worktree_recovery_required(
+        &self,
+        task_id: &TaskId,
+        timestamp: i64,
+    ) -> Result<TaskWorktree, CoreError> {
+        let updated = sqlx::query("UPDATE v3_task_worktrees SET state='recovery_required',updated_at_ms=? WHERE task_id=?")
+            .bind(timestamp)
+            .bind(task_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?;
+        if updated.rows_affected() != 1 {
+            return Err(CoreError::NotFound);
+        }
+        self.get_task_worktree(task_id).await
     }
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -1063,6 +1096,20 @@ async fn insert_event(
         .map_err(|_| CoreError::InvalidV3Record)?;
     sqlx::query("INSERT INTO v3_task_events (event_id,task_id,session_id,provider,event_kind,schema_version,occurred_at_ms,sequence_number,causation_id,correlation_id,payload_json,raw_diagnostic_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(event.event_id.to_string()).bind(event.task_id.to_string()).bind(event.session_id.as_ref().map(ToString::to_string)).bind(&event.provider).bind(event.kind.storage_name()).bind(event.schema_version).bind(event.occurred_at_ms).bind(i64::try_from(event.sequence_number).map_err(|_|CoreError::InvalidV3Record)?).bind(&event.causation_id).bind(&event.correlation_id).bind(payload).bind(raw).execute(&mut **tx).await.map_err(|_|CoreError::Storage)?;
     Ok(())
+}
+fn task_worktree_from(row: &sqlx::sqlite::SqliteRow) -> Result<TaskWorktree, CoreError> {
+    let state: String = row.get("state");
+    if !matches!(state.as_str(), "ready" | "recovery_required") {
+        return Err(CoreError::CorruptV3State);
+    }
+    Ok(TaskWorktree {
+        task_id: TaskId(row.get("task_id")),
+        repository_root: row.get("repository_root"),
+        worktree_path: row.get("worktree_path"),
+        branch: row.get("branch"),
+        base_commit: row.get("base_commit"),
+        state,
+    })
 }
 fn task_from(row: &sqlx::sqlite::SqliteRow) -> Result<Task, CoreError> {
     let task = Task {
