@@ -664,6 +664,22 @@ impl V3Repository {
             .transpose()?
             .ok_or(CoreError::NotFound)
     }
+    /// Returns only sessions owned by a task. Adapters use the opaque provider
+    /// reference for supported resume/reconciliation; they never discover
+    /// provider sessions outside Sentinel's durable state.
+    pub async fn list_sessions_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<AgentSession>, CoreError> {
+        sqlx::query("SELECT * FROM v3_sessions WHERE task_id=? ORDER BY created_at_ms ASC, id ASC")
+            .bind(task_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .iter()
+            .map(session_from)
+            .collect()
+    }
     /// Looks up an opaque adapter session reference without interpreting it.
     pub async fn get_session_by_provider_reference(
         &self,

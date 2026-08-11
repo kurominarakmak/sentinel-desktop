@@ -259,6 +259,16 @@ impl CodexAppServer {
         if !cwd.is_dir() {
             return Err(CodexError::InvalidInput);
         }
+        // A recreated desktop-owned connection continues the durable event
+        // stream for this Sentinel task. It must never reuse sequence zero.
+        let sequence = repository
+            .v3()
+            .list_events(&task_id)
+            .await
+            .map_err(|_| CodexError::Storage)?
+            .last()
+            .map(|event| event.sequence_number)
+            .unwrap_or(0);
         let mut command = Command::new(program.executable());
         command
             .arg("app-server")
@@ -282,7 +292,7 @@ impl CodexAppServer {
         let state = Arc::new(Mutex::new(EventState {
             repository,
             task_id,
-            sequence: 0,
+            sequence,
             arrival_sequence: 0,
             seen: HashSet::new(),
             sessions: HashMap::new(),

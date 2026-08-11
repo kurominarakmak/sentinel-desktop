@@ -1,5 +1,6 @@
 #[allow(dead_code)]
 mod b2_a;
+mod codex_sessions;
 mod codex_usage;
 mod windowing;
 
@@ -59,6 +60,18 @@ struct Diagnostics {
 struct CodexCapabilityDto {
     exec_json: bool,
     app_server_experimental: bool,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTaskRequest {
+    summary: String,
+    prompt: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexTaskIdRequest {
+    task_id: String,
+    prompt: Option<String>,
 }
 /// Explicit Phase 7 public allowlist.  The queue never exposes private event
 /// data, runtime IDs, paths, or audit rows.
@@ -273,6 +286,7 @@ struct DesktopState {
     worktree_root: PathBuf,
     worktree_projects: Arc<tokio::sync::Mutex<HashSet<ProjectId>>>,
     codex_usage: codex_usage::CodexUsageManager,
+    codex_sessions: codex_sessions::CodexSessionManager,
     #[cfg(test)]
     reconciliation_test_hooks: Option<ReconciliationTestHooks>,
     #[cfg(test)]
@@ -571,6 +585,67 @@ async fn codex_rate_limits(
         .rate_limits()
         .await
         .map(|snapshot| snapshot.map(|value| value.0))
+        .map_err(safe_error)
+}
+
+#[tauri::command]
+async fn start_codex_session_task(
+    state: State<'_, DesktopState>,
+    request: CodexTaskRequest,
+) -> Result<String, SafeError> {
+    if request.summary.trim().is_empty() || request.prompt.trim().is_empty() {
+        return Err(input_error());
+    }
+    let cwd = std::env::current_dir().map_err(|_| safe_error("codex cwd"))?;
+    let task = state
+        .codex_sessions
+        .start_task(request.summary, &cwd)
+        .await
+        .map_err(safe_error)?;
+    state
+        .codex_sessions
+        .start_turn(&task.id, &request.prompt)
+        .await
+        .map_err(safe_error)?;
+    Ok(task.id.0)
+}
+
+#[tauri::command]
+async fn resume_codex_session_task(
+    state: State<'_, DesktopState>,
+    request: CodexTaskIdRequest,
+) -> Result<(), SafeError> {
+    if request.task_id.trim().is_empty() {
+        return Err(input_error());
+    }
+    let task_id = sentinel_core::v3::TaskId(request.task_id);
+    state
+        .codex_sessions
+        .resume_task(&task_id)
+        .await
+        .map_err(safe_error)?;
+    if let Some(prompt) = request.prompt.filter(|prompt| !prompt.trim().is_empty()) {
+        state
+            .codex_sessions
+            .start_turn(&task_id, &prompt)
+            .await
+            .map_err(safe_error)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_codex_session_task(
+    state: State<'_, DesktopState>,
+    request: CodexTaskIdRequest,
+) -> Result<(), SafeError> {
+    if request.task_id.trim().is_empty() {
+        return Err(input_error());
+    }
+    state
+        .codex_sessions
+        .cancel(&sentinel_core::v3::TaskId(request.task_id))
+        .await
         .map_err(safe_error)
 }
 fn parse_approval_owner(
@@ -3461,10 +3536,36 @@ fn main() {
                 .and_then(|path| CodexProgram::from_executable(path).ok());
             let codex_exec_available = codex.is_some();
             let codex_usage = codex_usage::CodexUsageManager::new(
+                codex_app_program.clone(),
+                repository.clone(),
+                std::env::current_dir().unwrap_or_else(|_| data_dir.clone()),
+            );
+            let codex_sessions = codex_sessions::CodexSessionManager::new(
                 codex_app_program,
                 repository.clone(),
                 std::env::current_dir().unwrap_or_else(|_| data_dir.clone()),
             );
+            tauri::async_runtime::block_on(
+                repository.v3().restore_unfinished_tasks(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                ),
+            )
+            .map_err(|_| {
+                Box::<dyn std::error::Error>::from(
+                    "Agent Sentinel could not restore unfinished V3 tasks",
+                )
+            })?;
+            tauri::async_runtime::block_on(codex_sessions.reconcile_after_restart()).map_err(
+                |_| {
+                    Box::<dyn std::error::Error>::from(
+                        "Agent Sentinel could not reconcile Codex sessions",
+                    )
+                },
+            )?;
+            let initial_codex_usage = codex_usage.clone();
             let mut codex_usage_updates = codex_usage.subscribe();
             let usage_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -3493,6 +3594,7 @@ fn main() {
                 worktree_root,
                 worktree_projects: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
                 codex_usage,
+                codex_sessions,
                 #[cfg(test)]
                 reconciliation_test_hooks: None,
                 #[cfg(test)]
@@ -3518,6 +3620,9 @@ fn main() {
             spike_diagnostics,
             codex_capability,
             codex_rate_limits,
+            start_codex_session_task,
+            resume_codex_session_task,
+            cancel_codex_session_task,
             approval_capability,
             drift_guardian_capability,
             evaluate_drift_guardian,
@@ -5387,6 +5492,11 @@ mod bridge_tests {
             ),
             codex_exec_available: false,
             codex_usage: codex_usage::CodexUsageManager::new(
+                None,
+                repository.clone(),
+                worktree_root.clone(),
+            ),
+            codex_sessions: codex_sessions::CodexSessionManager::new(
                 None,
                 repository.clone(),
                 worktree_root.clone(),
