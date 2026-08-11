@@ -509,7 +509,54 @@ pub struct CreateArtifact {
 pub struct V3Repository {
     pool: SqlitePool,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskWorktree {
+    pub task_id: TaskId,
+    pub repository_root: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_commit: String,
+    pub state: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTaskWorktree {
+    pub task_id: TaskId,
+    pub repository_root: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub base_commit: String,
+}
 impl V3Repository {
+    pub async fn get_task_worktree(&self, task_id: &TaskId) -> Result<TaskWorktree, CoreError> {
+        let row = sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE task_id=?")
+            .bind(task_id.to_string()).fetch_optional(&self.pool).await.map_err(|_| CoreError::Storage)?
+            .ok_or(CoreError::NotFound)?;
+        Ok(TaskWorktree {
+            task_id: TaskId(row.get("task_id")),
+            repository_root: row.get("repository_root"),
+            worktree_path: row.get("worktree_path"),
+            branch: row.get("branch"),
+            base_commit: row.get("base_commit"),
+            state: row.get("state"),
+        })
+    }
+    pub async fn create_task_worktree(
+        &self,
+        input: CreateTaskWorktree,
+        timestamp: i64,
+    ) -> Result<TaskWorktree, CoreError> {
+        if input.repository_root.is_empty()
+            || input.worktree_path.is_empty()
+            || input.branch.is_empty()
+            || input.base_commit.len() != 40
+            || !input.base_commit.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(CoreError::InvalidV3Record);
+        }
+        sqlx::query("INSERT INTO v3_task_worktrees (task_id,repository_root,worktree_path,branch,base_commit,state,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,'ready',?,?)")
+            .bind(input.task_id.to_string()).bind(&input.repository_root).bind(&input.worktree_path).bind(&input.branch).bind(&input.base_commit).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.get_task_worktree(&input.task_id).await
+    }
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
