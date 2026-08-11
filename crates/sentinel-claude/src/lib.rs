@@ -257,6 +257,11 @@ impl ClaudeProcess {
             .wait()
             .await
             .map_err(|_| ClaudeError::UnexpectedExit)?;
+        // stdout can still contain the terminal stream-json `result` after the
+        // child exits. Drain it before deriving a session outcome.
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.await;
+        }
         let state = self.state.lock().await;
         let cancelling = state.cancelling;
         let completed = state.completed;
@@ -275,9 +280,6 @@ impl ClaudeProcess {
                 json!({"exit_code":status.code()}),
             )
             .await?;
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.await;
         }
         Ok(())
     }

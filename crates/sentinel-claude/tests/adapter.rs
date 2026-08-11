@@ -7,7 +7,7 @@ use sentinel_core::{
     },
     RunRepository,
 };
-use std::{path::PathBuf, sync::Mutex};
+use std::{path::PathBuf, process::Command, sync::Mutex};
 use tempfile::TempDir;
 
 static ENV: Mutex<()> = Mutex::new(());
@@ -224,4 +224,101 @@ async fn restart_reconciliation_returns_only_sentinel_owned_recovery_sessions() 
     );
     drop(dir);
     std::env::remove_var("SENTINEL_FAKE_CLAUDE_SCENARIO");
+}
+
+/// Explicitly opt-in provider validation. It uses a disposable Git repository
+/// and never changes Claude configuration, installs a status bridge, or touches
+/// the Sentinel checkout.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires an explicitly authorized local Claude Code account"]
+async fn real_local_claude_stream_json_start_resume_and_restart_reconciliation() {
+    assert_eq!(
+        std::env::var("SENTINEL_REAL_CLAUDE_SMOKE").as_deref(),
+        Ok("1")
+    );
+    let executable = std::env::var_os("SENTINEL_REAL_CLAUDE_EXECUTABLE")
+        .map(PathBuf::from)
+        .expect("set SENTINEL_REAL_CLAUDE_EXECUTABLE to the local claude binary");
+    assert!(matches!(
+        detect_installation(executable.clone()).await,
+        ClaudeInstallation::Available { .. }
+    ));
+    let directory = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(directory.path())
+        .status()
+        .unwrap()
+        .success());
+    let repository = RunRepository::open(&url(&directory)).await.unwrap();
+    let task = repository
+        .v3()
+        .create_task(
+            CreateTask {
+                project_id: None,
+                workflow_id: "real-claude".into(),
+                summary: "temporary Claude stream-json smoke".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let program = ClaudeProgram::from_executable(executable).unwrap();
+    let (mut process, session) = ClaudeProcess::start(
+        program.clone(),
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+        "Reply with exactly `sentinel-start-ok`. Do not inspect or modify any files.",
+    )
+    .await
+    .unwrap();
+    process.wait_for_exit().await.unwrap();
+    let events = repository.v3().list_events(&task.id).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::Message)));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::SessionCompleted)));
+    let (mut resumed, resumed_session) = ClaudeProcess::resume(
+        program,
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+        &session.provider_session_id,
+        "Reply with exactly `sentinel-resume-ok`. Do not inspect or modify any files.",
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed_session, session);
+    resumed.wait_for_exit().await.unwrap();
+    let transition = NormalizedEventEnvelope {
+        event_id: EventId::new(),
+        task_id: task.id.clone(),
+        session_id: None,
+        provider: PROVIDER.into(),
+        kind: EventKind::Unknown {
+            discriminator: "real/restart".into(),
+        },
+        schema_version: 1,
+        occurred_at_ms: 2,
+        sequence_number: 10_000,
+        causation_id: None,
+        correlation_id: None,
+        payload: serde_json::json!({}),
+        raw_diagnostic_payload: None,
+    };
+    let task = repository
+        .v3()
+        .transition_task_with_event(&task, TaskLifecycle::Preparing, &transition, 2)
+        .await
+        .unwrap();
+    repository.v3().restore_unfinished_tasks(3).await.unwrap();
+    assert_eq!(
+        ClaudeProcess::reconcile_persisted_sessions(&repository, &task.id)
+            .await
+            .unwrap(),
+        vec![session]
+    );
 }
