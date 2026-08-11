@@ -172,9 +172,14 @@ fn main() {
                 );
             }
             let result = match method {
-                "initialize" if scenario == "unsupported-version" => {
+                "initialize"
+                    if scenario == "unsupported-version" || scenario == "newer-version" =>
+                {
                     json!({"protocolVersion":"999"})
                 }
+                "initialize" if scenario == "older-version" => json!({"protocolVersion":"0"}),
+                "initialize" if scenario == "missing-version" => json!({}),
+                "initialize" if scenario == "protocol-v2" => json!({"protocolVersion":"2"}),
                 "initialize" => json!({"protocolVersion":"1"}),
                 "account/rateLimits/read" => {
                     json!({"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":"2026-08-06T12:00:00Z"}}})

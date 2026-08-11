@@ -5,8 +5,8 @@ use sentinel_core::{
     v3::{CreateTask, EventKind},
     RunRepository,
 };
-use std::sync::Mutex;
 use std::time::Duration;
+use std::{process::Command, sync::Mutex};
 use tempfile::TempDir;
 
 static FAKE_SERVER_ENV: Mutex<()> = Mutex::new(());
@@ -52,6 +52,82 @@ async fn detects_a_supported_explicit_executable_and_missing_file() {
         CodexInstallation::Missing
     ));
     assert!(CodexProgram::from_executable("/definitely/missing/codex").is_err());
+}
+
+/// Opt-in local integration check. It never runs in CI and only uses a fresh
+/// temporary Git repository; it does not issue account or reset operations.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires an explicitly authorized local Codex account"]
+async fn real_local_app_server_smoke_uses_only_a_temporary_git_repository() {
+    assert_eq!(
+        std::env::var("SENTINEL_REAL_CODEX_SMOKE").as_deref(),
+        Ok("1")
+    );
+    let executable = std::env::var_os("SENTINEL_REAL_CODEX_EXECUTABLE")
+        .map(std::path::PathBuf::from)
+        .expect("set SENTINEL_REAL_CODEX_EXECUTABLE to the local codex binary");
+    let directory = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(directory.path())
+        .status()
+        .unwrap()
+        .success());
+    let repository = RunRepository::open(&url(&directory)).await.unwrap();
+    let task = repository
+        .v3()
+        .create_task(
+            CreateTask {
+                project_id: None,
+                workflow_id: "real-smoke".into(),
+                summary: "temporary Codex App Server smoke".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let program = CodexProgram::from_executable(executable).unwrap();
+    let mut server = CodexAppServer::start(
+        program.clone(),
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+    )
+    .await
+    .unwrap();
+    let session = server.start_thread(directory.path()).await.unwrap();
+    let turn = server
+        .start_turn(
+            &session,
+            "For this temporary smoke test, begin waiting without changing any files.",
+        )
+        .await
+        .unwrap();
+    // A minimal smoke turn may complete before the interrupt reaches Codex.
+    // Both outcomes prove the supported request path without pretending that
+    // a completed turn was cancelled in flight.
+    assert!(matches!(
+        server.interrupt_turn(&session, &turn).await,
+        Ok(()) | Err(CodexError::RpcError)
+    ));
+    server.shutdown().await.unwrap();
+    let mut replacement = CodexAppServer::start(
+        program,
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+    )
+    .await
+    .unwrap();
+    let resumed = replacement.resume_thread(&session.thread_id).await.unwrap();
+    assert_eq!(resumed.thread_id, session.thread_id);
+    assert!(!repository
+        .v3()
+        .list_events(&task.id)
+        .await
+        .unwrap()
+        .is_empty());
+    replacement.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -209,6 +285,35 @@ async fn unsupported_versions_payloads_and_provider_methods_remain_safe_diagnost
     assert!(events.iter().any(|event| matches!(&event.kind, EventKind::Unknown { discriminator } if discriminator == "future/unsupported")));
     assert_eq!(server.pending_request_count().await, 0);
     assert_eq!(server.correlation_buffer_count().await, 0);
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn protocol_negotiation_accepts_legacy_and_v2_and_rejects_older_and_newer_shapes() {
+    let _guard = fake_server_env_lock();
+    for unsupported in ["older-version", "newer-version"] {
+        std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", unsupported);
+        let (d, r, t) = fixture().await;
+        let program = CodexProgram::from_executable(fake()).unwrap();
+        assert!(matches!(
+            CodexAppServer::start(program, r, t.id, d.path()).await,
+            Err(CodexError::Unsupported)
+        ));
+    }
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "protocol-v2");
+    let (d, r, t) = fixture().await;
+    let program = CodexProgram::from_executable(fake()).unwrap();
+    let mut server = CodexAppServer::start(program, r, t.id, d.path())
+        .await
+        .unwrap();
+    server.shutdown().await.unwrap();
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "missing-version");
+    let (d, r, t) = fixture().await;
+    let program = CodexProgram::from_executable(fake()).unwrap();
+    let mut server = CodexAppServer::start(program, r, t.id, d.path())
+        .await
+        .unwrap();
     server.shutdown().await.unwrap();
     std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
 }

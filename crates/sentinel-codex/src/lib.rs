@@ -35,6 +35,7 @@ pub const MAX_PENDING_REQUESTS: usize = 64;
 pub const START_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["1", "2"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodexTimeouts {
@@ -334,7 +335,14 @@ impl CodexAppServer {
             }
         };
         server.notify("initialized", json!({})).await?;
-        if initialized.get("protocolVersion").and_then(Value::as_str) != Some("1") {
+        let version_supported = initialized
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .map(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(&version))
+            // Current local App Server releases negotiate through the stable
+            // initialize response shape without declaring a version.
+            .unwrap_or(true);
+        if !version_supported {
             let _ = server.shutdown().await;
             return Err(CodexError::Unsupported);
         }
