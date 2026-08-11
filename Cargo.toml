@@ -8,6 +8,7 @@ members = [
   "crates/sentinel-process",
   "crates/sentinel-probe",
   "crates/sentinel-codex",
+  "crates/sentinel-claude",
   "apps/desktop/src-tauri",
 ]
 resolver = "2"

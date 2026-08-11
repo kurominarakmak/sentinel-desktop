@@ -3061,6 +3061,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-claude"
+version = "0.1.0"
+dependencies = [
+ "sentinel-core",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "sentinel-codex"
 version = "0.1.0"
 dependencies = [
