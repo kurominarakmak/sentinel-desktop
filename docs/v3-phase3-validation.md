@@ -21,10 +21,22 @@ followed by structured `assistant` and `result` events reporting
 configuration change was attempted, and no Sentinel or user repository was
 modified.
 
-Because the local CLI is not authenticated, new-provider execution, streamed
-provider work, same-session resume, in-flight cancellation, clean successful
-exit, and provider-backed restart reconciliation could not be validated. These
-remain Phase 3 completion requirements; deterministic coverage remains passing.
+## Phase 3 closure
+
+Phase 3 is **COMPLETE WITH AUTH-LIMITED VALIDATION**:
+
+- Real Claude Code executable/version detection passed.
+- Supported `stream-json` and `--resume` interfaces were confirmed.
+- Real CLI JSON framing (`system/init`, `assistant`, and `result`) was observed.
+- Deterministic start, stream, resume, cancel, malformed-output, exit, and
+  restart-recovery tests pass.
+
+The local CLI is not logged in, so authenticated new-session execution,
+provider streamed work, same-session resume, in-flight cancellation, clean
+successful lifecycle exit, and provider-backed restart reconciliation could
+not be tested. No login or account modification was attempted. Authenticated
+Claude smoke/reconciliation is deferred to Phase 8 or until credentials become
+available; it does not block Phase 3 closure.
 
 ## Adapter hardening observed during the probe
 
