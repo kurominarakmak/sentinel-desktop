@@ -96,3 +96,21 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .v3-status-approval-required { color: #9a6700; background: #fef0c7; }
 .v3-status-failed, .v3-status-recovery-required { color: var(--v3-danger); background: #fee4e2; }
 .v3-status-ready-for-review { color: #067647; background: #d1fadf; }
+.v3-task-detail > header { align-items: start; }
+.v3-task-detail > header strong { display: block; font-size: 15px; }
+.v3-detail-summary { display: grid; gap: var(--v3-space-1); grid-template-columns: repeat(3, minmax(0, 1fr)); margin: var(--v3-space-2) 0; }
+.v3-detail-summary span { color: var(--v3-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-detail-summary b { color: var(--v3-text); display: block; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+.v3-detail-actions { min-height: 0; margin-bottom: var(--v3-space-2); }
+.v3-callout { border-radius: var(--v3-radius-sm); margin: var(--v3-space-2) 0; padding: var(--v3-space-2); }
+.v3-callout-danger { background: #fee4e2; }
+.v3-task-detail details > summary { display: flex; justify-content: space-between; }
+.v3-timeline { display: grid; gap: var(--v3-space-2); list-style: none; margin: var(--v3-space-2) 0 0; padding: 0; }
+.v3-timeline li { border-left: 2px solid var(--v3-divider); display: grid; gap: 2px; padding-left: var(--v3-space-2); }
+.v3-timeline small, .v3-result-list small { color: var(--v3-muted); }
+.v3-result-list { display: grid; gap: var(--v3-space-2); margin-top: var(--v3-space-2); }
+.v3-result-list > div { display: grid; gap: 3px; border-bottom: 1px solid var(--v3-divider); padding-bottom: var(--v3-space-2); }
+.v3-result { border-radius: 999px; font-size: 10px; font-weight: 700; justify-self: start; padding: 2px 6px; }
+.v3-result-pass { background: #d1fadf; color: #067647; }.v3-result-fail { background: #fee4e2; color: var(--v3-danger); }.v3-result-caution { background: #fef0c7; color: #9a6700; }.v3-result-neutral { background: #eaecf0; color: #475467; }
+.v3-finding-blocker { background: color-mix(in srgb, #fee4e2 72%, transparent); border-radius: var(--v3-radius-sm); padding: var(--v3-space-2); }
+.v3-blocker-count { color: var(--v3-danger); font-size: 10px; }
