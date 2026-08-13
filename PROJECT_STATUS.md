@@ -51,11 +51,16 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 - V3 Phase 7 is **COMPLETE**. Quick Prompt, the event-driven Attention Widget,
   and durable Task Detail expose V3 task state, review/validation evidence,
   repair history, and human approval actions without inferring workflow state.
-- Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
-- The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
+
+### COMPLETE
+
+- V3 Phase 8 is **COMPLETE**. Provider/session recovery, execution and
+  credential boundaries, exact single-use authorization, and provenance plus
+  adversarial recovery audit evidence are covered by deterministic V3 suites.
 
 ### PLANNED
 
+- Phase 9 final UI redesign follows the completed Phase 8 hardening audit.
 - V3 Phase 8 is **PARTIAL**. Phase 8A hardens provider/session recovery and
   Phase 8B is **COMPLETE** with execution, credential, and single-use action
   authorization boundaries; Phase 8C provenance/recovery audit remains.
