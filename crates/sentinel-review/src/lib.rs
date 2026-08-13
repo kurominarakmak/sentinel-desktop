@@ -492,6 +492,110 @@ pub struct FinalApproval {
     pub approval: Approval,
     pub repair_rounds: usize,
 }
+/// Exact, executor-independent evidence required to use a final/destructive
+/// action approval. Values are opaque identifiers/digests, never secrets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionApprovalContext {
+    pub task_id: String,
+    pub action: String,
+    pub worktree_path: String,
+    pub repository_root: String,
+    pub branch: String,
+    pub head: String,
+    pub base_commit: String,
+    pub evidence_digest: String,
+}
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ActionAuthorizationError {
+    #[error("approval capability is invalid or unavailable")]
+    Denied,
+    #[error("worktree or task recovery is required")]
+    RecoveryRequired,
+    #[error("authorization storage failure")]
+    Storage,
+}
+pub struct ActionAuthorizationGuard;
+impl ActionAuthorizationGuard {
+    pub async fn issue(
+        repository: RunRepository,
+        context: ActionApprovalContext,
+        timestamp: i64,
+    ) -> Result<Approval, ActionAuthorizationError> {
+        if context.task_id.trim().is_empty()
+            || context.action.trim().is_empty()
+            || context.evidence_digest.len() > 256
+        {
+            return Err(ActionAuthorizationError::Denied);
+        }
+        let payload =
+            serde_json::to_string(&context).map_err(|_| ActionAuthorizationError::Storage)?;
+        repository
+            .v3()
+            .create_approval(
+                CreateApproval {
+                    task_id: TaskId(context.task_id),
+                    session_id: None,
+                    action_kind: format!("v3_action:{}", context.action),
+                    summary: payload,
+                },
+                timestamp,
+            )
+            .await
+            .map_err(|_| ActionAuthorizationError::Storage)
+    }
+    pub async fn validate_and_consume(
+        repository: RunRepository,
+        approval_id: &ApprovalId,
+        context: &ActionApprovalContext,
+        timestamp: i64,
+    ) -> Result<Approval, ActionAuthorizationError> {
+        let approval = repository
+            .v3()
+            .get_approval(approval_id)
+            .await
+            .map_err(|_| ActionAuthorizationError::Denied)?;
+        if approval.lifecycle != ApprovalLifecycle::Pending
+            || approval.action_kind != format!("v3_action:{}", context.action)
+            || approval.task_id.to_string() != context.task_id
+        {
+            return Err(ActionAuthorizationError::Denied);
+        }
+        let bound: ActionApprovalContext = serde_json::from_str(&approval.summary)
+            .map_err(|_| ActionAuthorizationError::Denied)?;
+        if &bound != context {
+            return Err(ActionAuthorizationError::Denied);
+        }
+        let task = repository
+            .v3()
+            .get_task(&approval.task_id)
+            .await
+            .map_err(|_| ActionAuthorizationError::Storage)?;
+        if task.recovery_condition != sentinel_core::v3::RecoveryCondition::None {
+            return Err(ActionAuthorizationError::RecoveryRequired);
+        }
+        let worktree = repository
+            .v3()
+            .get_task_worktree(&approval.task_id)
+            .await
+            .map_err(|_| ActionAuthorizationError::Denied)?;
+        if worktree.state != "ready"
+            || worktree.worktree_path != context.worktree_path
+            || worktree.repository_root != context.repository_root
+            || worktree.branch != context.branch
+            || worktree.base_commit != context.base_commit
+            || context.head != context.base_commit
+        {
+            return Err(ActionAuthorizationError::Denied);
+        }
+        let consumed = repository
+            .v3()
+            .transition_approval(&approval, ApprovalLifecycle::Approved, timestamp)
+            .await
+            .map_err(|_| ActionAuthorizationError::Denied)?;
+        repository.v3().create_artifact(CreateArtifact { task_id: approval.task_id.clone(), kind: "authorization_audit".into(), display_name: context.action.clone(), content_hash: None, metadata: serde_json::json!({"approval_id":approval.id.to_string(),"action":context.action,"evidence_digest":context.evidence_digest,"outcome":"consumed"}) }, timestamp).await.map_err(|_| ActionAuthorizationError::Storage)?;
+        Ok(consumed)
+    }
+}
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FinalApprovalError {
     #[error("worktree reconciliation is required")]
