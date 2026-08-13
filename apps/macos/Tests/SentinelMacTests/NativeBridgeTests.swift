@@ -82,4 +82,27 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertTrue(gate.apply(replacement))
         XCTAssertEqual(gate.current?.task.id, "task-2")
     }
+
+    func testDecodesCodexRateLimitsAndClaudeAuthLimitedStatus() throws {
+        let data = Data(#"{"kind":"status","status":{"version":4,"sentinel":"implementing","activeTask":{"id":"task-1","summary":"Ship it","lifecycle":"implementing","recoveryRequired":false,"recoveryReason":null,"version":4,"updatedAtMs":9},"recoveryRequired":false,"codex":{"name":"Codex","installation":"available · 1.0","runtime":"session active","usage":"live","rateLimits":{"primary":{"usedPercent":42,"resetsAt":"12:00","windowDurationMins":300}}},"claude":{"name":"Claude Code","installation":"available · 1.0","runtime":"no owned session","usage":"Authenticated usage is unavailable in the native bridge.","rateLimits":null}}}"#.utf8)
+        guard case .status(let status) = try JSONDecoder().decode(BridgeMessage.self, from: data) else { return XCTFail("expected status") }
+        XCTAssertEqual(status.codex.rateLimits?["primary"]?.usedPercent, 42)
+        XCTAssertNil(status.codex.rateLimits?["secondary"])
+        XCTAssertTrue(status.claude.usage.contains("unavailable"))
+        XCTAssertEqual(status.activeTask?.id, "task-1")
+    }
+
+    func testStatusGateRejectsStaleAndAcceptsProviderReplacementOrRecovery() {
+        let unavailable = NativeProviderStatus(name: "Codex", installation: "unavailable", runtime: "no owned session", usage: "unavailable", rateLimits: nil)
+        let claude = NativeProviderStatus(name: "Claude Code", installation: "not installed", runtime: "no owned session", usage: "unavailable", rateLimits: nil)
+        let current = NativeStatus(version: 3, sentinel: "implementing", activeTask: NativeTask(id: "task-1", summary: "work", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 3, updatedAtMs: 3), recoveryRequired: false, codex: unavailable, claude: claude)
+        let stale = NativeStatus(version: 2, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: unavailable, claude: claude)
+        let recovery = NativeStatus(version: 4, sentinel: "recovering", activeTask: NativeTask(id: "task-2", summary: "recover", lifecycle: "recovering", recoveryRequired: true, recoveryReason: "provider_missing", version: 4, updatedAtMs: 4), recoveryRequired: true, codex: NativeProviderStatus(name: "Codex", installation: "available", runtime: "session recovery_required", usage: "unavailable", rateLimits: nil), claude: claude)
+        var gate = StatusUpdateGate()
+        XCTAssertTrue(gate.apply(current))
+        XCTAssertFalse(gate.apply(stale))
+        XCTAssertTrue(gate.apply(recovery))
+        XCTAssertEqual(gate.current?.activeTask?.id, "task-2")
+        XCTAssertTrue(gate.current?.recoveryRequired == true)
+    }
 }

@@ -3,6 +3,7 @@
 //! This process owns no workflow decisions. It maps durable V3 state to JSON
 //! snapshots and forwards the already-existing final-approval supervisor call.
 
+use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
 use sentinel_codex::{CodexProgram, CodexTaskStarter, StartedCodexTask};
 use sentinel_core::{
     v3::{ApprovalId, TaskId},
@@ -26,6 +27,7 @@ enum Request {
     Capabilities,
     ActiveTask,
     AttentionState,
+    Status,
     TaskDetail {
         task_id: String,
     },
@@ -88,6 +90,27 @@ struct AttentionDto {
     validation: Option<String>,
     review: Option<String>,
     actions: AttentionActionsDto,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProviderStatusDto {
+    name: String,
+    installation: String,
+    runtime: String,
+    usage: String,
+    rate_limits: Option<Value>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct StatusDto {
+    version: u64,
+    sentinel: String,
+    active_task: Option<TaskDto>,
+    recovery_required: bool,
+    codex: ProviderStatusDto,
+    claude: ProviderStatusDto,
 }
 
 fn task_dto(task: sentinel_core::v3::Task) -> TaskDto {
@@ -198,6 +221,72 @@ async fn active_task_record(
     let mut tasks = repository.v3().list_tasks().await?;
     tasks.sort_by_key(|task| (task.updated_at_ms, task.version));
     Ok(tasks.pop())
+}
+
+fn installation_status(status: InstallationStatus) -> String {
+    match status {
+        InstallationStatus::Available { version, .. } => format!("available · {version}"),
+        InstallationStatus::NotInstalled => "not installed".into(),
+        InstallationStatus::Unusable { .. } => "unavailable".into(),
+    }
+}
+
+async fn status_snapshot(repository: &RunRepository) -> Result<StatusDto, CoreError> {
+    let task = active_task_record(repository).await?;
+    let (version, recovery_required, sentinel) = match task.as_ref() {
+        Some(task) => (
+            task.version,
+            task.recovery_condition != sentinel_core::v3::RecoveryCondition::None,
+            format!("{:?}", task.lifecycle).to_lowercase(),
+        ),
+        None => (0, false, "ready".into()),
+    };
+    let codex_sessions = match task.as_ref() {
+        Some(task) => repository.v3().list_sessions_for_task(&task.id).await?,
+        None => Vec::new(),
+    };
+    let codex_runtime = codex_sessions
+        .iter()
+        .rev()
+        .find(|session| session.provider.contains("codex") || session.provider.contains("openai"))
+        .map(|session| {
+            format!(
+                "session {}",
+                format!("{:?}", session.lifecycle).to_lowercase()
+            )
+        })
+        .unwrap_or_else(|| "no owned session".into());
+    let claude_runtime = codex_sessions
+        .iter()
+        .rev()
+        .find(|session| session.provider.contains("claude"))
+        .map(|session| {
+            format!(
+                "session {}",
+                format!("{:?}", session.lifecycle).to_lowercase()
+            )
+        })
+        .unwrap_or_else(|| "no owned session".into());
+    Ok(StatusDto {
+        version,
+        sentinel,
+        active_task: task.map(task_dto),
+        recovery_required,
+        codex: ProviderStatusDto {
+            name: "Codex".into(),
+            installation: installation_status(detect_installation(AgentKind::Codex)),
+            runtime: codex_runtime,
+            usage: "Live account usage is unavailable in the native bridge.".into(),
+            rate_limits: None,
+        },
+        claude: ProviderStatusDto {
+            name: "Claude Code".into(),
+            installation: installation_status(detect_installation(AgentKind::ClaudeCode)),
+            runtime: claude_runtime,
+            usage: "Authenticated usage is unavailable in the native bridge.".into(),
+            rate_limits: None,
+        },
+    })
 }
 
 async fn task_detail(
@@ -402,6 +491,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut subscribed = false;
     let mut last_snapshot = None;
+    let mut last_status = None;
     let mut owned_tasks = HashMap::new();
     let mut accepted_submissions = HashMap::new();
     let mut completed_actions: HashMap<String, Value> = HashMap::new();
@@ -427,6 +517,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            Ok(Request::Status) => match runtime.block_on(status_snapshot(&repository)) {
+                Ok(status) => response(json!({"kind":"status","status":status})),
+                Err(_) => {
+                    response(json!({"kind":"error","message":"could not read provider status"}))
+                }
+            },
             Ok(Request::TaskDetail { task_id }) => {
                 match runtime.block_on(task_detail(&repository, task_id, &owned_tasks)) {
                     Ok(detail) => response(json!({"kind":"task_detail","detail":detail})),
@@ -532,6 +628,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if last_snapshot.as_ref() != Some(&snapshot) {
                             last_snapshot = Some(snapshot);
                             response(json!({"kind":"attention_update","attention":attention}));
+                        }
+                        if let Ok(status) = runtime.block_on(status_snapshot(&repository)) {
+                            let snapshot = serde_json::to_string(&status).unwrap_or_default();
+                            if last_status.as_ref() != Some(&snapshot) {
+                                last_status = Some(snapshot);
+                                response(json!({"kind":"status_update","status":status}));
+                            }
                         }
                     }
                     Err(_) => {

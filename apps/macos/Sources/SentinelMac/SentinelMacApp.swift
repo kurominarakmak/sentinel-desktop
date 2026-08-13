@@ -6,6 +6,5 @@ struct SentinelMacApp: App {
 
     var body: some Scene {
         Settings { SettingsView() }
-        Window("Sentinel Status", id: "status") { StatusView() }
     }
 }

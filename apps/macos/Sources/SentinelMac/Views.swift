@@ -286,5 +286,60 @@ struct TaskDetailView: View {
     private func resolved(_ disposition: String) -> Bool { ["resolved", "repaired", "dismissed"].contains(disposition.lowercased()) }
 }
 
-struct StatusView: View { var body: some View { SentinelPanel { Text("Sentinel status").frame(width: 260, alignment: .leading) } } }
+struct StatusView: View {
+    @ObservedObject var bridge: NativeBridge
+
+    var body: some View {
+        SentinelPanel {
+            if let status = bridge.status {
+                VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
+                    HStack { ProviderBadge(provider: "Sentinel"); Spacer(); StateBadge(state: status.sentinel) }
+                    if let task = status.activeTask {
+                        Text(task.summary).font(.subheadline.weight(.semibold)).lineLimit(2)
+                        Text("\(task.lifecycle) · \(status.recoveryRequired ? "recovery required" : "durable state")").font(.caption).foregroundStyle(status.recoveryRequired ? .red : .secondary)
+                    } else {
+                        Text("No active task").font(.caption).foregroundStyle(.secondary)
+                    }
+                    provider(status.codex)
+                    provider(status.claude)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+                    Text("Sentinel Status").font(.headline)
+                    Text(bridge.availabilityMessage ?? "Waiting for the Rust status bridge…").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(minWidth: 320, idealWidth: 360, maxWidth: 420)
+        .onAppear { bridge.loadStatus() }
+    }
+
+    private func provider(_ provider: NativeProviderStatus) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack { ProviderBadge(provider: provider.name); Spacer(); Text(provider.installation).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+            Text(provider.runtime).font(.caption).lineLimit(1)
+            if let limits = provider.rateLimits {
+                rateLimit("Primary", limits["primary"])
+                rateLimit("Secondary", limits["secondary"])
+            } else {
+                Text(provider.usage).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+            }
+        }
+        .padding(.vertical, 3)
+    }
+
+    @ViewBuilder
+    private func rateLimit(_ title: String, _ window: RateLimitWindow?) -> some View {
+        if let window {
+            HStack(spacing: 6) {
+                Text(title).font(.caption2).frame(width: 58, alignment: .leading)
+                ProgressView(value: window.usedPercent, total: 100).frame(maxWidth: .infinity)
+                Text("\(window.usedPercent, specifier: "%.0f")%").font(.caption2.monospacedDigit())
+            }
+            Text([window.resetsAt, window.windowDurationMins.map { "\($0) min window" }].compactMap { $0 }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+        } else {
+            Text("\(title): unavailable").font(.caption2).foregroundStyle(.secondary)
+        }
+    }
+}
 struct SettingsView: View { var body: some View { SentinelPanel { Text("Sentinel settings").frame(width: 260, alignment: .leading) } } }

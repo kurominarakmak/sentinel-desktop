@@ -12,3 +12,4 @@ sentinel-core = { path = "../../../crates/sentinel-core" }
 sentinel-review = { path = "../../../crates/sentinel-review" }
 sentinel-codex = { path = "../../../crates/sentinel-codex" }
 sentinel-git = { path = "../../../crates/sentinel-git" }
+sentinel-agent-api = { path = "../../../crates/sentinel-agent-api" }

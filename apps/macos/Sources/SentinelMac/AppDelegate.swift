@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var quickPrompt: SentinelFloatingPanel?
     private var attention: SentinelFloatingPanel?
     private var detailWindow: NSWindow?
+    private var statusWindow: NSWindow?
     private var hotKeyRef: EventHotKeyRef?
     private var previousApplication: NSRunningApplication?
 
@@ -25,6 +26,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.image = NSImage(systemSymbolName: "scope", accessibilityDescription: "Sentinel")
         item.button?.action = #selector(showQuickPrompt)
         item.button?.target = self
+        let menu = NSMenu()
+        let promptItem = menu.addItem(withTitle: "Quick Prompt", action: #selector(showQuickPrompt), keyEquivalent: "")
+        promptItem.target = self
+        let statusMenuItem = menu.addItem(withTitle: "Status", action: #selector(showStatus), keyEquivalent: "")
+        statusMenuItem.target = self
+        item.menu = menu
         statusItem = item
     }
 
@@ -42,6 +49,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showQuickPrompt() { present(quickPrompt) }
     @objc func showAttention() { present(attention) }
+
+    @objc func showStatus() {
+        if statusWindow == nil {
+            statusWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
+                styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false
+            )
+            statusWindow?.title = "Sentinel Status"
+            statusWindow?.contentView = NSHostingView(rootView: StatusView(bridge: bridge))
+        }
+        statusWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     private func present(_ panel: NSPanel?) {
         guard let panel else { return }
