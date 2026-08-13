@@ -39,13 +39,12 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
   environment, durable redacted results/artifacts, supervisor invocation, and
   explicit restart interruption recovery.
 
-### PARTIAL
+### COMPLETE
 
-- V3 Phase 6 is **PARTIAL**. Phases 6A–6B persist deduplicated read-only
-  findings and one bounded confirmed-blocker repair handoff with fresh
-  deterministic validation; neither reviewer text nor repair-agent text can
-  finalize a task or resolve a finding without corroborating evidence. Phase
-  6C final review/approval orchestration remains.
+- V3 Phase 6 is **COMPLETE**. Read-only review findings, bounded confirmed
+  repair/re-review rounds, fresh deterministic validation, and durable final
+  approval packets are composed without allowing reviewer/implementer text to
+  resolve findings, finalize tasks, or execute a Git final action.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
 
@@ -69,5 +68,5 @@ Existing uncommitted desktop changes were present before this documentation reco
 Phase 2 is complete with known provider limitations recorded in
 [Phase 2D validation](docs/v3-phase2d-validation.md). Phase 3 is COMPLETE WITH
 AUTH-LIMITED VALIDATION; authenticated Claude smoke/reconciliation is deferred
-to Phase 8 or available credentials. Phases 4 and 5 are COMPLETE. Phases 6A–6B
-are complete; final review/approval orchestration remains in 6C.
+to Phase 8 or available credentials. Phases 4–6 are COMPLETE. Next is Phase 7:
+ambient desktop workflow surfaces and task-detail integration.

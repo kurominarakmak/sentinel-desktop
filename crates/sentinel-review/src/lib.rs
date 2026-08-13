@@ -5,8 +5,9 @@
 
 use sentinel_core::{
     v3::{
-        AgentSession, CreateArtifact, CreateRepairRound, CreateReviewFinding, FindingDisposition,
-        RepairRoundId, RepairRoundLifecycle, ReviewFinding, TaskId, ValidationLifecycle,
+        AgentSession, Approval, ApprovalId, ApprovalLifecycle, CreateApproval, CreateArtifact,
+        CreateRepairRound, CreateReviewFinding, FindingDisposition, RepairRoundId,
+        RepairRoundLifecycle, ReviewFinding, SessionLifecycle, TaskId, ValidationLifecycle,
     },
     CoreError, RunRepository,
 };
@@ -248,6 +249,7 @@ pub struct RepairReport {
     pub repair_round_id: RepairRoundId,
     pub resolved: usize,
     pub unresolved: usize,
+    pub validation_passed: bool,
 }
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RepairError {
@@ -297,6 +299,7 @@ impl RepairSupervisor {
         let eligible: Vec<ReviewFinding> = qualified
             .iter()
             .filter(|finding| finding.repair_round_id.is_none())
+            .take(1)
             .cloned()
             .collect();
         if eligible.is_empty() {
@@ -431,6 +434,7 @@ impl RepairSupervisor {
             repair_round_id: final_round.id,
             resolved,
             unresolved,
+            validation_passed: passed,
         })
     }
 }
@@ -481,6 +485,236 @@ fn repair_finding(finding: &ReviewFinding) -> Option<RepairFinding> {
 }
 fn map_repair_core(_: CoreError) -> RepairError {
     RepairError::Storage
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalApproval {
+    pub approval: Approval,
+    pub repair_rounds: usize,
+}
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FinalApprovalError {
+    #[error("worktree reconciliation is required")]
+    Reconciliation,
+    #[error("implementer session is missing or recovery-required")]
+    SessionUnavailable,
+    #[error("deterministic validation did not pass")]
+    ValidationFailed,
+    #[error("confirmed blocker remains unresolved")]
+    UnresolvedBlocker,
+    #[error("repair/re-review round limit reached")]
+    RoundLimitReached,
+    #[error("human approval is required")]
+    ApprovalRequired,
+    #[error("approval was rejected")]
+    ApprovalRejected,
+    #[error("review, repair, or storage failure")]
+    Storage,
+}
+
+/// Creates a durable approval request; it never performs a final Git action.
+pub struct FinalApprovalSupervisor;
+impl FinalApprovalSupervisor {
+    pub async fn prepare(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        profile: ValidationProfile,
+        reviewer: &dyn Reviewer,
+        implementer: &dyn RepairImplementer,
+        max_rounds: u32,
+    ) -> Result<FinalApproval, FinalApprovalError> {
+        if max_rounds == 0 {
+            return Err(FinalApprovalError::RoundLimitReached);
+        }
+        WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| FinalApprovalError::Reconciliation)?;
+        let sessions = repository
+            .v3()
+            .list_sessions_for_task(&task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        if sessions.is_empty()
+            || sessions
+                .iter()
+                .any(|session| session.lifecycle == SessionLifecycle::RecoveryRequired)
+        {
+            return Err(FinalApprovalError::SessionUnavailable);
+        }
+        ReviewSupervisor::run(repository.clone(), task_id.clone(), main, reviewer)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let mut rounds = 0;
+        loop {
+            let findings = repository
+                .v3()
+                .list_review_findings(&task_id)
+                .await
+                .map_err(|_| FinalApprovalError::Storage)?;
+            let confirmed = findings.iter().any(|finding| {
+                finding.disposition == FindingDisposition::ConfirmedBlocking
+                    && matches!(finding.severity.as_str(), "blocker" | "high")
+            });
+            if !confirmed {
+                break;
+            }
+            if rounds >= max_rounds {
+                return Err(FinalApprovalError::RoundLimitReached);
+            }
+            let repair = RepairSupervisor::handoff(
+                repository.clone(),
+                task_id.clone(),
+                main,
+                profile.clone(),
+                implementer,
+            )
+            .await
+            .map_err(|error| match error {
+                RepairError::Reconciliation => FinalApprovalError::Reconciliation,
+                RepairError::Validation => FinalApprovalError::ValidationFailed,
+                RepairError::NoEligibleFindings
+                | RepairError::DuplicateHandoff
+                | RepairError::MalformedFinding => FinalApprovalError::UnresolvedBlocker,
+                _ => FinalApprovalError::Storage,
+            })?;
+            rounds += 1;
+            if !repair.validation_passed {
+                return Err(FinalApprovalError::ValidationFailed);
+            }
+            if repair.unresolved > 0 {
+                return Err(FinalApprovalError::UnresolvedBlocker);
+            }
+            // Every completed repair gets a fresh, read-only review pass.
+            ReviewSupervisor::run(repository.clone(), task_id.clone(), main, reviewer)
+                .await
+                .map_err(|_| FinalApprovalError::Storage)?;
+        }
+        let findings = repository
+            .v3()
+            .list_review_findings(&task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        if findings.iter().any(|finding| {
+            matches!(finding.severity.as_str(), "blocker" | "high")
+                && finding.disposition != FindingDisposition::Repaired
+                && finding.disposition != FindingDisposition::Dismissed
+        }) {
+            return Err(FinalApprovalError::UnresolvedBlocker);
+        }
+        let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let validation = ValidationRunner::run_profile(
+            repository.clone(),
+            task_id.clone(),
+            main,
+            profile,
+            &mut cancellation,
+        )
+        .await
+        .map_err(|_| FinalApprovalError::ValidationFailed)?;
+        if !validation
+            .results
+            .iter()
+            .all(|result| result.outcome == "passed")
+        {
+            return Err(FinalApprovalError::ValidationFailed);
+        }
+        let worktree = WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| FinalApprovalError::Reconciliation)?;
+        let diff = WorktreeTransaction::diff_text(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| FinalApprovalError::Reconciliation)?;
+        let validations = review_validations(&repository, &task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let history = repository
+            .v3()
+            .list_repair_rounds(&task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let unresolved: Vec<_> = findings
+            .iter()
+            .filter(|finding| {
+                finding.disposition != FindingDisposition::Repaired
+                    && finding.disposition != FindingDisposition::Dismissed
+            })
+            .map(|finding| {
+                serde_json::json!({"id":finding.id.to_string(),"severity":finding.severity,"summary":finding.summary,"disposition":finding.disposition})
+            })
+            .collect();
+        let finding_packet: Vec<_> = findings
+            .iter()
+            .map(|finding| {
+                serde_json::json!({"id":finding.id.to_string(),"severity":finding.severity,"disposition":finding.disposition,"summary":finding.summary,"evidence":finding.evidence})
+            })
+            .collect();
+        let repair_history: Vec<_> = history
+            .iter()
+            .map(|round| serde_json::json!({"id":round.id.to_string(),"round_number":round.round_number,"lifecycle":round.lifecycle,"created_at_ms":round.created_at_ms,"updated_at_ms":round.updated_at_ms}))
+            .collect();
+        repository
+            .v3()
+            .create_artifact(
+                CreateArtifact {
+                    task_id: task_id.clone(),
+                    kind: "final_approval_packet".into(),
+                    display_name: "final-approval".into(),
+                    content_hash: None,
+                    metadata: serde_json::json!({"base_commit":worktree.base_commit,"diff":diff,"validations":validations,"findings":finding_packet,"repair_history":repair_history,"unresolved_risks":unresolved}),
+                },
+                now(),
+            )
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let approval = repository
+            .v3()
+            .create_approval(
+                CreateApproval {
+                    task_id,
+                    session_id: None,
+                    action_kind: "v3_final_git_action".into(),
+                    summary:
+                        "Human approval is required before any commit, merge, push, or discard."
+                            .into(),
+                },
+                now(),
+            )
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        Ok(FinalApproval {
+            approval,
+            repair_rounds: rounds as usize,
+        })
+    }
+    pub async fn require_human_approval(
+        repository: RunRepository,
+        approval_id: &ApprovalId,
+        approve: bool,
+    ) -> Result<Approval, FinalApprovalError> {
+        let approval = repository
+            .v3()
+            .get_approval(approval_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        if approval.lifecycle != ApprovalLifecycle::Pending {
+            return Err(FinalApprovalError::ApprovalRequired);
+        }
+        let next = if approve {
+            ApprovalLifecycle::Approved
+        } else {
+            ApprovalLifecycle::Denied
+        };
+        let updated = repository
+            .v3()
+            .transition_approval(&approval, next, now())
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        if !approve {
+            return Err(FinalApprovalError::ApprovalRejected);
+        }
+        Ok(updated)
+    }
 }
 
 #[cfg(test)]
@@ -1098,6 +1332,290 @@ mod tests {
         assert_eq!(
             reopened.v3().list_repair_rounds(&id).await.unwrap().len(),
             1
+        );
+    }
+    async fn owned_session(repo: &RunRepository, id: &TaskId) -> AgentSession {
+        repo.v3()
+            .create_session(
+                CreateSession {
+                    task_id: id.clone(),
+                    provider: "openai.codex.app_server".into(),
+                    provider_session_ref: format!("owned-{id}"),
+                },
+                2,
+            )
+            .await
+            .unwrap()
+    }
+    async fn second_confirmed_repair_finding(repo: &RunRepository, id: &TaskId, main: &Path) {
+        let mut candidate = repair_candidate();
+        candidate.summary = "second guard".into();
+        ReviewSupervisor::run(repo.clone(), id.clone(), main, &Fixed(vec![candidate]))
+            .await
+            .unwrap();
+        let finding = repo
+            .v3()
+            .list_review_findings(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|finding| finding.summary == "second guard")
+            .unwrap();
+        repo.v3()
+            .transition_review_finding(&finding, FindingDisposition::ConfirmedBlocking, 11)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn clean_first_review_creates_final_human_approval_without_finalizing_task() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        let before = repo.v3().get_task(&id).await.unwrap();
+        let final_packet = FinalApprovalSupervisor::prepare(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &Fixed(vec![]),
+            &Repairing {
+                evidence: RepairEvidence {
+                    changed_files: vec![],
+                },
+                seen: Mutex::new(None),
+            },
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(final_packet.repair_rounds, 0);
+        assert_eq!(final_packet.approval.lifecycle, ApprovalLifecycle::Pending);
+        assert_eq!(
+            repo.v3().get_task(&id).await.unwrap().lifecycle,
+            before.lifecycle
+        );
+    }
+    #[tokio::test]
+    async fn one_repair_then_rereview_passes_to_final_approval() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        confirmed_repair_finding(&repo, &id).await;
+        let final_packet = FinalApprovalSupervisor::prepare(
+            repo,
+            id,
+            main.path(),
+            profile("/usr/bin/true"),
+            &Fixed(vec![]),
+            &Repairing {
+                evidence: RepairEvidence {
+                    changed_files: vec!["changed.rs".into()],
+                },
+                seen: Mutex::new(None),
+            },
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(final_packet.repair_rounds, 1);
+        assert_eq!(final_packet.approval.lifecycle, ApprovalLifecycle::Pending);
+    }
+    #[tokio::test]
+    async fn multiple_confirmed_findings_use_bounded_sequential_repair_rounds() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        confirmed_repair_finding(&repo, &id).await;
+        second_confirmed_repair_finding(&repo, &id, main.path()).await;
+        let final_packet = FinalApprovalSupervisor::prepare(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &Fixed(vec![]),
+            &Repairing {
+                evidence: RepairEvidence {
+                    changed_files: vec!["changed.rs".into()],
+                },
+                seen: Mutex::new(None),
+            },
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(final_packet.repair_rounds, 2);
+        assert_eq!(repo.v3().list_repair_rounds(&id).await.unwrap().len(), 2);
+    }
+    #[tokio::test]
+    async fn round_limit_preserves_unresolved_blocker() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        confirmed_repair_finding(&repo, &id).await;
+        second_confirmed_repair_finding(&repo, &id, main.path()).await;
+        assert_eq!(
+            FinalApprovalSupervisor::prepare(
+                repo.clone(),
+                id.clone(),
+                main.path(),
+                profile("/usr/bin/true"),
+                &Fixed(vec![]),
+                &Repairing {
+                    evidence: RepairEvidence {
+                        changed_files: vec!["changed.rs".into()]
+                    },
+                    seen: Mutex::new(None)
+                },
+                1,
+            )
+            .await
+            .unwrap_err(),
+            FinalApprovalError::RoundLimitReached
+        );
+        assert!(repo
+            .v3()
+            .list_review_findings(&id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|finding| finding.disposition == FindingDisposition::ConfirmedBlocking));
+    }
+    #[tokio::test]
+    async fn validation_failure_and_unresolved_blocker_stop_safely() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        assert_eq!(
+            FinalApprovalSupervisor::prepare(
+                repo.clone(),
+                id.clone(),
+                main.path(),
+                profile("/usr/bin/false"),
+                &Fixed(vec![]),
+                &Repairing {
+                    evidence: RepairEvidence {
+                        changed_files: vec![]
+                    },
+                    seen: Mutex::new(None)
+                },
+                1,
+            )
+            .await
+            .unwrap_err(),
+            FinalApprovalError::ValidationFailed
+        );
+        confirmed_repair_finding(&repo, &id).await;
+        assert_eq!(
+            FinalApprovalSupervisor::prepare(
+                repo,
+                id,
+                main.path(),
+                profile("/usr/bin/true"),
+                &Fixed(vec![]),
+                &Repairing {
+                    evidence: RepairEvidence {
+                        changed_files: vec![]
+                    },
+                    seen: Mutex::new(None)
+                },
+                1,
+            )
+            .await
+            .unwrap_err(),
+            FinalApprovalError::UnresolvedBlocker
+        );
+    }
+    #[tokio::test]
+    async fn missing_or_recovery_required_session_refuses_final_orchestration() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        assert_eq!(
+            FinalApprovalSupervisor::prepare(
+                repo.clone(),
+                id.clone(),
+                main.path(),
+                profile("/usr/bin/true"),
+                &Fixed(vec![]),
+                &Repairing {
+                    evidence: RepairEvidence {
+                        changed_files: vec![]
+                    },
+                    seen: Mutex::new(None)
+                },
+                1,
+            )
+            .await
+            .unwrap_err(),
+            FinalApprovalError::SessionUnavailable
+        );
+        let session = owned_session(&repo, &id).await;
+        repo.v3()
+            .transition_session(&session, SessionLifecycle::RecoveryRequired, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            FinalApprovalSupervisor::prepare(
+                repo,
+                id,
+                main.path(),
+                profile("/usr/bin/true"),
+                &Fixed(vec![]),
+                &Repairing {
+                    evidence: RepairEvidence {
+                        changed_files: vec![]
+                    },
+                    seen: Mutex::new(None)
+                },
+                1,
+            )
+            .await
+            .unwrap_err(),
+            FinalApprovalError::SessionUnavailable
+        );
+    }
+    #[tokio::test]
+    async fn final_approval_requires_explicit_human_decision_and_survives_restart() {
+        let (main, database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        let final_packet = FinalApprovalSupervisor::prepare(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &Fixed(vec![]),
+            &Repairing {
+                evidence: RepairEvidence {
+                    changed_files: vec![],
+                },
+                seen: Mutex::new(None),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            FinalApprovalSupervisor::require_human_approval(
+                repo.clone(),
+                &final_packet.approval.id,
+                false
+            )
+            .await
+            .unwrap_err(),
+            FinalApprovalError::ApprovalRejected
+        );
+        assert_eq!(
+            repo.v3()
+                .get_approval(&final_packet.approval.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            ApprovalLifecycle::Denied
+        );
+        drop(repo);
+        let url = format!("sqlite://{}", database.path().join("state.db").display());
+        let reopened = RunRepository::open(&url).await.unwrap();
+        assert_eq!(
+            reopened
+                .v3()
+                .get_approval(&final_packet.approval.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            ApprovalLifecycle::Denied
         );
     }
 }
