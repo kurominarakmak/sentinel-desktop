@@ -87,12 +87,53 @@ struct AttentionWidgetView: View {
     var body: some View {
         SentinelPanel {
             VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
-                HStack { ProviderBadge(provider: "Sentinel"); Spacer(); StateBadge(state: bridge.activeTask?.lifecycle ?? "ready") }
-                Text(bridge.activeTask?.summary ?? "Ready for a task").font(.headline).lineLimit(2)
-                if let reason = bridge.activeTask?.recoveryReason { Text(reason.replacingOccurrences(of: "_", with: " ")).font(.caption).foregroundStyle(.red) }
-                Button("Open Task Detail", action: openDetail).keyboardShortcut(.return)
+                if let attention = bridge.attention {
+                    HStack {
+                        ProviderBadge(provider: attention.provider ?? "Sentinel")
+                        Spacer()
+                        StateBadge(state: attention.displayState)
+                    }
+                    Text(attention.task.summary).font(.headline).lineLimit(2)
+                    if let activity = attention.activity {
+                        Label(activity.replacingOccurrences(of: "_", with: " "), systemImage: "waveform.path.ecg")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    HStack(spacing: SentinelTokens.compactSpacing) {
+                        if let validation = attention.validation { StateBadge(state: "validation \(validation)") }
+                        if let review = attention.review { Text(review).font(.caption2.weight(.semibold)).foregroundStyle(.orange) }
+                    }
+                    if attention.task.recoveryRequired || attention.displayState == "failed" {
+                        Text(attention.task.recoveryReason?.replacingOccurrences(of: "_", with: " ") ?? "Task requires attention.")
+                            .font(.caption).foregroundStyle(.red).lineLimit(2)
+                    }
+                    actions(attention.actions)
+                } else {
+                    HStack { ProviderBadge(provider: "Sentinel"); Spacer(); StateBadge(state: "ready") }
+                    Text("No active task").font(.headline)
+                    Text(bridge.availabilityMessage ?? "Use ⌘⇧Space to create a task.").font(.caption).foregroundStyle(.secondary)
+                    Button("Open Task Detail", action: openDetail)
+                }
+                if let message = bridge.attentionActionMessage {
+                    if bridge.attentionActionInFlight {
+                        Text(message).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    } else {
+                        Text(message).font(.caption).foregroundStyle(.red).lineLimit(2)
+                    }
+                }
             }
-        }.frame(width: SentinelTokens.panelWidth)
+        }
+        .frame(minWidth: SentinelTokens.panelWidth, idealWidth: SentinelTokens.panelWidth, maxWidth: SentinelTokens.panelWidth, minHeight: 180, maxHeight: 260)
+    }
+
+    @ViewBuilder
+    private func actions(_ actions: AttentionActions) -> some View {
+        HStack(spacing: SentinelTokens.compactSpacing) {
+            if actions.stop { Button("Stop") { bridge.requestAttentionAction("stop") }.disabled(bridge.attentionActionInFlight) }
+            if actions.approve { Button("Approve") { bridge.requestAttentionAction("approve") }.disabled(bridge.attentionActionInFlight) }
+            if actions.reject { Button("Reject") { bridge.requestAttentionAction("reject") }.disabled(bridge.attentionActionInFlight) }
+            Spacer()
+            Button("Open Task Detail", action: openDetail).keyboardShortcut(.return)
+        }
     }
 }
 

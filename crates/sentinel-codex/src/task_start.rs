@@ -16,6 +16,8 @@ pub struct StartedCodexTask {
     task: Task,
     server: CodexAppServer,
     session: CodexSession,
+    turn: Option<CodexTurn>,
+    repository: RunRepository,
 }
 
 impl StartedCodexTask {
@@ -24,7 +26,49 @@ impl StartedCodexTask {
     }
 
     pub async fn start_turn(&mut self, prompt: &str) -> Result<CodexTurn, CodexError> {
-        self.server.start_turn(&self.session, prompt).await
+        let turn = self.server.start_turn(&self.session, prompt).await?;
+        self.turn = Some(turn.clone());
+        Ok(turn)
+    }
+
+    pub async fn cancel(&mut self) -> Result<(), CodexError> {
+        let Some(turn) = self.turn.as_ref() else {
+            return Ok(());
+        };
+        let durable = self
+            .repository
+            .v3()
+            .get_session(&self.session.session_id)
+            .await
+            .map_err(|_| CodexError::Storage)?;
+        let durable = self
+            .repository
+            .v3()
+            .transition_session(&durable, SessionLifecycle::Cancelling, now_ms())
+            .await
+            .map_err(|_| CodexError::Storage)?;
+        self.server.interrupt_turn(&self.session, turn).await?;
+        self.repository
+            .v3()
+            .transition_session(&durable, SessionLifecycle::Cancelled, now_ms())
+            .await
+            .map_err(|_| CodexError::Storage)?;
+        let task = self
+            .repository
+            .v3()
+            .get_task(&self.task.id)
+            .await
+            .map_err(|_| CodexError::Storage)?;
+        if !task.lifecycle.terminal() {
+            self.task = self
+                .repository
+                .v3()
+                .transition_task(&task, TaskLifecycle::Cancelled, now_ms())
+                .await
+                .map_err(|_| CodexError::Storage)?;
+        }
+        self.turn = None;
+        Ok(())
     }
 
     pub fn into_parts(self) -> (Task, CodexAppServer, CodexSession) {
@@ -117,6 +161,8 @@ impl CodexTaskStarter {
             task,
             server,
             session,
+            turn: None,
+            repository: self.repository.clone(),
         })
     }
 }

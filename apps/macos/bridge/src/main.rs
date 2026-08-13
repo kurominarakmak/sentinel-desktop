@@ -25,6 +25,7 @@ use std::{
 enum Request {
     Capabilities,
     ActiveTask,
+    AttentionState,
     TaskDetail {
         task_id: String,
     },
@@ -34,6 +35,12 @@ enum Request {
         provider: String,
         summary: String,
         prompt: String,
+    },
+    AttentionAction {
+        request_id: String,
+        action: String,
+        task_id: String,
+        approval_id: Option<String>,
     },
     Supervisor {
         command: String,
@@ -62,6 +69,27 @@ struct TaskDto {
     updated_at_ms: i64,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AttentionActionsDto {
+    stop: bool,
+    approve: bool,
+    reject: bool,
+    approval_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AttentionDto {
+    task: TaskDto,
+    display_state: String,
+    provider: Option<String>,
+    activity: Option<String>,
+    validation: Option<String>,
+    review: Option<String>,
+    actions: AttentionActionsDto,
+}
+
 fn task_dto(task: sentinel_core::v3::Task) -> TaskDto {
     let recovery_required = task.recovery_condition != sentinel_core::v3::RecoveryCondition::None;
     TaskDto {
@@ -80,6 +108,96 @@ async fn active_task(repository: &RunRepository) -> Result<Option<TaskDto>, Core
     let mut tasks = repository.v3().list_tasks().await?;
     tasks.sort_by_key(|task| (task.updated_at_ms, task.version));
     Ok(tasks.pop().map(task_dto))
+}
+
+fn attention_display_state(task: &sentinel_core::v3::Task) -> &'static str {
+    use sentinel_core::v3::TaskLifecycle;
+    if task.recovery_condition != sentinel_core::v3::RecoveryCondition::None {
+        return "recovery_required";
+    }
+    match task.lifecycle {
+        TaskLifecycle::AwaitingApproval => "waiting_for_approval",
+        TaskLifecycle::ReadyForHuman | TaskLifecycle::Reviewing => "ready_for_review",
+        TaskLifecycle::Failed | TaskLifecycle::Blocked => "failed",
+        TaskLifecycle::Cancelled => "cancelled",
+        _ => "working",
+    }
+}
+
+fn provider_identity(provider: String) -> String {
+    if provider.contains("claude") {
+        "Claude Code".into()
+    } else if provider.contains("codex") || provider.contains("openai") {
+        "Codex".into()
+    } else {
+        provider
+    }
+}
+
+async fn attention_state(
+    repository: &RunRepository,
+    owned_tasks: &HashMap<TaskId, StartedCodexTask>,
+) -> Result<Option<AttentionDto>, CoreError> {
+    let Some(task) = active_task_record(repository).await? else {
+        return Ok(None);
+    };
+    let id = task.id.clone();
+    let events = repository.v3().list_events(&id).await?;
+    let sessions = repository.v3().list_sessions_for_task(&id).await?;
+    let validations = repository.v3().list_validation_results(&id).await?;
+    let findings = repository.v3().list_review_findings(&id).await?;
+    let approvals = repository.v3().list_approvals_for_task(&id).await?;
+    let approval_id = approvals
+        .iter()
+        .rev()
+        .find(|approval| {
+            approval.action_kind == "v3_final_git_action"
+                && approval.lifecycle == sentinel_core::v3::ApprovalLifecycle::Pending
+        })
+        .map(|approval| approval.id.to_string());
+    let latest_validation = validations
+        .last()
+        .map(|item| format!("{:?}", item.lifecycle).to_lowercase());
+    let blockers = findings
+        .iter()
+        .filter(|finding| {
+            matches!(finding.severity.as_str(), "blocker" | "high")
+                && !matches!(
+                    format!("{:?}", finding.disposition).to_lowercase().as_str(),
+                    "resolved" | "dismissed" | "repaired"
+                )
+        })
+        .count();
+    let can_stop = !task.lifecycle.terminal()
+        && task.recovery_condition == sentinel_core::v3::RecoveryCondition::None
+        && owned_tasks.contains_key(&id);
+    Ok(Some(AttentionDto {
+        display_state: attention_display_state(&task).into(),
+        provider: sessions
+            .last()
+            .map(|session| provider_identity(session.provider.clone())),
+        activity: events
+            .last()
+            .map(|event| format!("{:?}", event.kind).to_lowercase()),
+        validation: latest_validation,
+        review: (blockers > 0)
+            .then(|| format!("{blockers} blocker{}", if blockers == 1 { "" } else { "s" })),
+        actions: AttentionActionsDto {
+            stop: can_stop,
+            approve: approval_id.is_some(),
+            reject: approval_id.is_some(),
+            approval_id,
+        },
+        task: task_dto(task),
+    }))
+}
+
+async fn active_task_record(
+    repository: &RunRepository,
+) -> Result<Option<sentinel_core::v3::Task>, CoreError> {
+    let mut tasks = repository.v3().list_tasks().await?;
+    tasks.sort_by_key(|task| (task.updated_at_ms, task.version));
+    Ok(tasks.pop())
 }
 
 async fn task_detail(repository: &RunRepository, task_id: String) -> Result<Value, CoreError> {
@@ -148,6 +266,57 @@ async fn start_task(
     Ok(task)
 }
 
+async fn perform_attention_action(
+    repository: &RunRepository,
+    owned_tasks: &mut HashMap<TaskId, StartedCodexTask>,
+    action: String,
+    task_id: String,
+    approval_id: Option<String>,
+) -> Result<(), &'static str> {
+    let state = attention_state(repository, owned_tasks)
+        .await
+        .map_err(|_| "could not read task state")?
+        .ok_or("there is no active task")?;
+    if state.task.id != task_id {
+        return Err("task is no longer active");
+    }
+    match (action.as_str(), approval_id) {
+        ("stop", None) if state.actions.stop => owned_tasks
+            .get_mut(&TaskId(task_id))
+            .ok_or("task session is unavailable")?
+            .cancel()
+            .await
+            .map_err(|_| "stop was rejected by the Rust supervisor"),
+        ("approve", Some(approval_id))
+            if state.actions.approve
+                && state.actions.approval_id.as_deref() == Some(&approval_id) =>
+        {
+            FinalApprovalSupervisor::require_human_approval(
+                repository.clone(),
+                &ApprovalId(approval_id),
+                true,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| "approval was rejected by the Rust supervisor")
+        }
+        ("reject", Some(approval_id))
+            if state.actions.reject
+                && state.actions.approval_id.as_deref() == Some(&approval_id) =>
+        {
+            FinalApprovalSupervisor::require_human_approval(
+                repository.clone(),
+                &ApprovalId(approval_id),
+                false,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| "rejection was rejected by the Rust supervisor")
+        }
+        _ => Err("action is not authorized for the current task"),
+    }
+}
+
 fn response(value: Value) {
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout, "{}", value);
@@ -178,6 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_snapshot = None;
     let mut owned_tasks = HashMap::new();
     let mut accepted_submissions = HashMap::new();
+    let mut completed_actions: HashMap<String, Value> = HashMap::new();
     loop {
         match receiver.recv_timeout(Duration::from_millis(400)) {
             Ok(Request::Capabilities) => response(json!({
@@ -192,6 +362,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(task) => response(json!({"kind":"active_task","task":task})),
                 Err(_) => response(json!({"kind":"error","message":"could not read active task"})),
             },
+            Ok(Request::AttentionState) => {
+                match runtime.block_on(attention_state(&repository, &owned_tasks)) {
+                    Ok(state) => response(json!({"kind":"attention_state","attention":state})),
+                    Err(_) => {
+                        response(json!({"kind":"error","message":"could not read attention state"}))
+                    }
+                }
+            }
             Ok(Request::TaskDetail { task_id }) => match runtime
                 .block_on(task_detail(&repository, task_id))
             {
@@ -239,6 +417,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 }
             }
+            Ok(Request::AttentionAction {
+                request_id,
+                action,
+                task_id,
+                approval_id,
+            }) => {
+                if let Some(result) = completed_actions.get(&request_id) {
+                    response(result.clone());
+                    continue;
+                }
+                let result = runtime.block_on(perform_attention_action(
+                    &repository,
+                    &mut owned_tasks,
+                    action,
+                    task_id,
+                    approval_id,
+                ));
+                let payload = match result {
+                    Ok(()) => {
+                        json!({"kind":"attention_action_result","requestId":request_id,"accepted":true})
+                    }
+                    Err(message) => {
+                        json!({"kind":"attention_action_result","requestId":request_id,"accepted":false,"message":message})
+                    }
+                };
+                completed_actions.insert(request_id, payload.clone());
+                response(payload);
+            }
             Ok(Request::Supervisor {
                 command,
                 approval_id,
@@ -261,12 +467,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             Err(mpsc::RecvTimeoutError::Timeout) if subscribed => {
-                match runtime.block_on(active_task(&repository)) {
-                    Ok(task) => {
-                        let snapshot = serde_json::to_string(&task).unwrap_or_default();
+                match runtime.block_on(attention_state(&repository, &owned_tasks)) {
+                    Ok(attention) => {
+                        let snapshot = serde_json::to_string(&attention).unwrap_or_default();
                         if last_snapshot.as_ref() != Some(&snapshot) {
                             last_snapshot = Some(snapshot);
-                            response(json!({"kind":"task_update","task":task}));
+                            response(json!({"kind":"attention_update","attention":attention}));
                         }
                     }
                     Err(_) => {
@@ -304,6 +510,20 @@ mod tests {
         ));
         assert!(
             serde_json::from_str::<Request>(r#"{"kind":"start_task","provider":"codex"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn attention_actions_are_typed_and_do_not_accept_arbitrary_commands() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"attention_action","request_id":"action-1","action":"stop","task_id":"task-1"}"#
+            ),
+            Ok(Request::AttentionAction { .. })
+        ));
+        assert!(
+            serde_json::from_str::<Request>(r#"{"kind":"attention_action","action":"merge"}"#)
+                .is_err()
         );
     }
 }

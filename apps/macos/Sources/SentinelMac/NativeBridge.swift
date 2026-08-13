@@ -16,6 +16,23 @@ struct ProviderCapability: Codable, Equatable, Identifiable {
     let available: Bool
 }
 
+struct AttentionActions: Codable, Equatable {
+    let stop: Bool
+    let approve: Bool
+    let reject: Bool
+    let approvalID: String?
+}
+
+struct NativeAttention: Codable, Equatable {
+    let task: NativeTask
+    let displayState: String
+    let provider: String?
+    let activity: String?
+    let validation: String?
+    let review: String?
+    let actions: AttentionActions
+}
+
 enum TaskSubmissionState: Equatable {
     case idle
     case sending
@@ -45,16 +62,49 @@ struct TaskSubmissionGate {
     mutating func rejectPending() { pendingRequestID = nil }
 }
 
+struct AttentionActionGate {
+    private(set) var pendingRequestID: String?
+
+    mutating func begin(requestID: String) -> Bool {
+        guard pendingRequestID == nil else { return false }
+        pendingRequestID = requestID
+        return true
+    }
+
+    mutating func complete(requestID: String) -> Bool {
+        guard pendingRequestID == requestID else { return false }
+        pendingRequestID = nil
+        return true
+    }
+}
+
+struct AttentionUpdateGate {
+    private(set) var current: NativeAttention?
+
+    mutating func apply(_ update: NativeAttention?) -> Bool {
+        guard let update else {
+            current = nil
+            return true
+        }
+        if let existing = current?.task, existing.id == update.task.id, update.task.version < existing.version { return false }
+        current = update
+        return true
+    }
+}
+
 enum BridgeMessage: Decodable, Equatable {
     case activeTask(NativeTask?)
     case taskUpdate(NativeTask?)
     case subscribed
     case capabilities(repository: String?, providers: [ProviderCapability])
+    case attentionState(NativeAttention?)
+    case attentionUpdate(NativeAttention?)
+    case attentionActionResult(requestID: String, accepted: Bool, message: String?)
     case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
     case supervisorResult(Bool)
     case unavailable(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, task, ok, message, repository, providers, requestId, accepted }
+    private enum CodingKeys: String, CodingKey { case kind, task, ok, message, repository, providers, requestId, accepted, attention }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -63,6 +113,9 @@ enum BridgeMessage: Decodable, Equatable {
         case "task_update": self = .taskUpdate(try values.decodeIfPresent(NativeTask.self, forKey: .task))
         case "subscribed": self = .subscribed
         case "capabilities": self = .capabilities(repository: try values.decodeIfPresent(String.self, forKey: .repository), providers: try values.decodeIfPresent([ProviderCapability].self, forKey: .providers) ?? [])
+        case "attention_state": self = .attentionState(try values.decodeIfPresent(NativeAttention.self, forKey: .attention))
+        case "attention_update": self = .attentionUpdate(try values.decodeIfPresent(NativeAttention.self, forKey: .attention))
+        case "attention_action_result": self = .attentionActionResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "task_start_result": self = .taskStartResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), task: try values.decodeIfPresent(NativeTask.self, forKey: .task), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "supervisor_result": self = .supervisorResult(try values.decode(Bool.self, forKey: .ok))
         default: self = .unavailable(try values.decodeIfPresent(String.self, forKey: .message) ?? "Native bridge unavailable")
@@ -77,10 +130,15 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var providers: [ProviderCapability] = []
     @Published private(set) var repositoryContext: String?
     @Published private(set) var taskSubmission = TaskSubmissionState.idle
+    @Published private(set) var attention: NativeAttention?
+    @Published private(set) var attentionActionMessage: String?
+    @Published private(set) var attentionActionInFlight = false
 
     private var process: Process?
     private var input: FileHandle?
     private var submissionGate = TaskSubmissionGate()
+    private var attentionActionGate = AttentionActionGate()
+    private var attentionUpdateGate = AttentionUpdateGate()
 
     func start() {
         guard process == nil else { return }
@@ -109,6 +167,7 @@ final class NativeBridge: ObservableObject {
             }
             send(["kind": "subscribe"])
             send(["kind": "active_task"])
+            send(["kind": "attention_state"])
             send(["kind": "capabilities"])
         } catch {
             availabilityMessage = "Native bridge could not start."
@@ -117,6 +176,30 @@ final class NativeBridge: ObservableObject {
 
     func decideFinalApproval(id: String, approve: Bool) {
         send(["kind": "supervisor", "command": "decide_final_approval", "approval_id": id, "approve": approve])
+    }
+
+    func requestAttentionAction(_ action: String) {
+        guard let attention else {
+            attentionActionMessage = "There is no active task."
+            return
+        }
+        let requestID = UUID().uuidString.lowercased()
+        guard attentionActionGate.begin(requestID: requestID) else {
+            attentionActionMessage = "An action is already in progress."
+            return
+        }
+        attentionActionInFlight = true
+        attentionActionMessage = nil
+        var request: [String: Any] = ["kind": "attention_action", "request_id": requestID, "action": action, "task_id": attention.task.id]
+        if (action == "approve" || action == "reject"), let approvalID = attention.actions.approvalID {
+            request["approval_id"] = approvalID
+        }
+        guard send(request) else {
+            _ = attentionActionGate.complete(requestID: requestID)
+            attentionActionInFlight = false
+            attentionActionMessage = "Native bridge is unavailable."
+            return
+        }
     }
 
     func submitTask(provider: String, summary: String, prompt: String) {
@@ -139,6 +222,11 @@ final class NativeBridge: ObservableObject {
     private func receive(_ message: BridgeMessage) {
         switch message {
         case .activeTask(let task), .taskUpdate(let task): activeTask = task
+        case .attentionState(let attention), .attentionUpdate(let attention): apply(attention)
+        case .attentionActionResult(let requestID, let accepted, let message):
+            guard attentionActionGate.complete(requestID: requestID) else { return }
+            attentionActionInFlight = false
+            attentionActionMessage = accepted ? "Action accepted." : (message ?? "Action was rejected.")
         case .capabilities(let repository, let providers):
             repositoryContext = repository
             self.providers = providers
@@ -153,6 +241,12 @@ final class NativeBridge: ObservableObject {
         case .unavailable(let message): availabilityMessage = message
         case .subscribed, .supervisorResult: break
         }
+    }
+
+    private func apply(_ update: NativeAttention?) {
+        guard attentionUpdateGate.apply(update) else { return }
+        attention = attentionUpdateGate.current
+        activeTask = attention?.task
     }
 
     @discardableResult
