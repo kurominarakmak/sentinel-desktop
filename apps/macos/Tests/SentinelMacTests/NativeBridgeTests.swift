@@ -92,6 +92,15 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(status.activeTask?.id, "task-1")
     }
 
+    func testDecodesCodexNumericRateLimitResetAndKeepsTrayPercentage() throws {
+        let data = Data(#"{"kind":"status","status":{"version":1,"sentinel":"ready","activeTask":null,"recoveryRequired":false,"codex":{"name":"Codex","installation":"available","runtime":"active","usage":"live","rateLimits":{"primary":{"usedPercent":39,"resetsAt":1787196921,"windowDurationMins":10080}}},"claude":{"name":"Claude Code","installation":"unavailable","runtime":"none","usage":"unavailable","rateLimits":null}}}"#.utf8)
+        guard case .status(let status) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected status")
+        }
+        XCTAssertEqual(CodexTrayTitle.make(status), "39%")
+        XCTAssertTrue(status.codex.rateLimits?["primary"]?.resetsAt?.contains("T") == true)
+    }
+
     func testStatusGateRejectsStaleAndAcceptsProviderReplacementOrRecovery() {
         let unavailable = NativeProviderStatus(name: "Codex", installation: "unavailable", runtime: "no owned session", usage: "unavailable", rateLimits: nil)
         let claude = NativeProviderStatus(name: "Claude Code", installation: "not installed", runtime: "no owned session", usage: "unavailable", rateLimits: nil)

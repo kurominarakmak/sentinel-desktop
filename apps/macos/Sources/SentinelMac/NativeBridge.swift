@@ -54,13 +54,34 @@ struct NativeTaskDetail: Codable, Equatable {
     let actions: AttentionActions
 }
 
-struct RateLimitWindow: Codable, Equatable {
+struct RateLimitWindow: Decodable, Equatable {
     let usedPercent: Double
     let resetsAt: String?
     let windowDurationMins: Int?
+
+    init(usedPercent: Double, resetsAt: String?, windowDurationMins: Int?) {
+        self.usedPercent = usedPercent
+        self.resetsAt = resetsAt
+        self.windowDurationMins = windowDurationMins
+    }
+
+    private enum CodingKeys: String, CodingKey { case usedPercent, resetsAt, windowDurationMins }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        usedPercent = try values.decode(Double.self, forKey: .usedPercent)
+        windowDurationMins = try values.decodeIfPresent(Int.self, forKey: .windowDurationMins)
+        if let text = try? values.decode(String.self, forKey: .resetsAt) {
+            resetsAt = text
+        } else if let seconds = try? values.decode(Double.self, forKey: .resetsAt) {
+            resetsAt = ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: seconds))
+        } else {
+            resetsAt = nil
+        }
+    }
 }
 
-struct NativeProviderStatus: Codable, Equatable {
+struct NativeProviderStatus: Decodable, Equatable {
     let name: String
     let installation: String
     let runtime: String
@@ -68,7 +89,7 @@ struct NativeProviderStatus: Codable, Equatable {
     let rateLimits: [String: RateLimitWindow]?
 }
 
-struct NativeStatus: Codable, Equatable {
+struct NativeStatus: Decodable, Equatable {
     let version: UInt64
     let sentinel: String
     let activeTask: NativeTask?
