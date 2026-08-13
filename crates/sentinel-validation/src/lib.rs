@@ -147,7 +147,9 @@ impl ValidationRunner {
                 .transition_validation_result(&result, ValidationLifecycle::Running, None, now())
                 .await
                 .map_err(|_| ValidationError::Storage)?;
-            let execution = execute(&step, &owned_worktree, cancellation, running.id.clone()).await;
+            let execution = redact_execution(
+                execute(&step, &owned_worktree, cancellation, running.id.clone()).await,
+            );
             let lifecycle = match execution.outcome.as_str() {
                 "passed" => ValidationLifecycle::Passed,
                 "failed" => ValidationLifecycle::Failed,
@@ -170,6 +172,67 @@ impl ValidationRunner {
             results.push(execution);
         }
         Ok(ValidationReport { results })
+    }
+}
+fn redact_execution(mut execution: ValidationExecution) -> ValidationExecution {
+    execution.command_json = redact_secrets(&execution.command_json);
+    execution.stdout = redact_secrets(&execution.stdout);
+    execution.stderr = redact_secrets(&execution.stderr);
+    execution
+}
+fn redact_secrets(value: &str) -> String {
+    let mut redacted = value.to_owned();
+    for key in [
+        "authorization",
+        "api_key",
+        "api-key",
+        "token",
+        "secret",
+        "password",
+    ] {
+        let mut offset = 0usize;
+        loop {
+            let lower = redacted.to_ascii_lowercase();
+            let Some(found) = lower[offset..].find(key) else {
+                break;
+            };
+            let start = offset + found + key.len();
+            let rest = &redacted[start..];
+            let Some(separator) = rest.find(|c: char| matches!(c, ':' | '=')) else {
+                offset = start;
+                continue;
+            };
+            let value_start = start + separator + 1;
+            let value_start = value_start
+                + redacted[value_start..]
+                    .chars()
+                    .take_while(|character| character.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+            let value_end = redacted[value_start..]
+                .find(|c: char| c.is_whitespace() || matches!(c, ',' | '"'))
+                .map(|end| value_start + end)
+                .unwrap_or(redacted.len());
+            if value_end > value_start {
+                redacted.replace_range(value_start..value_end, "[REDACTED]");
+            }
+            offset = value_start + "[REDACTED]".len();
+        }
+    }
+    redacted
+}
+
+#[cfg(test)]
+mod credential_redaction_tests {
+    use super::redact_secrets;
+
+    #[test]
+    fn secret_bearing_diagnostics_are_redacted_before_persistence() {
+        let value = redact_secrets("Authorization: bearer-secret token=abc123 api_key=xyz");
+        assert!(!value.contains("bearer-secret"));
+        assert!(!value.contains("abc123"));
+        assert!(!value.contains("xyz"));
+        assert!(value.contains("[REDACTED]"));
     }
 }
 fn invalid_step(step: &ValidationStep) -> bool {
