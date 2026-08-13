@@ -9,12 +9,13 @@ pub struct V3TaskDto {
     pub summary: String,
     pub lifecycle: String,
     pub recovery_required: bool,
+    pub recovery_reason: Option<String>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct V3TaskDetailDto {
     pub task: V3TaskDto,
-    pub activity: Vec<String>,
+    pub activity: Vec<serde_json::Value>,
     pub worktree: Option<serde_json::Value>,
     pub diff: Option<serde_json::Value>,
     pub validations: Vec<serde_json::Value>,
@@ -42,6 +43,8 @@ fn task_dto(task: sentinel_core::v3::Task) -> V3TaskDto {
         summary: task.summary,
         lifecycle: format!("{:?}", task.lifecycle).to_lowercase(),
         recovery_required: task.recovery_condition != sentinel_core::v3::RecoveryCondition::None,
+        recovery_reason: (task.recovery_condition != sentinel_core::v3::RecoveryCondition::None)
+            .then(|| format!("{:?}", task.recovery_condition).to_lowercase()),
     }
 }
 #[tauri::command]
@@ -125,15 +128,15 @@ pub async fn get_v3_task_detail(
         .map_err(safe_error)?
         .into_iter()
         .last()
-        .map(|session| session.provider);
+        .map(|session| format!("{} · {:?}", session.provider, session.lifecycle).to_lowercase());
     Ok(V3TaskDetailDto {
         task: task_dto(task),
-        activity: events.into_iter().map(|event| format!("{:?}", event.kind).to_lowercase()).collect(),
-        worktree: worktree.map(|value| serde_json::json!({"branch":value.branch,"baseCommit":value.base_commit,"state":value.state})),
+        activity: events.into_iter().map(|event| serde_json::json!({"kind":format!("{:?}", event.kind).to_lowercase(),"provider":event.provider,"occurredAtMs":event.occurred_at_ms,"payload":event.payload})).collect(),
+        worktree: worktree.map(|value| serde_json::json!({"repositoryRoot":value.repository_root,"path":value.worktree_path,"branch":value.branch,"baseCommit":value.base_commit,"state":value.state})),
         diff: merge.and_then(|value| serde_json::from_str(&value.diff_json).ok()),
-        validations: validations.into_iter().map(|value| serde_json::json!({"id":value.id.to_string(),"check":value.check_name,"state":format!("{:?}", value.lifecycle).to_lowercase(),"summary":value.summary})).collect(),
+        validations: validations.into_iter().map(|value| serde_json::json!({"id":value.id.to_string(),"profile":value.profile_id,"check":value.check_name,"required":value.required,"state":format!("{:?}", value.lifecycle).to_lowercase(),"summary":value.summary,"createdAtMs":value.created_at_ms,"updatedAtMs":value.updated_at_ms})).collect(),
         findings: findings.into_iter().map(|value| serde_json::json!({"id":value.id.to_string(),"severity":value.severity,"disposition":format!("{:?}", value.disposition).to_lowercase(),"summary":value.summary,"evidence":value.evidence})).collect(),
-        repair_rounds: rounds.into_iter().map(|value| serde_json::json!({"id":value.id.to_string(),"round":value.round_number,"state":format!("{:?}", value.lifecycle).to_lowercase()})).collect(),
+        repair_rounds: rounds.into_iter().map(|value| serde_json::json!({"id":value.id.to_string(),"round":value.round_number,"state":format!("{:?}", value.lifecycle).to_lowercase(),"createdAtMs":value.created_at_ms,"updatedAtMs":value.updated_at_ms})).collect(),
         final_approval_packet: final_packet,
         final_approval_id: pending.into_iter().rev().find(|value| value.action_kind == "v3_final_git_action" && value.lifecycle == sentinel_core::v3::ApprovalLifecycle::Pending).map(|value| value.id.to_string()),
         agent,

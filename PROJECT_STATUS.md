@@ -46,11 +46,11 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
   approval packets are composed without allowing reviewer/implementer text to
   resolve findings, finalize tasks, or execute a Git final action.
 
-### PARTIAL
+### COMPLETE
 
-- V3 Phase 7 is **PARTIAL**. Phase 7A adds a compact, event-driven status
-  widget with task detail and supported approval/stop actions; Phase 7B still
-  needs the remaining task-detail and ambient-window refinement.
+- V3 Phase 7 is **COMPLETE**. Quick Prompt, the event-driven Attention Widget,
+  and durable Task Detail expose V3 task state, review/validation evidence,
+  repair history, and human approval actions without inferring workflow state.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
 
@@ -58,7 +58,7 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 
 - Supported Codex and Claude Code adapters with start, stream, cancel, resume/reconcile, and recovery capability reporting.
 - Supervisor-owned worktree transaction lifecycle; configurable build/lint/test profiles; read-only review; confirmed-blocker repair loops; and human-gated final actions.
-- Attention Widget, focus restoration, complete Task Detail, security/recovery/provenance hardening, and final UI redesign.
+- Phase 8 security, recovery, and provenance hardening, followed by final UI redesign.
 
 ### DEFERRED
 
