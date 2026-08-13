@@ -1,12 +1,14 @@
 import type { Phase2AppServices } from "./Phase2App";
 import { ProviderUsageWidget } from "./ProviderUsageWidget";
+import { V3AttentionWidget } from "./V3AttentionWidget";
+import { registerEscapeToHide } from "./escape";
+import { useEffect } from "react";
 
 export function StatusWindow({ services }: { services: Phase2AppServices }) {
-  return <main className="utility-window" aria-live="polite">
-    <header><strong>Agent Sentinel</strong><span className="state-dot" aria-label="Idle" /></header>
-    <p className="utility-title">No active task</p>
-    <p className="muted">Open the prompt to start or review a managed task.</p>
+  useEffect(() => registerEscapeToHide(window, () => services.hidePrompt()), [services]);
+  return <main className="utility-window">
+    <V3AttentionWidget />
     <ProviderUsageWidget />
-    <button onClick={() => void services.hidePrompt()}>Open Prompt</button>
+    <button onClick={() => void services.hidePrompt()}>Hide</button>
   </main>;
 }

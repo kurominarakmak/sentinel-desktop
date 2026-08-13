@@ -48,9 +48,9 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 
 ### PARTIAL
 
-- V3 Phase 7 is **PARTIAL**. The desktop bridge and prompt surface expose
-  durable V3 tasks, attention state, task detail, and explicit final-approval
-  decisions; broader ambient-window refinement remains.
+- V3 Phase 7 is **PARTIAL**. Phase 7A adds a compact, event-driven status
+  widget with task detail and supported approval/stop actions; Phase 7B still
+  needs the remaining task-detail and ambient-window refinement.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
 
