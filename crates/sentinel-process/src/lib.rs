@@ -59,6 +59,50 @@ impl SupervisedProcess {
         Self::start_in_with_environment(program, args, working_directory, true).await
     }
 
+    pub async fn start_in_sanitized_with_env(
+        program: &str,
+        args: &[&str],
+        working_directory: Option<&Path>,
+        environment: &[(String, String)],
+    ) -> Result<(Self, mpsc::Receiver<ProcessEvent>), ProcessError> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .env_clear()
+            .envs(environment.iter().cloned());
+        if let Some(directory) = working_directory {
+            command.current_dir(directory);
+        }
+        #[cfg(unix)]
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.spawn()?;
+        let pid = child.id().ok_or(ProcessError::MissingId)?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let (sender, receiver) = mpsc::channel(64);
+        if let Some(stdout) = stdout {
+            forward_lines(BufReader::new(stdout), sender.clone(), ProcessEvent::Stdout);
+        }
+        if let Some(stderr) = stderr {
+            forward_lines(BufReader::new(stderr), sender.clone(), ProcessEvent::Stderr);
+        }
+        tokio::spawn(async move {
+            let _ = sender;
+        });
+        Ok((Self { child, pid }, receiver))
+    }
+
     async fn start_in_with_environment(
         program: &str,
         args: &[&str],

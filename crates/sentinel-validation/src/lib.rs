@@ -8,7 +8,11 @@ use sentinel_core::{
 use sentinel_process::{ProcessEvent, SupervisedProcess};
 use sentinel_worktree::WorktreeTransaction;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 use tokio::{sync::watch, time};
 
@@ -19,11 +23,30 @@ pub struct ValidationProfile {
     pub steps: Vec<ValidationStep>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryValidationProfiles {
+    pub profiles: Vec<ValidationProfile>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidationStep {
     pub name: String,
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub kind: CheckKind,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
     pub required: bool,
     pub timeout_ms: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckKind {
+    #[default]
+    Custom,
+    Build,
+    Lint,
+    Test,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidationReport {
@@ -37,6 +60,45 @@ pub enum ValidationError {
     Worktree,
     #[error("storage failure")]
     Storage,
+    #[error("profile not found")]
+    ProfileNotFound,
+}
+
+pub fn load_repository_profiles(
+    root: &Path,
+) -> Result<RepositoryValidationProfiles, ValidationError> {
+    let path = root.join(".agent-sentinel").join("validation.json");
+    let bytes = std::fs::read(path).map_err(|_| ValidationError::InvalidProfile)?;
+    let profiles: RepositoryValidationProfiles =
+        serde_json::from_slice(&bytes).map_err(|_| ValidationError::InvalidProfile)?;
+    if profiles.profiles.is_empty()
+        || profiles.profiles.iter().any(|profile| {
+            profile.id.trim().is_empty()
+                || profile.steps.is_empty()
+                || profile.steps.iter().any(invalid_step)
+        })
+    {
+        return Err(ValidationError::InvalidProfile);
+    }
+    Ok(profiles)
+}
+pub struct ValidationSupervisor;
+impl ValidationSupervisor {
+    pub async fn run_selected(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        profile_id: &str,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> Result<ValidationReport, ValidationError> {
+        let profiles = load_repository_profiles(main)?;
+        let profile = profiles
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or(ValidationError::ProfileNotFound)?;
+        ValidationRunner::run_profile(repository, task_id, main, profile, cancellation).await
+    }
 }
 
 pub struct ValidationRunner;
@@ -126,22 +188,50 @@ async fn execute(
     let args: Vec<&str> = step.argv.iter().skip(1).map(String::as_str).collect();
     let mut stdout = String::new();
     let mut stderr = String::new();
-    let (mut process, mut events) =
-        match SupervisedProcess::start_in_sanitized(&step.argv[0], &args, Some(cwd)).await {
-            Ok(value) => value,
-            Err(_) => {
-                return execution(
-                    validation_id,
-                    step,
-                    None,
-                    started,
-                    started_instant,
-                    stdout,
-                    stderr,
-                    "invalid",
-                )
-            }
-        };
+    if step.cwd != "" && step.cwd != "."
+        || step
+            .env
+            .keys()
+            .any(|key| !matches!(key.as_str(), "PATH" | "HOME" | "TMPDIR"))
+    {
+        return execution(
+            validation_id,
+            step,
+            None,
+            started,
+            started_instant,
+            stdout,
+            stderr,
+            "invalid",
+        );
+    }
+    let environment: Vec<(String, String)> = step
+        .env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let (mut process, mut events) = match SupervisedProcess::start_in_sanitized_with_env(
+        &step.argv[0],
+        &args,
+        Some(cwd),
+        &environment,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(_) => {
+            return execution(
+                validation_id,
+                step,
+                None,
+                started,
+                started_instant,
+                stdout,
+                stderr,
+                "invalid",
+            )
+        }
+    };
     let deadline = time::Instant::now() + Duration::from_millis(step.timeout_ms);
     let exit: Option<i32>;
     let outcome;
@@ -260,6 +350,9 @@ mod tests {
         ValidationStep {
             name: name.into(),
             argv: argv.iter().map(|v| (*v).into()).collect(),
+            kind: CheckKind::Custom,
+            cwd: String::new(),
+            env: BTreeMap::new(),
             required: true,
             timeout_ms: 500,
         }
@@ -430,5 +523,34 @@ mod tests {
             ValidationLifecycle::Incomplete
         );
         drop(main);
+    }
+
+    #[tokio::test]
+    async fn repository_profile_loading_and_supervisor_wiring_are_safe() {
+        let (main, _db, repo, task) = fixture().await;
+        let config = main.path().join(".agent-sentinel");
+        std::fs::create_dir(&config).unwrap();
+        std::fs::write(config.join("validation.json"), r#"{"profiles":[{"id":"default","steps":[{"name":"build","argv":["/usr/bin/true"],"kind":"build","cwd":".","timeout_ms":1000,"required":true}]}]}"#).unwrap();
+        let (_tx, mut cancel) = watch::channel(false);
+        let report = ValidationSupervisor::run_selected(
+            repo.clone(),
+            task.clone(),
+            main.path(),
+            "default",
+            &mut cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.results[0].outcome, "passed");
+        assert!(matches!(
+            ValidationSupervisor::run_selected(repo, task, main.path(), "missing", &mut cancel)
+                .await,
+            Err(ValidationError::ProfileNotFound)
+        ));
+        std::fs::write(config.join("validation.json"), "not json").unwrap();
+        assert!(matches!(
+            load_repository_profiles(main.path()),
+            Err(ValidationError::InvalidProfile)
+        ));
     }
 }

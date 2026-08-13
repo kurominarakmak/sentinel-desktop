@@ -19,6 +19,7 @@ dependencies = [
  "sentinel-git",
  "sentinel-process",
  "sentinel-runtime",
+ "sentinel-validation",
  "serde",
  "serde_json",
  "sqlx",

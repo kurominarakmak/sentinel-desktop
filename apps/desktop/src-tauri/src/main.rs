@@ -26,6 +26,8 @@ use sentinel_git::{
     WorktreeDestinationState, WorktreeMetadataLookup,
 };
 use sentinel_runtime::{CancellationResult, CodexExecProgram, FakeAgentProgram, RunOrchestrator};
+use sentinel_validation::ValidationSupervisor;
+
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -72,6 +74,24 @@ struct CodexTaskRequest {
 struct CodexTaskIdRequest {
     task_id: String,
     prompt: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V3ValidationRequest {
+    task_id: String,
+    profile_id: String,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V3ValidationResultDto {
+    profile_id: String,
+    results: Vec<V3ValidationCheckDto>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct V3ValidationCheckDto {
+    validation_id: String,
+    outcome: String,
 }
 /// Explicit Phase 7 public allowlist.  The queue never exposes private event
 /// data, runtime IDs, paths, or audit rows.
@@ -563,6 +583,44 @@ fn spike_diagnostics() -> Diagnostics {
         codex: format_installation(detect_installation(AgentKind::Codex)),
         claude_code: format_installation(detect_installation(AgentKind::ClaudeCode)),
     }
+}
+
+#[tauri::command]
+async fn run_v3_validation_profile(
+    state: State<'_, DesktopState>,
+    request: V3ValidationRequest,
+) -> Result<V3ValidationResultDto, SafeError> {
+    if request.task_id.trim().is_empty() || request.profile_id.trim().is_empty() {
+        return Err(input_error());
+    }
+    let task_id = sentinel_core::v3::TaskId(request.task_id);
+    let worktree = state
+        .repository
+        .v3()
+        .get_task_worktree(&task_id)
+        .await
+        .map_err(safe_error)?;
+    let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
+    let report = ValidationSupervisor::run_selected(
+        state.repository.clone(),
+        task_id,
+        Path::new(&worktree.repository_root),
+        &request.profile_id,
+        &mut cancellation,
+    )
+    .await
+    .map_err(safe_error)?;
+    Ok(V3ValidationResultDto {
+        profile_id: request.profile_id,
+        results: report
+            .results
+            .into_iter()
+            .map(|result| V3ValidationCheckDto {
+                validation_id: result.validation_id.to_string(),
+                outcome: result.outcome,
+            })
+            .collect(),
+    })
 }
 
 #[tauri::command]
@@ -3618,6 +3676,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             spike_diagnostics,
+            run_v3_validation_profile,
             codex_capability,
             codex_rate_limits,
             start_codex_session_task,

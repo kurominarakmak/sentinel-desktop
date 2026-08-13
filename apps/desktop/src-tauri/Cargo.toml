@@ -19,6 +19,7 @@ sentinel-core = { path = "../../../crates/sentinel-core" }
 sentinel-runtime = { path = "../../../crates/sentinel-runtime" }
 sentinel-codex = { path = "../../../crates/sentinel-codex" }
 sentinel-git = { path = "../../../crates/sentinel-git" }
+sentinel-validation = { path = "../../../crates/sentinel-validation" }
 tokio.workspace = true
 unicode-normalization.workspace = true
 
