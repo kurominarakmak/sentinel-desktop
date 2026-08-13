@@ -550,14 +550,22 @@ async fn futures_join_validations(
 }
 
 fn codex_program() -> Option<CodexProgram> {
-    let configured = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE").map(PathBuf::from);
-    let path = configured.or_else(|| {
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|directory| directory.join("codex"))
-                .find(|candidate| candidate.is_file())
+    let path = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
+        .map(PathBuf::from)
+        .filter(|candidate| candidate.is_file())
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|directory| directory.join("codex"))
+                    .find(|candidate| candidate.is_file())
+            })
         })
-    });
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/bin/codex"))
+                .filter(|candidate| candidate.is_file())
+        });
     path.and_then(|path| CodexProgram::from_executable(path).ok())
 }
 
