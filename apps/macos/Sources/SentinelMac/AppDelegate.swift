@@ -29,7 +29,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installPanels() {
-        quickPrompt = SentinelFloatingPanel(title: "Quick Prompt") { QuickPromptView(bridge: self.bridge) }
+        quickPrompt = SentinelFloatingPanel(title: "Quick Prompt") {
+            QuickPromptView(bridge: self.bridge) { [weak self] in
+                self?.quickPrompt?.orderOut(nil)
+                self?.restorePreviousApplication()
+            }
+        }
         attention = SentinelFloatingPanel(title: "Sentinel") { AttentionWidgetView(bridge: self.bridge, openDetail: { self.showTaskDetail() }) }
         quickPrompt?.onHide = { [weak self] in self?.restorePreviousApplication() }
         attention?.onHide = { [weak self] in self?.restorePreviousApplication() }
@@ -47,6 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        if panel === quickPrompt {
+            NotificationCenter.default.post(name: .sentinelQuickPromptShown, object: nil)
+        }
     }
 
     private func restorePreviousApplication() {

@@ -3,13 +3,19 @@
 //! This process owns no workflow decisions. It maps durable V3 state to JSON
 //! snapshots and forwards the already-existing final-approval supervisor call.
 
-use sentinel_core::{v3::ApprovalId, CoreError, RunRepository};
+use sentinel_codex::{CodexProgram, CodexTaskStarter, StartedCodexTask};
+use sentinel_core::{
+    v3::{ApprovalId, TaskId},
+    CoreError, RunRepository,
+};
+use sentinel_git::inspect_repository;
 use sentinel_review::FinalApprovalSupervisor;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{self, BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
     time::Duration,
 };
@@ -17,16 +23,31 @@ use std::{
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Request {
+    Capabilities,
     ActiveTask,
     TaskDetail {
         task_id: String,
     },
     Subscribe,
+    StartTask {
+        request_id: String,
+        provider: String,
+        summary: String,
+        prompt: String,
+    },
     Supervisor {
         command: String,
         approval_id: Option<String>,
         approve: Option<bool>,
     },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderDto {
+    id: String,
+    label: String,
+    available: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -79,6 +100,54 @@ async fn task_detail(repository: &RunRepository, task_id: String) -> Result<Valu
     }))
 }
 
+fn codex_program() -> Option<CodexProgram> {
+    let configured = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE").map(PathBuf::from);
+    let path = configured.or_else(|| {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|directory| directory.join("codex"))
+                .find(|candidate| candidate.is_file())
+        })
+    });
+    path.and_then(|path| CodexProgram::from_executable(path).ok())
+}
+
+fn repository_root() -> Option<PathBuf> {
+    std::env::var_os("SENTINEL_REPOSITORY_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .filter(|path| path.is_dir())
+}
+
+async fn start_task(
+    repository: &RunRepository,
+    program: Option<CodexProgram>,
+    root: &Path,
+    provider: String,
+    summary: String,
+    prompt: String,
+    owned_tasks: &mut HashMap<TaskId, StartedCodexTask>,
+) -> Result<TaskDto, &'static str> {
+    if provider != "codex" || prompt.trim().is_empty() || summary.trim().is_empty() {
+        return Err("task submission was rejected");
+    }
+    if inspect_repository(root).await.is_err() {
+        return Err("repository is unavailable or invalid");
+    }
+    let starter = CodexTaskStarter::new(program, repository.clone());
+    let mut started = starter
+        .start_task(summary, root)
+        .await
+        .map_err(|_| "Codex is unavailable")?;
+    started
+        .start_turn(&prompt)
+        .await
+        .map_err(|_| "Codex rejected the task prompt")?;
+    let task = task_dto(started.task().clone());
+    owned_tasks.insert(TaskId(task.id.clone()), started);
+    Ok(task)
+}
+
 fn response(value: Value) {
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout, "{}", value);
@@ -92,6 +161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = format!("sqlite://{}", PathBuf::from(database_path).display());
     let runtime = tokio::runtime::Runtime::new()?;
     let repository = runtime.block_on(RunRepository::open(&database_url))?;
+    let root = repository_root();
+    let program = codex_program();
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
@@ -105,8 +176,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut subscribed = false;
     let mut last_snapshot = None;
+    let mut owned_tasks = HashMap::new();
+    let mut accepted_submissions = HashMap::new();
     loop {
         match receiver.recv_timeout(Duration::from_millis(400)) {
+            Ok(Request::Capabilities) => response(json!({
+                "kind":"capabilities",
+                "repository":root.as_ref().map(|path| path.display().to_string()),
+                "providers":[
+                    ProviderDto { id:"codex".into(), label:"Codex".into(), available:program.is_some() },
+                    ProviderDto { id:"claude_code".into(), label:"Claude Code".into(), available:false }
+                ]
+            })),
             Ok(Request::ActiveTask) => match runtime.block_on(active_task(&repository)) {
                 Ok(task) => response(json!({"kind":"active_task","task":task})),
                 Err(_) => response(json!({"kind":"error","message":"could not read active task"})),
@@ -121,6 +202,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subscribed = true;
                 last_snapshot = None;
                 response(json!({"kind":"subscribed"}));
+            }
+            Ok(Request::StartTask {
+                request_id,
+                provider,
+                summary,
+                prompt,
+            }) => {
+                if let Some(task) = accepted_submissions.get(&request_id) {
+                    response(
+                        json!({"kind":"task_start_result","requestId":request_id,"accepted":true,"task":task}),
+                    );
+                    continue;
+                }
+                let result = match root.as_deref() {
+                    Some(root) => runtime.block_on(start_task(
+                        &repository,
+                        program.clone(),
+                        root,
+                        provider,
+                        summary,
+                        prompt,
+                        &mut owned_tasks,
+                    )),
+                    None => Err("repository is unavailable or invalid"),
+                };
+                match result {
+                    Ok(task) => {
+                        accepted_submissions.insert(request_id.clone(), task);
+                        response(
+                            json!({"kind":"task_start_result","requestId":request_id,"accepted":true,"task":accepted_submissions.get(&request_id)}),
+                        );
+                    }
+                    Err(message) => response(
+                        json!({"kind":"task_start_result","requestId":request_id,"accepted":false,"message":message}),
+                    ),
+                }
             }
             Ok(Request::Supervisor {
                 command,
@@ -175,5 +292,18 @@ mod tests {
             Ok(Request::ActiveTask)
         ));
         assert!(serde_json::from_str::<Request>(r#"{"kind":"direct_sql"}"#).is_err());
+    }
+
+    #[test]
+    fn task_start_request_requires_provider_and_intent_fields() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"start_task","request_id":"request-1","provider":"codex","summary":"Task","prompt":"Do it"}"#
+            ),
+            Ok(Request::StartTask { .. })
+        ));
+        assert!(
+            serde_json::from_str::<Request>(r#"{"kind":"start_task","provider":"codex"}"#).is_err()
+        );
     }
 }

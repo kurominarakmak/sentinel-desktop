@@ -3125,7 +3125,9 @@ dependencies = [
 name = "sentinel-native-bridge"
 version = "0.1.0"
 dependencies = [
+ "sentinel-codex",
  "sentinel-core",
+ "sentinel-git",
  "sentinel-review",
  "serde",
  "serde_json",

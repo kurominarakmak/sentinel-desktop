@@ -3,9 +3,13 @@
 //! The desktop process owns every App Server it starts.  Provider `turn/completed`
 //! is retained as a normalized event only; it never advances a Sentinel task.
 
-use sentinel_codex::{CodexAppServer, CodexError, CodexProgram, CodexSession, CodexTurn, PROVIDER};
+use sentinel_codex::{
+    CodexAppServer, CodexError, CodexProgram, CodexSession, CodexTaskStarter, CodexTurn, PROVIDER,
+};
+#[cfg(test)]
+use sentinel_core::v3::CreateTask;
 use sentinel_core::{
-    v3::{CreateTask, SessionLifecycle, Task, TaskId, TaskLifecycle},
+    v3::{SessionLifecycle, Task, TaskId, TaskLifecycle},
     RunRepository,
 };
 use std::{
@@ -45,61 +49,10 @@ impl CodexSessionManager {
     }
 
     pub async fn start_task(&self, summary: String, cwd: &Path) -> Result<Task, CodexError> {
-        let task = self
-            .repository
-            .v3()
-            .create_task(
-                CreateTask {
-                    project_id: None,
-                    workflow_id: "codex-v3".into(),
-                    summary,
-                },
-                now_ms(),
-            )
-            .await
-            .map_err(|_| CodexError::Storage)?;
-        let task = self
-            .repository
-            .v3()
-            .transition_task(&task, TaskLifecycle::Preparing, now_ms())
-            .await
-            .map_err(|_| CodexError::Storage)?;
+        let starter = CodexTaskStarter::new(self.program.clone(), self.repository.clone());
+        let started = starter.start_task(summary, cwd).await?;
+        let (task, server, session) = started.into_parts();
         let mut owned = self.sessions.lock().await;
-        let server = self.start_server(&task.id, cwd).await?;
-        let session = match server.start_thread(cwd).await {
-            Ok(session) => session,
-            Err(error) => {
-                let _ = self
-                    .repository
-                    .v3()
-                    .transition_task(&task, TaskLifecycle::Failed, now_ms())
-                    .await;
-                return Err(error);
-            }
-        };
-        let durable = self
-            .repository
-            .v3()
-            .get_session(&session.session_id)
-            .await
-            .map_err(|_| CodexError::Storage)?;
-        let durable = self
-            .repository
-            .v3()
-            .transition_session(&durable, SessionLifecycle::Starting, now_ms())
-            .await
-            .map_err(|_| CodexError::Storage)?;
-        self.repository
-            .v3()
-            .transition_session(&durable, SessionLifecycle::Active, now_ms())
-            .await
-            .map_err(|_| CodexError::Storage)?;
-        let task = self
-            .repository
-            .v3()
-            .transition_task(&task, TaskLifecycle::Implementing, now_ms())
-            .await
-            .map_err(|_| CodexError::Storage)?;
         owned.insert(
             task.id.clone(),
             ManagedSession {

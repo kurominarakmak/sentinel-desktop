@@ -10,14 +10,51 @@ struct NativeTask: Codable, Equatable {
     let updatedAtMs: Int64
 }
 
+struct ProviderCapability: Codable, Equatable, Identifiable {
+    let id: String
+    let label: String
+    let available: Bool
+}
+
+enum TaskSubmissionState: Equatable {
+    case idle
+    case sending
+    case accepted(NativeTask)
+    case rejected(String)
+}
+
+enum TaskSubmissionBegin: Equatable { case accepted(String), rejected(String) }
+
+struct TaskSubmissionGate {
+    private(set) var pendingRequestID: String?
+
+    mutating func begin(prompt: String, providerAvailable: Bool, requestID: String) -> TaskSubmissionBegin {
+        guard pendingRequestID == nil else { return .rejected("Task submission is already in progress.") }
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .rejected("Describe the task before sending.") }
+        guard providerAvailable else { return .rejected("Selected provider is unavailable.") }
+        pendingRequestID = requestID
+        return .accepted(requestID)
+    }
+
+    mutating func complete(requestID: String) -> Bool {
+        guard pendingRequestID == requestID else { return false }
+        pendingRequestID = nil
+        return true
+    }
+
+    mutating func rejectPending() { pendingRequestID = nil }
+}
+
 enum BridgeMessage: Decodable, Equatable {
     case activeTask(NativeTask?)
     case taskUpdate(NativeTask?)
     case subscribed
+    case capabilities(repository: String?, providers: [ProviderCapability])
+    case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
     case supervisorResult(Bool)
     case unavailable(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, task, ok, message }
+    private enum CodingKeys: String, CodingKey { case kind, task, ok, message, repository, providers, requestId, accepted }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -25,6 +62,8 @@ enum BridgeMessage: Decodable, Equatable {
         case "active_task": self = .activeTask(try values.decodeIfPresent(NativeTask.self, forKey: .task))
         case "task_update": self = .taskUpdate(try values.decodeIfPresent(NativeTask.self, forKey: .task))
         case "subscribed": self = .subscribed
+        case "capabilities": self = .capabilities(repository: try values.decodeIfPresent(String.self, forKey: .repository), providers: try values.decodeIfPresent([ProviderCapability].self, forKey: .providers) ?? [])
+        case "task_start_result": self = .taskStartResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), task: try values.decodeIfPresent(NativeTask.self, forKey: .task), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "supervisor_result": self = .supervisorResult(try values.decode(Bool.self, forKey: .ok))
         default: self = .unavailable(try values.decodeIfPresent(String.self, forKey: .message) ?? "Native bridge unavailable")
         }
@@ -35,9 +74,13 @@ enum BridgeMessage: Decodable, Equatable {
 final class NativeBridge: ObservableObject {
     @Published private(set) var activeTask: NativeTask?
     @Published private(set) var availabilityMessage: String?
+    @Published private(set) var providers: [ProviderCapability] = []
+    @Published private(set) var repositoryContext: String?
+    @Published private(set) var taskSubmission = TaskSubmissionState.idle
 
     private var process: Process?
     private var input: FileHandle?
+    private var submissionGate = TaskSubmissionGate()
 
     func start() {
         guard process == nil else { return }
@@ -66,6 +109,7 @@ final class NativeBridge: ObservableObject {
             }
             send(["kind": "subscribe"])
             send(["kind": "active_task"])
+            send(["kind": "capabilities"])
         } catch {
             availabilityMessage = "Native bridge could not start."
         }
@@ -75,18 +119,48 @@ final class NativeBridge: ObservableObject {
         send(["kind": "supervisor", "command": "decide_final_approval", "approval_id": id, "approve": approve])
     }
 
+    func submitTask(provider: String, summary: String, prompt: String) {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestID = UUID().uuidString.lowercased()
+        switch submissionGate.begin(prompt: trimmed, providerAvailable: providers.first(where: { $0.id == provider })?.available == true, requestID: requestID) {
+        case .rejected(let message):
+            taskSubmission = .rejected(message)
+            return
+        case .accepted: break
+        }
+        taskSubmission = .sending
+        guard send(["kind": "start_task", "request_id": requestID, "provider": provider, "summary": summary, "prompt": trimmed]) else {
+            submissionGate.rejectPending()
+            taskSubmission = .rejected("Native bridge is unavailable.")
+            return
+        }
+    }
+
     private func receive(_ message: BridgeMessage) {
         switch message {
         case .activeTask(let task), .taskUpdate(let task): activeTask = task
+        case .capabilities(let repository, let providers):
+            repositoryContext = repository
+            self.providers = providers
+        case .taskStartResult(let requestID, let accepted, let task, let message):
+            guard submissionGate.complete(requestID: requestID) else { return }
+            if accepted, let task {
+                activeTask = task
+                taskSubmission = .accepted(task)
+            } else {
+                taskSubmission = .rejected(message ?? "Task submission was rejected.")
+            }
         case .unavailable(let message): availabilityMessage = message
         case .subscribed, .supervisorResult: break
         }
     }
 
-    private func send(_ value: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: value), let input else { return }
+    @discardableResult
+    private func send(_ value: [String: Any]) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: value), let input else { return false }
         input.write(data)
         input.write(Data("\n".utf8))
+        return true
     }
 
     private func bridgeExecutable() -> URL? {
