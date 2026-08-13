@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var attention: SentinelFloatingPanel?
     private var detailWindow: NSWindow?
     private var statusWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var hotKeyRef: EventHotKeyRef?
     private var previousApplication: NSRunningApplication?
 
@@ -31,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         promptItem.target = self
         let statusMenuItem = menu.addItem(withTitle: "Status", action: #selector(showStatus), keyEquivalent: "")
         statusMenuItem.target = self
+        let settingsMenuItem = menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
+        settingsMenuItem.target = self
         item.menu = menu
         statusItem = item
     }
@@ -60,6 +63,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusWindow?.contentView = NSHostingView(rootView: StatusView(bridge: bridge))
         }
         statusWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showSettings() {
+        if settingsWindow == nil {
+            settingsWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 470),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false
+            )
+            settingsWindow?.title = "Sentinel Settings"
+            settingsWindow?.contentView = NSHostingView(rootView: SettingsView(bridge: bridge))
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 

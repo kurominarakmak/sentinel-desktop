@@ -3130,6 +3130,7 @@ dependencies = [
  "sentinel-core",
  "sentinel-git",
  "sentinel-review",
+ "sentinel-validation",
  "serde",
  "serde_json",
  "tokio",

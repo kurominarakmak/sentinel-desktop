@@ -342,4 +342,116 @@ struct StatusView: View {
         }
     }
 }
-struct SettingsView: View { var body: some View { SentinelPanel { Text("Sentinel settings").frame(width: 260, alignment: .leading) } } }
+struct SettingsView: View {
+    @ObservedObject var bridge: NativeBridge
+
+    var body: some View {
+        ScrollView {
+            SentinelPanel {
+                if let settings = bridge.settings {
+                    VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
+                        HStack {
+                            ProviderBadge(provider: "Sentinel")
+                            Spacer()
+                            Text("Settings").font(.headline)
+                        }
+                        general(settings)
+                        providers(settings)
+                        validation(settings)
+                        Text("Workflow, security, credentials, and provider authentication remain managed by Rust.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+                        Text("Sentinel Settings").font(.headline)
+                        Text(bridge.availabilityMessage ?? "Waiting for Rust-confirmed settings…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding()
+        }
+        .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 470)
+        .onAppear { bridge.loadSettings() }
+    }
+
+    private func general(_ settings: NativeSettings) -> some View {
+        settingsSection("General") {
+            settingRow("Global shortcut", settings.globalShortcut)
+            settingRow("Default provider", settings.defaultProvider.capitalized)
+            settingRow("Repository", settings.repository ?? "No repository context")
+        }
+    }
+
+    private func providers(_ settings: NativeSettings) -> some View {
+        settingsSection("Providers") {
+            provider(settings.codex)
+            Divider()
+            provider(settings.claude)
+        }
+    }
+
+    private func provider(_ provider: SettingsProvider) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                ProviderBadge(provider: provider.name)
+                Spacer()
+                Text(provider.installation).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if let override = provider.executableOverride {
+                settingRow("Executable override", override)
+            } else {
+                Text("No configured executable override.").font(.caption).foregroundStyle(.secondary)
+            }
+            if !provider.supportsExecutableOverride {
+                Text("Executable overrides are configured by Rust at startup and are not editable here.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Text(provider.authentication).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+        }
+    }
+
+    private func validation(_ settings: NativeSettings) -> some View {
+        settingsSection("Validation") {
+            if let error = settings.validationError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            } else if settings.validationProfiles.isEmpty {
+                Text("No repository validation profiles are configured.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(settings.validationProfiles, id: \.id) { profile in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(profile.id).font(.caption.weight(.semibold))
+                        ForEach(Array(profile.steps.enumerated()), id: \.offset) { _, step in
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("\(step.kind.capitalized) · \(step.name)").font(.caption)
+                                Text("\(step.cwd) · \(step.timeoutMs) ms\(step.required ? " · required" : "")")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func settingsSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            Text(title).font(.subheadline.weight(.semibold))
+            content()
+        }
+    }
+
+    private func settingRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: SentinelTokens.compactSpacing) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 124, alignment: .leading)
+            Text(value).font(.caption).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+        }
+    }
+}

@@ -11,6 +11,7 @@ use sentinel_core::{
 };
 use sentinel_git::inspect_repository;
 use sentinel_review::FinalApprovalSupervisor;
+use sentinel_validation::load_repository_profiles;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -28,6 +29,7 @@ enum Request {
     ActiveTask,
     AttentionState,
     Status,
+    Settings,
     TaskDetail {
         task_id: String,
     },
@@ -111,6 +113,46 @@ struct StatusDto {
     recovery_required: bool,
     codex: ProviderStatusDto,
     claude: ProviderStatusDto,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SettingsProviderDto {
+    name: String,
+    installation: String,
+    executable_override: Option<String>,
+    supports_executable_override: bool,
+    authentication: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SettingsProfileStepDto {
+    name: String,
+    kind: String,
+    cwd: String,
+    timeout_ms: u64,
+    required: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SettingsProfileDto {
+    id: String,
+    steps: Vec<SettingsProfileStepDto>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SettingsDto {
+    version: u64,
+    global_shortcut: String,
+    repository: Option<String>,
+    default_provider: String,
+    codex: SettingsProviderDto,
+    claude: SettingsProviderDto,
+    validation_profiles: Vec<SettingsProfileDto>,
+    validation_error: Option<String>,
 }
 
 fn task_dto(task: sentinel_core::v3::Task) -> TaskDto {
@@ -286,6 +328,77 @@ async fn status_snapshot(repository: &RunRepository) -> Result<StatusDto, CoreEr
             usage: "Authenticated usage is unavailable in the native bridge.".into(),
             rate_limits: None,
         },
+    })
+}
+
+async fn settings_snapshot(
+    repository: &RunRepository,
+    root: Option<&Path>,
+) -> Result<SettingsDto, CoreError> {
+    let version = active_task_record(repository)
+        .await?
+        .map(|task| task.version)
+        .unwrap_or(0);
+    let (validation_profiles, validation_error) = match root {
+        Some(root) => match load_repository_profiles(root) {
+            Ok(profiles) => (
+                profiles
+                    .profiles
+                    .into_iter()
+                    .map(|profile| SettingsProfileDto {
+                        id: profile.id,
+                        steps: profile
+                            .steps
+                            .into_iter()
+                            .map(|step| SettingsProfileStepDto {
+                                name: step.name,
+                                kind: format!("{:?}", step.kind).to_lowercase(),
+                                cwd: step.cwd,
+                                timeout_ms: step.timeout_ms,
+                                required: step.required,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                None,
+            ),
+            Err(_) => (
+                Vec::new(),
+                Some("Repository validation configuration is unavailable or invalid.".into()),
+            ),
+        },
+        None => (
+            Vec::new(),
+            Some("No repository context is available.".into()),
+        ),
+    };
+    let codex_override = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(|path| path.display().to_string());
+    Ok(SettingsDto {
+        version,
+        global_shortcut: "Command+Shift+Space".into(),
+        repository: root.map(|path| path.display().to_string()),
+        default_provider: "codex".into(),
+        codex: SettingsProviderDto {
+            name: "Codex".into(),
+            installation: installation_status(detect_installation(AgentKind::Codex)),
+            executable_override: codex_override,
+            supports_executable_override: false,
+            authentication: "CLI-owned authentication; credentials are not exposed to Sentinel."
+                .into(),
+        },
+        claude: SettingsProviderDto {
+            name: "Claude Code".into(),
+            installation: installation_status(detect_installation(AgentKind::ClaudeCode)),
+            executable_override: None,
+            supports_executable_override: false,
+            authentication: "Authentication state is unavailable unless the provider proves it."
+                .into(),
+        },
+        validation_profiles,
+        validation_error,
     })
 }
 
@@ -523,6 +636,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     response(json!({"kind":"error","message":"could not read provider status"}))
                 }
             },
+            Ok(Request::Settings) => {
+                match runtime.block_on(settings_snapshot(&repository, root.as_deref())) {
+                    Ok(settings) => response(json!({"kind":"settings","settings":settings})),
+                    Err(_) => response(json!({"kind":"error","message":"could not read settings"})),
+                }
+            }
             Ok(Request::TaskDetail { task_id }) => {
                 match runtime.block_on(task_detail(&repository, task_id, &owned_tasks)) {
                     Ok(detail) => response(json!({"kind":"task_detail","detail":detail})),

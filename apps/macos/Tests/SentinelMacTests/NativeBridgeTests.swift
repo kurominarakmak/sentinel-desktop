@@ -105,4 +105,36 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(gate.current?.activeTask?.id, "task-2")
         XCTAssertTrue(gate.current?.recoveryRequired == true)
     }
+
+    func testDecodesSanitizedSettingsSnapshotAndConfiguredExecutableOverride() throws {
+        let data = Data(#"{"kind":"settings","settings":{"version":8,"globalShortcut":"Command+Shift+Space","repository":"/repo","defaultProvider":"codex","codex":{"name":"Codex","installation":"available","executableOverride":"/usr/local/bin/codex","supportsExecutableOverride":false,"authentication":"CLI-owned authentication; credentials are not exposed to Sentinel."},"claude":{"name":"Claude Code","installation":"unavailable","executableOverride":null,"supportsExecutableOverride":false,"authentication":"Authentication state is unavailable unless the provider proves it."},"validationProfiles":[{"id":"default","steps":[{"name":"unit","kind":"test","cwd":".","timeoutMs":120000,"required":true}]}],"validationError":null,"token":"secret-value"}}"#.utf8)
+        guard case .settings(let settings) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected settings snapshot")
+        }
+        XCTAssertEqual(settings.codex.executableOverride, "/usr/local/bin/codex")
+        XCTAssertFalse(settings.codex.supportsExecutableOverride)
+        XCTAssertEqual(settings.validationProfiles.first?.steps.first?.kind, "test")
+        XCTAssertFalse(String(describing: settings).contains("secret-value"))
+    }
+
+    func testSettingsSnapshotRepresentsRejectedOrUnsupportedOverridesWithoutMutation() throws {
+        let data = Data(#"{"kind":"settings","settings":{"version":9,"globalShortcut":"Command+Shift+Space","repository":null,"defaultProvider":"codex","codex":{"name":"Codex","installation":"unavailable","executableOverride":null,"supportsExecutableOverride":false,"authentication":"CLI-owned authentication; credentials are not exposed to Sentinel."},"claude":{"name":"Claude Code","installation":"unavailable","executableOverride":null,"supportsExecutableOverride":false,"authentication":"Authentication state is unavailable unless the provider proves it."},"validationProfiles":[],"validationError":"No repository context is available."}}"#.utf8)
+        guard case .settings(let settings) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected settings snapshot")
+        }
+        XCTAssertNil(settings.codex.executableOverride)
+        XCTAssertFalse(settings.codex.supportsExecutableOverride)
+        XCTAssertNotNil(settings.validationError)
+    }
+
+    func testSettingsGateRejectsStaleSnapshotAndPreservesConfirmedState() {
+        let provider = SettingsProvider(name: "Codex", installation: "available", executableOverride: nil, supportsExecutableOverride: false, authentication: "CLI-owned")
+        let claude = SettingsProvider(name: "Claude Code", installation: "unavailable", executableOverride: nil, supportsExecutableOverride: false, authentication: "unavailable")
+        let confirmed = NativeSettings(version: 4, globalShortcut: "Command+Shift+Space", repository: "/repo", defaultProvider: "codex", codex: provider, claude: claude, validationProfiles: [], validationError: nil)
+        let stale = NativeSettings(version: 3, globalShortcut: "Command+Shift+Space", repository: nil, defaultProvider: "codex", codex: provider, claude: claude, validationProfiles: [], validationError: "stale")
+        var gate = SettingsUpdateGate()
+        XCTAssertTrue(gate.apply(confirmed))
+        XCTAssertFalse(gate.apply(stale))
+        XCTAssertEqual(gate.current?.repository, "/repo")
+    }
 }
