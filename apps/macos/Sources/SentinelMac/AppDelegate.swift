@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var attention: SentinelFloatingPanel?
     private var detailWindow: NSWindow?
     private var statusWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var hotKeyRef: EventHotKeyRef?
     private var surfaceRegistry = NativeSurfaceRegistry()
     private var previousApplicationFocus = PreviousApplicationFocus()
@@ -27,6 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        .terminateCancel
     }
 
     private func installStatusItem() {
@@ -108,8 +113,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showSettings() {
-        _ = surfaceRegistry.requestOpen(.settings)
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: self)
+        if settingsWindow == nil {
+            _ = surfaceRegistry.requestOpen(.settings)
+            settingsWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 470),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false
+            )
+            settingsWindow?.title = "Sentinel Settings"
+            settingsWindow?.isReleasedWhenClosed = false
+            settingsWindow?.contentView = NSHostingView(rootView: SettingsView(bridge: bridge))
+        }
+        settingsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func present(_ panel: NSPanel?) {

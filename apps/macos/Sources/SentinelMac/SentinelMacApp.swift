@@ -1,10 +1,14 @@
-import SwiftUI
+import AppKit
 
 @main
-struct SentinelMacApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
+enum SentinelMacApp {
+    private static var retainedDelegate: AppDelegate?
 
-    var body: some Scene {
-        Settings { SettingsView(bridge: delegate.bridge) }
+    static func main() {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        retainedDelegate = delegate
+        application.delegate = delegate
+        application.run()
     }
 }
