@@ -11,6 +11,7 @@ members = [
   "crates/sentinel-claude",
   "crates/sentinel-worktree",
   "crates/sentinel-validation",
+  "crates/sentinel-review",
   "apps/desktop/src-tauri",
 ]
 resolver = "2"

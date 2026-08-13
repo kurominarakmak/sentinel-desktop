@@ -53,6 +53,39 @@ pub struct CleanupResult {
     pub outcome: TaskWorktreeCleanupOutcome,
 }
 impl WorktreeTransaction {
+    pub async fn diff(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+    ) -> Result<WorktreeDiff, TransactionError> {
+        let worktree = Self::reopen(repository, task_id, main).await?;
+        diff_at_base(Path::new(&worktree.worktree_path), &worktree.base_commit).await
+    }
+    /// Obtain an immutable review diff. No Git mutation command is invoked.
+    pub async fn diff_text(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+    ) -> Result<String, TransactionError> {
+        let worktree = Self::reopen(repository, task_id, main).await?;
+        let mut text = git_output(
+            Path::new(&worktree.worktree_path),
+            &["diff", "--no-ext-diff", "--binary", &worktree.base_commit],
+        )
+        .await?;
+        // Git's normal diff intentionally omits untracked content. Preserve
+        // their presence as review evidence without reading their contents.
+        for file in diff_at_base(Path::new(&worktree.worktree_path), &worktree.base_commit)
+            .await?
+            .files
+            .into_iter()
+            .filter(|file| file.untracked)
+        {
+            text.push_str("\n# untracked file: ");
+            text.push_str(&file.path);
+        }
+        Ok(text)
+    }
     pub async fn create(
         repository: RunRepository,
         task_id: TaskId,

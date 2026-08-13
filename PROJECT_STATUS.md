@@ -38,6 +38,13 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
   run ordered fixed-argv checks only in reconciled task worktrees, with allowed
   environment, durable redacted results/artifacts, supervisor invocation, and
   explicit restart interruption recovery.
+
+### PARTIAL
+
+- V3 Phase 6 is **PARTIAL**. Phase 6A persists deduplicated read-only reviewer
+  findings from a reconciled task-worktree diff and deterministic validation
+  evidence; it never grants write authority or finalizes a task. Phases 6B–6C
+  (bounded repair and final review/approval orchestration) remain.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
 
@@ -61,5 +68,5 @@ Existing uncommitted desktop changes were present before this documentation reco
 Phase 2 is complete with known provider limitations recorded in
 [Phase 2D validation](docs/v3-phase2d-validation.md). Phase 3 is COMPLETE WITH
 AUTH-LIMITED VALIDATION; authenticated Claude smoke/reconciliation is deferred
-to Phase 8 or available credentials. Phases 4 and 5 are COMPLETE. Next is
-Phase 6: read-only review and bounded repair workflow.
+to Phase 8 or available credentials. Phases 4 and 5 are COMPLETE. Phase 6A is
+complete; bounded repair and final review/approval orchestration remain in 6B–6C.

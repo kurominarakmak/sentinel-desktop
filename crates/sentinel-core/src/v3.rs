@@ -980,6 +980,19 @@ impl V3Repository {
             .transpose()?
             .ok_or(CoreError::NotFound)
     }
+    pub async fn list_validation_results(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<ValidationResult>, CoreError> {
+        sqlx::query("SELECT * FROM v3_validation_results WHERE task_id=? ORDER BY created_at_ms ASC, id ASC")
+            .bind(task_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .iter()
+            .map(validation_from)
+            .collect()
+    }
     pub async fn transition_validation_result(
         &self,
         value: &ValidationResult,
@@ -1108,6 +1121,21 @@ impl V3Repository {
             .map(|row| finding_from(&row))
             .transpose()?
             .ok_or(CoreError::NotFound)
+    }
+    pub async fn list_review_findings(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<ReviewFinding>, CoreError> {
+        sqlx::query(
+            "SELECT * FROM v3_review_findings WHERE task_id=? ORDER BY created_at_ms ASC, id ASC",
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| CoreError::Storage)?
+        .iter()
+        .map(finding_from)
+        .collect()
     }
     pub async fn transition_review_finding(
         &self,
