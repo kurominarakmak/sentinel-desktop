@@ -1068,6 +1068,21 @@ impl V3Repository {
             .transpose()?
             .ok_or(CoreError::NotFound)
     }
+    pub async fn list_repair_rounds(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<RepairRound>, CoreError> {
+        sqlx::query(
+            "SELECT * FROM v3_repair_rounds WHERE task_id=? ORDER BY round_number ASC, id ASC",
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| CoreError::Storage)?
+        .iter()
+        .map(repair_round_from)
+        .collect()
+    }
     pub async fn transition_repair_round(
         &self,
         round: &RepairRound,
@@ -1147,6 +1162,26 @@ impl V3Repository {
         let result = sqlx::query("UPDATE v3_review_findings SET disposition=?,updated_at_ms=? WHERE id=? AND disposition=?")
             .bind(enum_name(&next)).bind(timestamp).bind(finding.id.to_string())
             .bind(enum_name(&finding.disposition)).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        if result.rows_affected() != 1 {
+            return Err(CoreError::V3Conflict);
+        }
+        self.get_review_finding(&finding.id).await
+    }
+    pub async fn assign_review_finding_to_repair_round(
+        &self,
+        finding: &ReviewFinding,
+        round: &RepairRound,
+        timestamp: i64,
+    ) -> Result<ReviewFinding, CoreError> {
+        if finding.task_id != round.task_id
+            || finding.repair_round_id.is_some()
+            || finding.disposition != FindingDisposition::ConfirmedBlocking
+        {
+            return Err(CoreError::InvalidV3Record);
+        }
+        let result = sqlx::query("UPDATE v3_review_findings SET repair_round_id=?,updated_at_ms=? WHERE id=? AND repair_round_id IS NULL AND disposition='confirmed_blocking'")
+            .bind(round.id.to_string()).bind(timestamp).bind(finding.id.to_string())
+            .execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
         if result.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }

@@ -3147,6 +3147,7 @@ name = "sentinel-review"
 version = "0.1.0"
 dependencies = [
  "sentinel-core",
+ "sentinel-validation",
  "sentinel-worktree",
  "serde",
  "serde_json",

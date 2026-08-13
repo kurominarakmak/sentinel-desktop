@@ -4,9 +4,13 @@
 //! This makes the review boundary intentionally incapable of changing a task tree.
 
 use sentinel_core::{
-    v3::{CreateReviewFinding, TaskId, ValidationLifecycle},
+    v3::{
+        AgentSession, CreateArtifact, CreateRepairRound, CreateReviewFinding, FindingDisposition,
+        RepairRoundId, RepairRoundLifecycle, ReviewFinding, TaskId, ValidationLifecycle,
+    },
     CoreError, RunRepository,
 };
+use sentinel_validation::{ValidationProfile, ValidationRunner};
 use sentinel_worktree::{ChangedFileState, WorktreeTransaction};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::Path};
@@ -203,11 +207,287 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The bounded, serializable handoff supplied to a supported Codex or Claude
+/// adapter. The adapter receives an opaque Sentinel-owned session reference,
+/// never a reviewer capability.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairPacket {
+    pub repair_round_id: String,
+    pub task_id: String,
+    pub findings: Vec<RepairFinding>,
+    pub validations: Vec<ReviewValidation>,
+    pub implementer_session_id: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairFinding {
+    pub id: String,
+    pub summary: String,
+    pub file: String,
+    pub line: u32,
+    pub evidence: String,
+}
+/// This is the only write-capable boundary. Codex/Claude adapter integration
+/// implements it using a Sentinel-owned task session; reviewer implementations
+/// cannot implement this path because they receive no worktree handle.
+pub trait RepairImplementer: Send + Sync {
+    fn repair(
+        &self,
+        session: Option<&AgentSession>,
+        packet: &RepairPacket,
+    ) -> Result<RepairEvidence, RepairError>;
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairEvidence {
+    /// Files the implementer says it changed. This claim is insufficient on
+    /// its own; the supervisor confirms it against the pinned-base diff and
+    /// a fresh deterministic validation run.
+    pub changed_files: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairReport {
+    pub repair_round_id: RepairRoundId,
+    pub resolved: usize,
+    pub unresolved: usize,
+}
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RepairError {
+    #[error("no eligible confirmed blocker findings")]
+    NoEligibleFindings,
+    #[error("finding was already handed off")]
+    DuplicateHandoff,
+    #[error("malformed persisted finding")]
+    MalformedFinding,
+    #[error("worktree reconciliation is required")]
+    Reconciliation,
+    #[error("repair implementer failed")]
+    Implementer,
+    #[error("validation failed")]
+    Validation,
+    #[error("storage failure")]
+    Storage,
+}
+
+pub struct RepairSupervisor;
+impl RepairSupervisor {
+    pub async fn handoff(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        profile: ValidationProfile,
+        implementer: &dyn RepairImplementer,
+    ) -> Result<RepairReport, RepairError> {
+        // The persisted worktree identity must be current before any adapter
+        // receives a repair request.
+        WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| RepairError::Reconciliation)?;
+        let findings = repository
+            .v3()
+            .list_review_findings(&task_id)
+            .await
+            .map_err(map_repair_core)?;
+        let qualified: Vec<ReviewFinding> = findings
+            .iter()
+            .filter(|finding| {
+                finding.disposition == FindingDisposition::ConfirmedBlocking
+                    && matches!(finding.severity.as_str(), "blocker" | "high")
+            })
+            .cloned()
+            .collect();
+        let eligible: Vec<ReviewFinding> = qualified
+            .iter()
+            .filter(|finding| finding.repair_round_id.is_none())
+            .cloned()
+            .collect();
+        if eligible.is_empty() {
+            return if qualified.is_empty() {
+                Err(RepairError::NoEligibleFindings)
+            } else {
+                Err(RepairError::DuplicateHandoff)
+            };
+        }
+        if eligible
+            .iter()
+            .any(|finding| repair_finding(finding).is_none())
+        {
+            return Err(RepairError::MalformedFinding);
+        }
+        let rounds = repository
+            .v3()
+            .list_repair_rounds(&task_id)
+            .await
+            .map_err(map_repair_core)?;
+        let round = repository
+            .v3()
+            .create_repair_round(
+                CreateRepairRound {
+                    task_id: task_id.clone(),
+                    round_number: rounds.len() as u32 + 1,
+                },
+                now(),
+            )
+            .await
+            .map_err(map_repair_core)?;
+        let active = repository
+            .v3()
+            .transition_repair_round(&round, RepairRoundLifecycle::Active, now())
+            .await
+            .map_err(map_repair_core)?;
+        let mut assigned = Vec::with_capacity(eligible.len());
+        for finding in &eligible {
+            assigned.push(
+                repository
+                    .v3()
+                    .assign_review_finding_to_repair_round(finding, &active, now())
+                    .await
+                    .map_err(map_repair_core)?,
+            );
+        }
+        let validations = review_validations(&repository, &task_id).await?;
+        let session = repository
+            .v3()
+            .list_sessions_for_task(&task_id)
+            .await
+            .map_err(map_repair_core)?
+            .into_iter()
+            .last();
+        let packet = RepairPacket {
+            repair_round_id: active.id.to_string(),
+            task_id: task_id.to_string(),
+            findings: assigned.iter().filter_map(repair_finding).collect(),
+            validations,
+            implementer_session_id: session.as_ref().map(|value| value.id.to_string()),
+        };
+        repository
+            .v3()
+            .create_artifact(
+                CreateArtifact {
+                    task_id: task_id.clone(),
+                    kind: "repair_handoff".into(),
+                    display_name: format!("repair-round-{}", active.round_number),
+                    content_hash: None,
+                    metadata: serde_json::to_value(&packet).map_err(|_| RepairError::Storage)?,
+                },
+                now(),
+            )
+            .await
+            .map_err(map_repair_core)?;
+        let evidence = implementer.repair(session.as_ref(), &packet)?;
+        let awaiting = repository
+            .v3()
+            .transition_repair_round(&active, RepairRoundLifecycle::AwaitingValidation, now())
+            .await
+            .map_err(map_repair_core)?;
+        let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        let validation = ValidationRunner::run_profile(
+            repository.clone(),
+            task_id.clone(),
+            main,
+            profile,
+            &mut cancellation,
+        )
+        .await
+        .map_err(|_| RepairError::Validation)?;
+        let passed = validation
+            .results
+            .iter()
+            .all(|result| result.outcome == "passed");
+        let changed = WorktreeTransaction::diff(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| RepairError::Reconciliation)?;
+        let changed_files: std::collections::HashSet<_> =
+            changed.files.into_iter().map(|file| file.path).collect();
+        let reported_files: std::collections::HashSet<_> =
+            evidence.changed_files.into_iter().collect();
+        let mut resolved = 0;
+        if passed {
+            for finding in assigned {
+                let file = repair_finding(&finding).expect("prevalidated finding").file;
+                if changed_files.contains(&file) && reported_files.contains(&file) {
+                    repository
+                        .v3()
+                        .transition_review_finding(&finding, FindingDisposition::Repaired, now())
+                        .await
+                        .map_err(map_repair_core)?;
+                    resolved += 1;
+                }
+            }
+        }
+        let unresolved = eligible.len() - resolved;
+        let final_round = repository
+            .v3()
+            .transition_repair_round(
+                &awaiting,
+                if unresolved == 0 {
+                    RepairRoundLifecycle::Resolved
+                } else {
+                    RepairRoundLifecycle::Exhausted
+                },
+                now(),
+            )
+            .await
+            .map_err(map_repair_core)?;
+        Ok(RepairReport {
+            repair_round_id: final_round.id,
+            resolved,
+            unresolved,
+        })
+    }
+}
+async fn review_validations(
+    repository: &RunRepository,
+    task_id: &TaskId,
+) -> Result<Vec<ReviewValidation>, RepairError> {
+    let mut values = Vec::new();
+    for result in repository
+        .v3()
+        .list_validation_results(task_id)
+        .await
+        .map_err(map_repair_core)?
+    {
+        values.push(ReviewValidation {
+            check_name: result.check_name,
+            lifecycle: result.lifecycle,
+            outcome: repository
+                .v3()
+                .get_validation_execution(&result.id)
+                .await
+                .ok()
+                .map(|value| value.outcome),
+        });
+    }
+    Ok(values)
+}
+fn repair_finding(finding: &ReviewFinding) -> Option<RepairFinding> {
+    let file = finding.evidence.get("file")?.as_str()?;
+    let line = finding
+        .evidence
+        .get("line")?
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())?;
+    let evidence = finding.evidence.get("evidence")?.as_str()?;
+    (!file.trim().is_empty()
+        && !file.starts_with('/')
+        && !file.contains("..")
+        && line > 0
+        && !evidence.trim().is_empty())
+    .then(|| RepairFinding {
+        id: finding.id.to_string(),
+        summary: finding.summary.clone(),
+        file: file.into(),
+        line,
+        evidence: evidence.into(),
+    })
+}
+fn map_repair_core(_: CoreError) -> RepairError {
+    RepairError::Storage
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sentinel_core::v3::{
-        CreateTask, CreateValidationResult, ValidationExecution, ValidationLifecycle,
+        CreateSession, CreateTask, CreateValidationResult, ValidationExecution, ValidationLifecycle,
     };
     use std::{fs, path::Path, process::Command, sync::Mutex};
     use tempfile::TempDir;
@@ -229,6 +509,26 @@ mod tests {
             validation_outcome: None,
         }
     }
+    fn repair_candidate() -> ReviewCandidate {
+        ReviewCandidate {
+            file: "changed.rs".into(),
+            ..finding()
+        }
+    }
+    fn profile(program: &str) -> ValidationProfile {
+        ValidationProfile {
+            id: "repair".into(),
+            steps: vec![sentinel_validation::ValidationStep {
+                name: "repair-check".into(),
+                argv: vec![program.into()],
+                kind: sentinel_validation::CheckKind::Test,
+                cwd: ".".into(),
+                env: Default::default(),
+                required: true,
+                timeout_ms: 500,
+            }],
+        }
+    }
     struct Capturing {
         seen: Mutex<Option<ReviewPacket>>,
         findings: Vec<ReviewCandidate>,
@@ -237,6 +537,20 @@ mod tests {
         fn review(&self, packet: &ReviewPacket) -> Result<Vec<ReviewCandidate>, ReviewError> {
             *self.seen.lock().unwrap() = Some(packet.clone());
             Ok(self.findings.clone())
+        }
+    }
+    struct Repairing {
+        evidence: RepairEvidence,
+        seen: Mutex<Option<RepairPacket>>,
+    }
+    impl RepairImplementer for Repairing {
+        fn repair(
+            &self,
+            _session: Option<&AgentSession>,
+            packet: &RepairPacket,
+        ) -> Result<RepairEvidence, RepairError> {
+            *self.seen.lock().unwrap() = Some(packet.clone());
+            Ok(self.evidence.clone())
         }
     }
     fn git(directory: &Path, args: &[&str]) -> String {
@@ -522,5 +836,268 @@ mod tests {
         let stored = reopened.v3().list_review_findings(&id).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].summary, "missing guard");
+    }
+    async fn confirmed_repair_finding(repo: &RunRepository, id: &TaskId) -> ReviewFinding {
+        let main = repo
+            .v3()
+            .get_task_worktree(id)
+            .await
+            .unwrap()
+            .repository_root;
+        ReviewSupervisor::run(
+            repo.clone(),
+            id.clone(),
+            Path::new(&main),
+            &Fixed(vec![repair_candidate()]),
+        )
+        .await
+        .unwrap();
+        let finding = repo.v3().list_review_findings(id).await.unwrap().remove(0);
+        repo.v3()
+            .transition_review_finding(&finding, FindingDisposition::ConfirmedBlocking, 10)
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn confirmed_finding_hands_off_to_owned_session_and_resolves_after_validation() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let session = repo
+            .v3()
+            .create_session(
+                CreateSession {
+                    task_id: id.clone(),
+                    provider: "openai.codex.app_server".into(),
+                    provider_session_ref: "owned-thread".into(),
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        let finding = confirmed_repair_finding(&repo, &id).await;
+        let implementer = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec!["changed.rs".into()],
+            },
+            seen: Mutex::new(None),
+        };
+        let report = RepairSupervisor::handoff(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &implementer,
+        )
+        .await
+        .unwrap();
+        assert_eq!((report.resolved, report.unresolved), (1, 0));
+        let packet = implementer.seen.lock().unwrap().clone().unwrap();
+        assert_eq!(packet.findings[0].id, finding.id.to_string());
+        assert_eq!(
+            packet.implementer_session_id.as_deref(),
+            Some(session.id.0.as_str())
+        );
+        assert_eq!(
+            repo.v3()
+                .get_review_finding(&finding.id)
+                .await
+                .unwrap()
+                .disposition,
+            FindingDisposition::Repaired
+        );
+        assert_eq!(
+            repo.v3()
+                .get_repair_round(&report.repair_round_id)
+                .await
+                .unwrap()
+                .lifecycle,
+            RepairRoundLifecycle::Resolved
+        );
+    }
+    #[tokio::test]
+    async fn rejected_and_duplicate_handoffs_fail_safely() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let implementer = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec!["changed.rs".into()],
+            },
+            seen: Mutex::new(None),
+        };
+        assert_eq!(
+            RepairSupervisor::handoff(
+                repo.clone(),
+                id.clone(),
+                main.path(),
+                profile("/usr/bin/true"),
+                &implementer
+            )
+            .await
+            .unwrap_err(),
+            RepairError::NoEligibleFindings
+        );
+        confirmed_repair_finding(&repo, &id).await;
+        let first = RepairSupervisor::handoff(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/false"),
+            &implementer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.unresolved, 1);
+        assert_eq!(
+            RepairSupervisor::handoff(
+                repo,
+                id,
+                main.path(),
+                profile("/usr/bin/true"),
+                &implementer
+            )
+            .await
+            .unwrap_err(),
+            RepairError::DuplicateHandoff
+        );
+    }
+    #[tokio::test]
+    async fn malformed_or_evidence_free_confirmed_findings_are_rejected() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let reported = repo
+            .v3()
+            .create_review_finding(
+                CreateReviewFinding {
+                    task_id: id.clone(),
+                    repair_round_id: None,
+                    severity: "blocker".into(),
+                    summary: "unsupported claim".into(),
+                    evidence: serde_json::json!({"file":"changed.rs","line":2,"evidence":""}),
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        repo.v3()
+            .transition_review_finding(&reported, FindingDisposition::ConfirmedBlocking, 3)
+            .await
+            .unwrap();
+        let implementer = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec!["changed.rs".into()],
+            },
+            seen: Mutex::new(None),
+        };
+        assert_eq!(
+            RepairSupervisor::handoff(
+                repo,
+                id,
+                main.path(),
+                profile("/usr/bin/true"),
+                &implementer,
+            )
+            .await
+            .unwrap_err(),
+            RepairError::MalformedFinding
+        );
+    }
+    #[tokio::test]
+    async fn evidence_or_validation_cannot_resolve_a_finding_on_its_own() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let finding = confirmed_repair_finding(&repo, &id).await;
+        let text_only = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec![],
+            },
+            seen: Mutex::new(None),
+        };
+        let report = RepairSupervisor::handoff(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &text_only,
+        )
+        .await
+        .unwrap();
+        assert_eq!((report.resolved, report.unresolved), (0, 1));
+        assert_eq!(
+            repo.v3()
+                .get_review_finding(&finding.id)
+                .await
+                .unwrap()
+                .disposition,
+            FindingDisposition::ConfirmedBlocking
+        );
+    }
+    #[tokio::test]
+    async fn validation_failure_leaves_finding_unresolved_and_round_exhausted() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let finding = confirmed_repair_finding(&repo, &id).await;
+        let implementer = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec!["changed.rs".into()],
+            },
+            seen: Mutex::new(None),
+        };
+        let report = RepairSupervisor::handoff(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/false"),
+            &implementer,
+        )
+        .await
+        .unwrap();
+        assert_eq!((report.resolved, report.unresolved), (0, 1));
+        assert_eq!(
+            repo.v3()
+                .get_review_finding(&finding.id)
+                .await
+                .unwrap()
+                .disposition,
+            FindingDisposition::ConfirmedBlocking
+        );
+        assert_eq!(
+            repo.v3()
+                .get_repair_round(&report.repair_round_id)
+                .await
+                .unwrap()
+                .lifecycle,
+            RepairRoundLifecycle::Exhausted
+        );
+    }
+    #[tokio::test]
+    async fn repair_round_and_finding_assignment_survive_restart() {
+        let (main, database, _root, repo, id) = fixture().await;
+        let finding = confirmed_repair_finding(&repo, &id).await;
+        let implementer = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec!["changed.rs".into()],
+            },
+            seen: Mutex::new(None),
+        };
+        let report = RepairSupervisor::handoff(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/false"),
+            &implementer,
+        )
+        .await
+        .unwrap();
+        drop(repo);
+        let url = format!("sqlite://{}", database.path().join("state.db").display());
+        let reopened = RunRepository::open(&url).await.unwrap();
+        assert_eq!(
+            reopened
+                .v3()
+                .get_review_finding(&finding.id)
+                .await
+                .unwrap()
+                .repair_round_id,
+            Some(report.repair_round_id.clone())
+        );
+        assert_eq!(
+            reopened.v3().list_repair_rounds(&id).await.unwrap().len(),
+            1
+        );
     }
 }
