@@ -3,6 +3,7 @@ import { ProviderUsageWidget } from "./ProviderUsageWidget";
 import { V3AttentionWidget } from "./V3AttentionWidget";
 import { registerEscapeToHide } from "./escape";
 import { useEffect } from "react";
+import "./v3-design-system.css";
 
 export function StatusWindow({ services }: { services: Phase2AppServices }) {
   useEffect(() => registerEscapeToHide(window, () => services.hidePrompt()), [services]);

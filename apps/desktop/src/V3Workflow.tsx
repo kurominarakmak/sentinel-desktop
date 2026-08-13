@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
+import "./v3-design-system.css";
 
 export type V3Task = { id: string; summary: string; lifecycle: string; recoveryRequired: boolean; recoveryReason?: string | null };
 export type V3Detail = { task: V3Task; activity: Array<Record<string, unknown>>; worktree: Record<string, unknown> | null; diff: Record<string, unknown> | null; validations: Array<Record<string, unknown>>; findings: Array<Record<string, unknown>>; repairRounds: Array<Record<string, unknown>>; finalApprovalPacket: Record<string, unknown> | null; finalApprovalId: string | null; agent: string | null };
