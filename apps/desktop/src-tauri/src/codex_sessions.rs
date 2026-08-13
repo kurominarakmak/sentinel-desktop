@@ -180,6 +180,18 @@ impl CodexSessionManager {
             .get_task(task_id)
             .await
             .map_err(|_| CodexError::Storage)?;
+        // A repeated reconciliation is a no-op while the exact Sentinel-owned
+        // App Server and durable thread are still live.  In particular, do not
+        // start a second App Server or a replacement provider thread.
+        {
+            let owned = self.sessions.lock().await;
+            if owned
+                .get(task_id)
+                .is_some_and(|managed| managed.server.is_alive())
+            {
+                return Ok(task);
+            }
+        }
         let session = self
             .repository
             .v3()
@@ -190,8 +202,15 @@ impl CodexSessionManager {
             .find(|session| session.provider == PROVIDER)
             .ok_or(CodexError::InvalidInput)?;
         let mut owned = self.sessions.lock().await;
+        // A dead App Server is ours to replace; the durable provider thread is
+        // not. `thread/resume` is the proof step and errors leave recovery
+        // intact rather than creating a new Sentinel session/thread.
+        owned.remove(task_id);
         let server = self.start_server(task_id, &self.default_cwd).await?;
         let live = server.resume_thread(&session.provider_session_ref).await?;
+        if live.session_id != session.id {
+            return Err(CodexError::InvalidInput);
+        }
         let durable = self
             .repository
             .v3()
@@ -425,6 +444,31 @@ mod tests {
             SessionLifecycle::Active
         );
         replacement.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_reconciliation_reuses_the_owned_process_and_thread() {
+        let _guard = PROCESS_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (temp, repository, manager) = fixture().await;
+        let task = manager
+            .start_task("fixture".into(), temp.path())
+            .await
+            .unwrap();
+        let first = manager.pid_for_test(&task.id).await.unwrap();
+        manager.resume_task(&task.id).await.unwrap();
+        assert_eq!(manager.pid_for_test(&task.id).await.unwrap(), first);
+        assert_eq!(
+            repository
+                .v3()
+                .list_sessions_for_task(&task.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        manager.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -56,6 +56,8 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 
 ### PLANNED
 
+- V3 Phase 8 is **PARTIAL**. Phase 8A hardens provider/session recovery;
+  Phase 8B–8C security policy and provenance recovery remain.
 - Supported Codex and Claude Code adapters with start, stream, cancel, resume/reconcile, and recovery capability reporting.
 - Supervisor-owned worktree transaction lifecycle; configurable build/lint/test profiles; read-only review; confirmed-blocker repair loops; and human-gated final actions.
 - Phase 8 security, recovery, and provenance hardening, followed by final UI redesign.
