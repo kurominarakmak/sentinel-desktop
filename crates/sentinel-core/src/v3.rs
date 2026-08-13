@@ -549,6 +549,14 @@ pub struct CreateTaskWorktreeMergePreparation {
     pub conflicts_json: String,
     pub diff_json: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskWorktreeCleanupOutcome {
+    pub task_id: TaskId,
+    pub state: String,
+    pub reason: Option<String>,
+    pub approval_id: Option<ApprovalId>,
+    pub completed_at_ms: i64,
+}
 impl V3Repository {
     pub async fn get_task_worktree(&self, task_id: &TaskId) -> Result<TaskWorktree, CoreError> {
         let row = sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE task_id=?")
@@ -644,6 +652,39 @@ impl V3Repository {
             diff_json: row.get("diff_json"),
             prepared_at_ms: row.get("prepared_at_ms"),
         })
+    }
+    pub async fn get_task_worktree_cleanup_outcome(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<TaskWorktreeCleanupOutcome, CoreError> {
+        let row = sqlx::query("SELECT * FROM v3_task_worktree_cleanup_outcomes WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .ok_or(CoreError::NotFound)?;
+        Ok(TaskWorktreeCleanupOutcome {
+            task_id: TaskId(row.get("task_id")),
+            state: row.get("state"),
+            reason: row.get("reason"),
+            approval_id: row.get::<Option<String>, _>("approval_id").map(ApprovalId),
+            completed_at_ms: row.get("completed_at_ms"),
+        })
+    }
+    pub async fn save_task_worktree_cleanup_outcome(
+        &self,
+        task_id: &TaskId,
+        state: &str,
+        reason: Option<&str>,
+        approval_id: Option<&ApprovalId>,
+        timestamp: i64,
+    ) -> Result<TaskWorktreeCleanupOutcome, CoreError> {
+        if !matches!(state, "discarded" | "retained") {
+            return Err(CoreError::InvalidV3Record);
+        }
+        sqlx::query("INSERT INTO v3_task_worktree_cleanup_outcomes (task_id,state,reason,approval_id,completed_at_ms) VALUES (?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,reason=excluded.reason,approval_id=excluded.approval_id,completed_at_ms=excluded.completed_at_ms")
+            .bind(task_id.to_string()).bind(state).bind(reason).bind(approval_id.map(ToString::to_string)).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.get_task_worktree_cleanup_outcome(task_id).await
     }
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }

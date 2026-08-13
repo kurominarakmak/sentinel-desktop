@@ -1,7 +1,7 @@
 use sentinel_core::{
     v3::{
-        CreateTaskWorktree, CreateTaskWorktreeMergePreparation, TaskId, TaskWorktree,
-        TaskWorktreeMergePreparation,
+        ApprovalId, ApprovalLifecycle, CreateTaskWorktree, CreateTaskWorktreeMergePreparation,
+        TaskId, TaskWorktree, TaskWorktreeCleanupOutcome, TaskWorktreeMergePreparation,
     },
     CoreError, RunRepository,
 };
@@ -22,6 +22,10 @@ pub enum TransactionError {
     Conflict,
     #[error("worktree recovery is required")]
     RecoveryRequired,
+    #[error("approved destructive action is required")]
+    ApprovalRequired,
+    #[error("destructive preflight refused")]
+    PreflightRefused,
     #[error("git failure")]
     Git,
     #[error("storage failure")]
@@ -43,6 +47,10 @@ pub struct WorktreeDiff {
 pub struct MergePreparation {
     pub diff: WorktreeDiff,
     pub persisted: TaskWorktreeMergePreparation,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupResult {
+    pub outcome: TaskWorktreeCleanupOutcome,
 }
 impl WorktreeTransaction {
     pub async fn create(
@@ -198,6 +206,157 @@ impl WorktreeTransaction {
             .map_err(map_core)?;
         Ok(MergePreparation { diff, persisted })
     }
+
+    pub async fn discard(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        approval_id: ApprovalId,
+        approval_version: u64,
+        approved_head: &str,
+    ) -> Result<CleanupResult, TransactionError> {
+        if let Ok(outcome) = repository
+            .v3()
+            .get_task_worktree_cleanup_outcome(&task_id)
+            .await
+        {
+            if outcome.state == "discarded" {
+                return Ok(CleanupResult { outcome });
+            }
+        }
+        let approval = match repository.v3().get_approval(&approval_id).await {
+            Ok(approval) => approval,
+            Err(CoreError::NotFound) => return Err(TransactionError::ApprovalRequired),
+            Err(_) => return Err(TransactionError::Storage),
+        };
+        if approval.task_id != task_id
+            || approval.action_kind != "worktree_discard"
+            || approval.lifecycle != ApprovalLifecycle::Approved
+            || approval.version != approval_version
+        {
+            return Err(TransactionError::ApprovalRequired);
+        }
+        let worktree = match Self::reopen(repository.clone(), task_id.clone(), main).await {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                return retain(
+                    repository,
+                    &task_id,
+                    Some(&approval_id),
+                    "identity_unverified",
+                    error,
+                )
+                .await
+            }
+        };
+        let path = Path::new(&worktree.worktree_path);
+        let current_head = match git_output(path, &["rev-parse", "--verify", "HEAD^{commit}"]).await
+        {
+            Ok(head) if head == approved_head => head,
+            _ => {
+                return retain(
+                    repository,
+                    &task_id,
+                    Some(&approval_id),
+                    "head_changed",
+                    TransactionError::PreflightRefused,
+                )
+                .await
+            }
+        };
+        if !git_output(path, &["status", "--porcelain"])
+            .await?
+            .is_empty()
+        {
+            return retain(
+                repository,
+                &task_id,
+                Some(&approval_id),
+                "dirty_worktree",
+                TransactionError::PreflightRefused,
+            )
+            .await;
+        }
+        let main_inspection = inspect_repository(main)
+            .await
+            .map_err(|_| TransactionError::PreflightRefused)?;
+        if !main_inspection.is_primary
+            || main_inspection.primary_root.to_string_lossy() != worktree.repository_root
+            || current_head != approved_head
+        {
+            return retain(
+                repository,
+                &task_id,
+                Some(&approval_id),
+                "primary_or_identity_changed",
+                TransactionError::PreflightRefused,
+            )
+            .await;
+        }
+        let removal = Command::new("/usr/bin/git")
+            .current_dir(&main_inspection.primary_root)
+            .args([
+                "worktree",
+                "remove",
+                path.to_str().ok_or(TransactionError::PreflightRefused)?,
+            ])
+            .output()
+            .await
+            .map_err(|_| TransactionError::Git)?;
+        if !removal.status.success() {
+            return retain(
+                repository,
+                &task_id,
+                Some(&approval_id),
+                "worktree_remove_failed",
+                TransactionError::Git,
+            )
+            .await;
+        }
+        let branch = Command::new("/usr/bin/git")
+            .current_dir(&main_inspection.primary_root)
+            .args(["branch", "-D", &worktree.branch])
+            .output()
+            .await
+            .map_err(|_| TransactionError::Git)?;
+        if !branch.status.success() {
+            return retain(
+                repository,
+                &task_id,
+                Some(&approval_id),
+                "branch_remove_failed",
+                TransactionError::Git,
+            )
+            .await;
+        }
+        let outcome = repository
+            .v3()
+            .save_task_worktree_cleanup_outcome(
+                &task_id,
+                "discarded",
+                None,
+                Some(&approval_id),
+                now(),
+            )
+            .await
+            .map_err(map_core)?;
+        Ok(CleanupResult { outcome })
+    }
+}
+
+async fn retain(
+    repository: RunRepository,
+    task_id: &TaskId,
+    approval_id: Option<&ApprovalId>,
+    reason: &str,
+    error: TransactionError,
+) -> Result<CleanupResult, TransactionError> {
+    repository
+        .v3()
+        .save_task_worktree_cleanup_outcome(task_id, "retained", Some(reason), approval_id, now())
+        .await
+        .map_err(map_core)?;
+    Err(error)
 }
 
 async fn persisted_worktree_matches(worktree: &TaskWorktree, primary_root: &Path) -> bool {
@@ -957,6 +1116,291 @@ mod tests {
         .await
         .expect("create");
         let _ = prepare(repository, task_id, main.path()).await;
+        assert_eq!(git(main.path(), &["rev-parse", "HEAD"]), main_head);
+        assert_eq!(git(&unrelated, &["rev-parse", "HEAD"]), unrelated_head);
+    }
+
+    async fn approval(repository: &RunRepository, task_id: TaskId) -> (ApprovalId, u64) {
+        let pending = repository
+            .v3()
+            .create_approval(
+                sentinel_core::v3::CreateApproval {
+                    task_id,
+                    session_id: None,
+                    action_kind: "worktree_discard".into(),
+                    summary: "Discard task worktree".into(),
+                },
+                10,
+            )
+            .await
+            .expect("approval");
+        let approved = repository
+            .v3()
+            .transition_approval(&pending, ApprovalLifecycle::Approved, 11)
+            .await
+            .expect("approve");
+        (approved.id, approved.version)
+    }
+
+    #[tokio::test]
+    async fn approved_clean_discard_removes_only_owned_worktree_and_branch() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let (approval_id, version) = approval(&repository, task_id.clone()).await;
+        let result = WorktreeTransaction::discard(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            approval_id,
+            version,
+            &base,
+        )
+        .await
+        .expect("discard");
+        assert_eq!(result.outcome.state, "discarded");
+        assert!(!Path::new(&worktree.worktree_path).exists());
+        assert!(
+            !git(main.path(), &["branch", "--list", &worktree.branch]).contains(&worktree.branch)
+        );
+        assert_eq!(
+            repository
+                .v3()
+                .get_task_worktree_cleanup_outcome(&task_id)
+                .await
+                .expect("outcome"),
+            result.outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_requires_approval() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        assert!(matches!(
+            WorktreeTransaction::discard(
+                repository,
+                task_id,
+                main.path(),
+                ApprovalId::new(),
+                0,
+                &base
+            )
+            .await,
+            Err(TransactionError::ApprovalRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_stale_approval_or_changed_head() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let (approval_id, version) = approval(&repository, task_id.clone()).await;
+        assert!(matches!(
+            WorktreeTransaction::discard(
+                repository.clone(),
+                task_id.clone(),
+                main.path(),
+                approval_id.clone(),
+                version + 1,
+                &base
+            )
+            .await,
+            Err(TransactionError::ApprovalRequired)
+        ));
+        fs::write(
+            Path::new(&worktree.worktree_path).join("task.txt"),
+            "task\n",
+        )
+        .expect("write");
+        git(Path::new(&worktree.worktree_path), &["add", "task.txt"]);
+        git(
+            Path::new(&worktree.worktree_path),
+            &["commit", "-m", "task"],
+        );
+        assert!(matches!(
+            WorktreeTransaction::discard(
+                repository.clone(),
+                task_id.clone(),
+                main.path(),
+                approval_id,
+                version,
+                &base
+            )
+            .await,
+            Err(TransactionError::PreflightRefused)
+        ));
+        assert_eq!(
+            repository
+                .v3()
+                .get_task_worktree_cleanup_outcome(&task_id)
+                .await
+                .expect("outcome")
+                .state,
+            "retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_dirty_or_identity_mismatched_worktrees() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let (approval_id, version) = approval(&repository, task_id.clone()).await;
+        fs::write(
+            Path::new(&worktree.worktree_path).join("dirty.txt"),
+            "dirty\n",
+        )
+        .expect("dirty");
+        assert!(matches!(
+            WorktreeTransaction::discard(
+                repository.clone(),
+                task_id.clone(),
+                main.path(),
+                approval_id,
+                version,
+                &base
+            )
+            .await,
+            Err(TransactionError::PreflightRefused)
+        ));
+        assert!(Path::new(&worktree.worktree_path).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_is_retained_and_repeat_is_idempotent() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let (approval_id, version) = approval(&repository, task_id.clone()).await;
+        fs::rename(&worktree.worktree_path, root.path().join("moved")).expect("move");
+        assert!(WorktreeTransaction::discard(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            approval_id,
+            version,
+            &base
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            repository
+                .v3()
+                .get_task_worktree_cleanup_outcome(&task_id)
+                .await
+                .expect("outcome")
+                .state,
+            "retained"
+        );
+        // A successfully discarded task reports the recorded outcome without a second Git mutation.
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let (approval_id, version) = approval(&repository, task_id.clone()).await;
+        let first = WorktreeTransaction::discard(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            approval_id.clone(),
+            version,
+            &base,
+        )
+        .await
+        .expect("first");
+        let second = WorktreeTransaction::discard(
+            repository,
+            task_id,
+            main.path(),
+            approval_id,
+            version,
+            &base,
+        )
+        .await
+        .expect("repeat");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn discard_preserves_primary_and_unrelated_worktrees() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("root");
+        let unrelated = root.path().join("unrelated");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "unrelated-cleanup",
+                unrelated.to_str().expect("path"),
+            ],
+        );
+        let main_head = git(main.path(), &["rev-parse", "HEAD"]);
+        let unrelated_head = git(&unrelated, &["rev-parse", "HEAD"]);
+        WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let (approval_id, version) = approval(&repository, task_id.clone()).await;
+        WorktreeTransaction::discard(
+            repository,
+            task_id,
+            main.path(),
+            approval_id,
+            version,
+            &base,
+        )
+        .await
+        .expect("discard");
         assert_eq!(git(main.path(), &["rev-parse", "HEAD"]), main_head);
         assert_eq!(git(&unrelated, &["rev-parse", "HEAD"]), unrelated_head);
     }
