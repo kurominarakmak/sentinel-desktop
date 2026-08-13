@@ -58,9 +58,17 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
   credential boundaries, exact single-use authorization, and provenance plus
   adversarial recovery audit evidence are covered by deterministic V3 suites.
 
+### COMPLETE
+
+- V3 Phase 9 is **COMPLETE**. The compact desktop shell, Quick Prompt,
+  Attention Widget, Task Detail, Status, and Settings share the final V3
+  visual system while durable supervisor state remains the only workflow
+  authority.
+
 ### PLANNED
 
-- Phase 9 final UI redesign follows the completed Phase 8 hardening audit.
+- No additional V3 delivery phase is planned. Known limitations are retained
+  in the Phase 8C provenance/recovery audit and provider capability records.
 - V3 Phase 8 is **PARTIAL**. Phase 8A hardens provider/session recovery and
   Phase 8B is **COMPLETE** with execution, credential, and single-use action
   authorization boundaries; Phase 8C provenance/recovery audit remains.

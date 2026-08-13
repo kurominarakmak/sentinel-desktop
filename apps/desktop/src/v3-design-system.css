@@ -114,3 +114,27 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .v3-result-pass { background: #d1fadf; color: #067647; }.v3-result-fail { background: #fee4e2; color: var(--v3-danger); }.v3-result-caution { background: #fef0c7; color: #9a6700; }.v3-result-neutral { background: #eaecf0; color: #475467; }
 .v3-finding-blocker { background: color-mix(in srgb, #fee4e2 72%, transparent); border-radius: var(--v3-radius-sm); padding: var(--v3-space-2); }
 .v3-blocker-count { color: var(--v3-danger); font-size: 10px; }
+
+/* Final compact-shell QA: keep volatile provider/task content contained. */
+main, #root > section, .utility-window, .v3-workflow { overflow: hidden; }
+.utility-window { min-height: 132px; }
+.utility-window nav { display: flex; flex-wrap: wrap; gap: var(--v3-space-1); margin: var(--v3-space-2) 0; }
+.utility-window nav button { background: transparent; border-color: var(--v3-border); color: var(--v3-text); font-size: 11px; }
+.utility-window nav button[aria-current="page"] { background: color-mix(in srgb, var(--v3-accent) 12%, transparent); border-color: color-mix(in srgb, var(--v3-accent) 38%, transparent); color: var(--v3-accent); }
+.v3-workflow, .v3-attention, .v3-task-detail { contain: layout paint; }
+.v3-workflow { min-height: 220px; }
+.v3-task-detail { max-height: 560px; overflow: auto; overscroll-behavior: contain; }
+.v3-task-detail > details { overflow: hidden; }
+.v3-task-detail pre { max-width: 100%; overflow: auto; }
+.v3-task-detail b, .v3-task-detail small, .v3-task-detail p { overflow-wrap: anywhere; }
+.v3-prompt-actions .muted { min-height: 17px; white-space: nowrap; }
+.v3-attention header, .v3-task-detail header { min-height: 33px; }
+.v3-attention-actions { min-height: 30px; flex-wrap: nowrap; }
+.v3-attention-actions button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-status-badge { max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+.v3-result-list { max-height: 260px; overflow: auto; overscroll-behavior: contain; padding-right: 2px; }
+.v3-timeline details { background: transparent; border: 0; margin: 0; padding: 0; }
+button.v3-reject-action:hover:not(:disabled) { background: #912018; }
+button.v3-approve-action:hover:not(:disabled) { background: #05603b; }
+@media (max-width: 360px) { .v3-detail-summary { grid-template-columns: 1fr; }.v3-attention-actions { flex-wrap: wrap; }.v3-status-badge { max-width: 120px; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; } }
