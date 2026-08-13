@@ -193,4 +193,12 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertTrue(connection.claimSubscription(for: second))
         XCTAssertFalse(connection.claimSubscription(for: second))
     }
+
+    func testCodexTrayTitleUsesOnlyVerifiedPrimaryUsage() {
+        let codex = NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: ["primary": RateLimitWindow(usedPercent: 24.6, resetsAt: nil, windowDurationMins: nil)])
+        let claude = NativeProviderStatus(name: "Claude Code", installation: "unavailable", runtime: "none", usage: "unavailable", rateLimits: nil)
+        XCTAssertEqual(CodexTrayTitle.make(NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: codex, claude: claude)), "25%")
+        XCTAssertEqual(CodexTrayTitle.make(nil), "—")
+        XCTAssertEqual(CodexTrayTitle.make(NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: ["primary": RateLimitWindow(usedPercent: 101, resetsAt: nil, windowDurationMins: nil)]), claude: claude)), "—")
+    }
 }

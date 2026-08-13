@@ -80,3 +80,11 @@ enum FloatingPanelPlacement {
         return centeredFrame(size: frame.size, preferred: preferred)
     }
 }
+
+enum CodexTrayTitle {
+    static func make(_ status: NativeStatus?) -> String {
+        guard let usedPercent = status?.codex.rateLimits?["primary"]?.usedPercent,
+              (0...100).contains(usedPercent) else { return "—" }
+        return String(format: "%.0f%%", usedPercent)
+    }
+}

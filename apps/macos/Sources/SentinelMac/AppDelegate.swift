@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import Combine
 import SwiftUI
 
 @MainActor
@@ -13,11 +14,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var surfaceRegistry = NativeSurfaceRegistry()
     private var previousApplicationFocus = PreviousApplicationFocus()
+    private var bridgeSubscriptions = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         bridge.start()
         installStatusItem()
+        observeStatusItem()
         installPanels()
         installGlobalShortcut()
     }
@@ -28,7 +31,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "scope", accessibilityDescription: "Sentinel")
+        item.button?.image = codexTrayImage() ?? NSImage(systemSymbolName: "chevron.left.forwardslash.chevron.right", accessibilityDescription: "Codex")
+        item.button?.image?.size = NSSize(width: 18, height: 18)
+        item.button?.imagePosition = .imageLeft
+        item.button?.title = "—"
         item.button?.action = #selector(showQuickPrompt)
         item.button?.target = self
         let menu = NSMenu()
@@ -42,6 +48,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsMenuItem.target = self
         item.menu = menu
         statusItem = item
+    }
+
+    private func observeStatusItem() {
+        bridge.$status
+            .receive(on: RunLoop.main)
+            .sink { [weak self] status in self?.updateStatusItem(status) }
+            .store(in: &bridgeSubscriptions)
+    }
+
+    private func updateStatusItem(_ status: NativeStatus?) {
+        statusItem?.button?.title = CodexTrayTitle.make(status)
+    }
+
+    private func codexTrayImage() -> NSImage? {
+        let sourceRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let candidates = [
+            Bundle.main.url(forResource: "codex-tray", withExtension: "png"),
+            ProcessInfo.processInfo.environment["SENTINEL_CODEX_TRAY_ICON"].map(URL.init(fileURLWithPath:)),
+            sourceRoot.appendingPathComponent("apps/desktop/src-tauri/icons/codex-tray.png"),
+        ].compactMap { $0 }
+        return candidates.lazy.compactMap(NSImage.init(contentsOf:)).first
     }
 
     private func installPanels() {
