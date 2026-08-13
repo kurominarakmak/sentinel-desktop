@@ -87,6 +87,39 @@ struct NativeProviderStatus: Decodable, Equatable {
     let runtime: String
     let usage: String
     let rateLimits: [String: RateLimitWindow]?
+
+    init(name: String, installation: String, runtime: String, usage: String, rateLimits: [String: RateLimitWindow]?) {
+        self.name = name
+        self.installation = installation
+        self.runtime = runtime
+        self.usage = usage
+        self.rateLimits = rateLimits
+    }
+
+    private enum CodingKeys: String, CodingKey { case name, installation, runtime, usage, rateLimits }
+    private enum RateLimitKeys: String, CodingKey { case primary, secondary }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        name = try values.decode(String.self, forKey: .name)
+        installation = try values.decode(String.self, forKey: .installation)
+        runtime = try values.decode(String.self, forKey: .runtime)
+        usage = try values.decode(String.self, forKey: .usage)
+
+        guard values.contains(.rateLimits), try !values.decodeNil(forKey: .rateLimits) else {
+            rateLimits = nil
+            return
+        }
+        let windows = try values.nestedContainer(keyedBy: RateLimitKeys.self, forKey: .rateLimits)
+        var supported: [String: RateLimitWindow] = [:]
+        if let primary = try windows.decodeIfPresent(RateLimitWindow.self, forKey: .primary) {
+            supported[RateLimitKeys.primary.rawValue] = primary
+        }
+        if let secondary = try windows.decodeIfPresent(RateLimitWindow.self, forKey: .secondary) {
+            supported[RateLimitKeys.secondary.rawValue] = secondary
+        }
+        rateLimits = supported.isEmpty ? nil : supported
+    }
 }
 
 struct NativeStatus: Decodable, Equatable {

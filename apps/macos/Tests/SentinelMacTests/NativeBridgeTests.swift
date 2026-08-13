@@ -93,7 +93,7 @@ final class NativeBridgeTests: XCTestCase {
     }
 
     func testDecodesCodexNumericRateLimitResetAndKeepsTrayPercentage() throws {
-        let data = Data(#"{"kind":"status","status":{"version":1,"sentinel":"ready","activeTask":null,"recoveryRequired":false,"codex":{"name":"Codex","installation":"available","runtime":"active","usage":"live","rateLimits":{"primary":{"usedPercent":39,"resetsAt":1787196921,"windowDurationMins":10080}}},"claude":{"name":"Claude Code","installation":"unavailable","runtime":"none","usage":"unavailable","rateLimits":null}}}"#.utf8)
+        let data = Data(#"{"kind":"status","status":{"version":1,"sentinel":"ready","activeTask":null,"recoveryRequired":false,"codex":{"name":"Codex","installation":"available","runtime":"active","usage":"live","rateLimits":{"credits":{"balance":"0","hasCredits":false,"unlimited":false},"individualLimit":null,"limitId":"codex","planType":"plus","primary":{"usedPercent":39,"resetsAt":1787196921,"windowDurationMins":10080},"secondary":null,"spendControlReached":false}},"claude":{"name":"Claude Code","installation":"unavailable","runtime":"none","usage":"unavailable","rateLimits":null}}}"#.utf8)
         guard case .status(let status) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
             return XCTFail("expected status")
         }
