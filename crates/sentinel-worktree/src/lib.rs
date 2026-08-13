@@ -1,8 +1,12 @@
 use sentinel_core::{
-    v3::{CreateTaskWorktree, TaskId, TaskWorktree},
+    v3::{
+        CreateTaskWorktree, CreateTaskWorktreeMergePreparation, TaskId, TaskWorktree,
+        TaskWorktreeMergePreparation,
+    },
     CoreError, RunRepository,
 };
 use sentinel_git::{inspect_repository, resolve_exact_head, RepositoryState};
+use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -24,6 +28,22 @@ pub enum TransactionError {
     Storage,
 }
 pub struct WorktreeTransaction;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedFileState {
+    pub path: String,
+    pub index_status: Option<String>,
+    pub worktree_status: Option<String>,
+    pub untracked: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeDiff {
+    pub files: Vec<ChangedFileState>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergePreparation {
+    pub diff: WorktreeDiff,
+    pub persisted: TaskWorktreeMergePreparation,
+}
 impl WorktreeTransaction {
     pub async fn create(
         repository: RunRepository,
@@ -129,6 +149,55 @@ impl WorktreeTransaction {
             Err(TransactionError::RecoveryRequired)
         }
     }
+
+    pub async fn prepare_merge(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        target_branch: &str,
+    ) -> Result<MergePreparation, TransactionError> {
+        let worktree = Self::reopen(repository.clone(), task_id.clone(), main).await?;
+        let main_inspection = inspect_repository(main)
+            .await
+            .map_err(|_| TransactionError::Invalid)?;
+        if !main_inspection.is_primary || main_inspection.branch.as_deref() != Some(target_branch) {
+            return Err(TransactionError::Invalid);
+        }
+        let diff = diff_at_base(Path::new(&worktree.worktree_path), &worktree.base_commit).await?;
+        let target_commit = git_output(main, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        let worktree_commit = git_output(
+            Path::new(&worktree.worktree_path),
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+        )
+        .await?;
+        let target_advanced = target_commit != worktree.base_commit;
+        let conflicts = merge_conflicts(
+            Path::new(&worktree.worktree_path),
+            &target_commit,
+            &worktree_commit,
+        )
+        .await?;
+        let persisted = repository
+            .v3()
+            .save_task_worktree_merge_preparation(
+                CreateTaskWorktreeMergePreparation {
+                    task_id,
+                    target_branch: target_branch.into(),
+                    target_commit,
+                    worktree_commit,
+                    target_advanced,
+                    merge_ready: conflicts.is_empty(),
+                    conflicts_json: serde_json::to_string(&conflicts)
+                        .map_err(|_| TransactionError::Storage)?,
+                    diff_json: serde_json::to_string(&diff.files)
+                        .map_err(|_| TransactionError::Storage)?,
+                },
+                now(),
+            )
+            .await
+            .map_err(map_core)?;
+        Ok(MergePreparation { diff, persisted })
+    }
 }
 
 async fn persisted_worktree_matches(worktree: &TaskWorktree, primary_root: &Path) -> bool {
@@ -143,9 +212,107 @@ async fn persisted_worktree_matches(worktree: &TaskWorktree, primary_root: &Path
     {
         return false;
     }
-    resolve_exact_head(path)
+    git_succeeds(
+        path,
+        &["merge-base", "--is-ancestor", &worktree.base_commit, "HEAD"],
+    )
+    .await
+}
+
+async fn diff_at_base(
+    worktree: &Path,
+    base_commit: &str,
+) -> Result<WorktreeDiff, TransactionError> {
+    let output = git_output_bytes(worktree, &["status", "--porcelain=v1", "-z"]).await?;
+    let mut files = Vec::new();
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if record.len() < 4 {
+            return Err(TransactionError::Git);
+        }
+        let status = std::str::from_utf8(&record[..2]).map_err(|_| TransactionError::Git)?;
+        let path = std::str::from_utf8(&record[3..]).map_err(|_| TransactionError::Git)?;
+        let untracked = status == "??";
+        files.push(ChangedFileState {
+            path: path.into(),
+            index_status: (!untracked && &status[0..1] != " ").then(|| status[0..1].into()),
+            worktree_status: (!untracked && &status[1..2] != " ").then(|| status[1..2].into()),
+            untracked,
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let base_diff = git_output(worktree, &["diff", "--name-status", base_commit]).await?;
+    for line in base_diff.lines() {
+        let Some((status, path)) = line.split_once('\t') else {
+            return Err(TransactionError::Git);
+        };
+        if files.iter().all(|file| file.path != path) {
+            files.push(ChangedFileState {
+                path: path.into(),
+                index_status: Some(status.into()),
+                worktree_status: None,
+                untracked: false,
+            });
+        }
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(WorktreeDiff { files })
+}
+
+async fn merge_conflicts(
+    worktree: &Path,
+    target: &str,
+    task: &str,
+) -> Result<Vec<String>, TransactionError> {
+    let output = Command::new("/usr/bin/git")
+        .current_dir(worktree)
+        .args(["merge-tree", "--write-tree", target, task])
+        .output()
         .await
-        .is_ok_and(|head| head == worktree.base_commit)
+        .map_err(|_| TransactionError::Git)?;
+    if output.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut conflicts: Vec<String> = text
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("CONFLICT (content): Merge conflict in ")
+                .map(str::to_owned)
+        })
+        .collect();
+    if conflicts.is_empty() {
+        conflicts.push("merge_conflict".into());
+    }
+    Ok(conflicts)
+}
+async fn git_output(directory: &Path, args: &[&str]) -> Result<String, TransactionError> {
+    String::from_utf8(git_output_bytes(directory, args).await?)
+        .map(|value| value.trim().into())
+        .map_err(|_| TransactionError::Git)
+}
+async fn git_output_bytes(directory: &Path, args: &[&str]) -> Result<Vec<u8>, TransactionError> {
+    let output = Command::new("/usr/bin/git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .await
+        .map_err(|_| TransactionError::Git)?;
+    output
+        .status
+        .success()
+        .then_some(output.stdout)
+        .ok_or(TransactionError::Git)
+}
+async fn git_succeeds(directory: &Path, args: &[&str]) -> bool {
+    Command::new("/usr/bin/git")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
 }
 
 fn map_core(_: CoreError) -> TransactionError {
@@ -488,15 +655,24 @@ mod tests {
         )
         .await
         .expect("create worktree");
-        fs::write(
-            Path::new(&created.worktree_path).join("changed.txt"),
-            "changed\n",
-        )
-        .expect("change worktree");
-        git(Path::new(&created.worktree_path), &["add", "changed.txt"]);
         git(
             Path::new(&created.worktree_path),
-            &["commit", "-m", "changed"],
+            &["checkout", "--orphan", "foreign"],
+        );
+        fs::write(
+            Path::new(&created.worktree_path).join("foreign.txt"),
+            "foreign\n",
+        )
+        .expect("foreign file");
+        git(Path::new(&created.worktree_path), &["add", "foreign.txt"]);
+        git(
+            Path::new(&created.worktree_path),
+            &["commit", "-m", "foreign"],
+        );
+        git(main.path(), &["branch", "-f", &created.branch, "foreign"]);
+        git(
+            Path::new(&created.worktree_path),
+            &["checkout", &created.branch],
         );
 
         assert!(matches!(
@@ -541,5 +717,247 @@ mod tests {
             git(&unrelated, &["branch", "--show-current"]),
             unrelated_branch
         );
+    }
+
+    async fn prepare(repository: RunRepository, task_id: TaskId, main: &Path) -> MergePreparation {
+        let branch = git(main, &["branch", "--show-current"]);
+        WorktreeTransaction::prepare_merge(repository, task_id, main, branch.trim())
+            .await
+            .expect("prepare merge")
+    }
+
+    #[tokio::test]
+    async fn prepares_a_clean_diff() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let preparation = prepare(repository, task_id, main.path()).await;
+        assert!(preparation.diff.files.is_empty());
+        assert!(preparation.persisted.merge_ready);
+    }
+
+    #[tokio::test]
+    async fn reports_modified_staged_and_unstaged_files() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        fs::write(
+            Path::new(&worktree.worktree_path).join("README.md"),
+            "staged\n",
+        )
+        .expect("write");
+        git(Path::new(&worktree.worktree_path), &["add", "README.md"]);
+        fs::write(
+            Path::new(&worktree.worktree_path).join("README.md"),
+            "unstaged\n",
+        )
+        .expect("write");
+        let preparation = prepare(repository, task_id, main.path()).await;
+        assert_eq!(
+            preparation.diff.files,
+            vec![ChangedFileState {
+                path: "README.md".into(),
+                index_status: Some("M".into()),
+                worktree_status: Some("M".into()),
+                untracked: false
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_added_deleted_and_untracked_files() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        fs::remove_file(Path::new(&worktree.worktree_path).join("README.md")).expect("delete");
+        git(Path::new(&worktree.worktree_path), &["add", "-u"]);
+        fs::write(
+            Path::new(&worktree.worktree_path).join("added.txt"),
+            "added\n",
+        )
+        .expect("add");
+        git(Path::new(&worktree.worktree_path), &["add", "added.txt"]);
+        fs::write(
+            Path::new(&worktree.worktree_path).join("untracked.txt"),
+            "untracked\n",
+        )
+        .expect("untracked");
+        let preparation = prepare(repository, task_id, main.path()).await;
+        assert_eq!(
+            preparation
+                .diff
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["README.md", "added.txt", "untracked.txt"]
+        );
+        assert!(preparation
+            .diff
+            .files
+            .iter()
+            .any(|file| file.untracked && file.path == "untracked.txt"));
+    }
+
+    #[tokio::test]
+    async fn records_when_target_branch_has_advanced() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        fs::write(main.path().join("target.txt"), "target\n").expect("target change");
+        git(main.path(), &["add", "target.txt"]);
+        git(main.path(), &["commit", "-m", "target advanced"]);
+        let preparation = prepare(repository.clone(), task_id.clone(), main.path()).await;
+        assert!(preparation.persisted.target_advanced);
+        assert_eq!(
+            repository
+                .v3()
+                .get_task_worktree_merge_preparation(&task_id)
+                .await
+                .expect("persisted preparation"),
+            preparation.persisted
+        );
+    }
+
+    #[tokio::test]
+    async fn records_a_clean_merge_candidate() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        fs::write(
+            Path::new(&worktree.worktree_path).join("task.txt"),
+            "task\n",
+        )
+        .expect("task change");
+        git(Path::new(&worktree.worktree_path), &["add", "task.txt"]);
+        git(
+            Path::new(&worktree.worktree_path),
+            &["commit", "-m", "task"],
+        );
+        fs::write(main.path().join("target.txt"), "target\n").expect("target change");
+        git(main.path(), &["add", "target.txt"]);
+        git(main.path(), &["commit", "-m", "target"]);
+        assert!(
+            prepare(repository, task_id, main.path())
+                .await
+                .persisted
+                .merge_ready
+        );
+    }
+
+    #[tokio::test]
+    async fn records_a_merge_conflict_candidate() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        fs::write(
+            Path::new(&worktree.worktree_path).join("README.md"),
+            "task\n",
+        )
+        .expect("task change");
+        git(Path::new(&worktree.worktree_path), &["add", "README.md"]);
+        git(
+            Path::new(&worktree.worktree_path),
+            &["commit", "-m", "task"],
+        );
+        fs::write(main.path().join("README.md"), "target\n").expect("target change");
+        git(main.path(), &["add", "README.md"]);
+        git(main.path(), &["commit", "-m", "target"]);
+        let preparation = prepare(repository, task_id, main.path()).await;
+        assert!(!preparation.persisted.merge_ready);
+        assert!(!preparation.persisted.conflicts_json.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_preparation_for_recovery_required_worktree() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        fs::rename(&worktree.worktree_path, root.path().join("missing")).expect("move");
+        let branch = git(main.path(), &["branch", "--show-current"]);
+        assert!(matches!(
+            WorktreeTransaction::prepare_merge(repository, task_id, main.path(), branch.trim())
+                .await,
+            Err(TransactionError::RecoveryRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn preparation_preserves_primary_and_unrelated_worktrees() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let unrelated = root.path().join("unrelated");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "unrelated-b",
+                unrelated.to_str().expect("path"),
+            ],
+        );
+        let main_head = git(main.path(), &["rev-parse", "HEAD"]);
+        let unrelated_head = git(&unrelated, &["rev-parse", "HEAD"]);
+        WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let _ = prepare(repository, task_id, main.path()).await;
+        assert_eq!(git(main.path(), &["rev-parse", "HEAD"]), main_head);
+        assert_eq!(git(&unrelated, &["rev-parse", "HEAD"]), unrelated_head);
     }
 }

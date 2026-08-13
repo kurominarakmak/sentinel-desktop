@@ -27,9 +27,10 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
 - V3 Phase 3 native Claude Code adapter: Sentinel owns a supported non-interactive `--print --output-format stream-json` child, persists the opaque Claude session ID, streams normalized V3 events, cancels only its owned process, resumes only Sentinel-owned session records, and reconciles persisted records after restart. Executable/version detection, supported stream-json/resume interfaces, and real CLI JSON framing were verified. Deterministic fake-Claude start/stream/cancel/resume/malformed/exit/restart fixtures pass. The local `claude 2.1.201` binary was not logged in, so authenticated provider lifecycle validation is deferred to Phase 8 or when credentials become available; no login or account change was attempted.
 
 ### PARTIAL
-- V3 Phase 4 is **PARTIAL**. Phases 4A1–4A2 create one task-namespaced branch
-  and worktree from a pinned base commit, persist and reconcile its metadata,
-  reject ownership conflicts, and leave the primary working tree untouched.
+- V3 Phase 4 is **PARTIAL**. Phases 4A1–4B create and reconcile one
+  task-namespaced worktree from a pinned base, persist read-only diff and merge
+  preparation metadata, reject ownership conflicts, and leave the primary tree
+  untouched.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
 
@@ -53,6 +54,5 @@ Existing uncommitted desktop changes were present before this documentation reco
 Phase 2 is complete with known provider limitations recorded in
 [Phase 2D validation](docs/v3-phase2d-validation.md). Phase 3 is COMPLETE WITH
 AUTH-LIMITED VALIDATION; authenticated Claude smoke/reconciliation is deferred
-to Phase 8 or available credentials. Phase 4 remains PARTIAL: 4B diff and
-merge preparation, plus 4C approval-gated discard, rollback, cleanup, and
-retention remain.
+to Phase 8 or available credentials. Phase 4 remains PARTIAL: 4C approval-gated
+discard, rollback, cleanup, and retention remain.

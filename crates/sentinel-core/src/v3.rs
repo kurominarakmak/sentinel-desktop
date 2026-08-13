@@ -526,6 +526,29 @@ pub struct CreateTaskWorktree {
     pub branch: String,
     pub base_commit: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskWorktreeMergePreparation {
+    pub task_id: TaskId,
+    pub target_branch: String,
+    pub target_commit: String,
+    pub worktree_commit: String,
+    pub target_advanced: bool,
+    pub merge_ready: bool,
+    pub conflicts_json: String,
+    pub diff_json: String,
+    pub prepared_at_ms: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTaskWorktreeMergePreparation {
+    pub task_id: TaskId,
+    pub target_branch: String,
+    pub target_commit: String,
+    pub worktree_commit: String,
+    pub target_advanced: bool,
+    pub merge_ready: bool,
+    pub conflicts_json: String,
+    pub diff_json: String,
+}
 impl V3Repository {
     pub async fn get_task_worktree(&self, task_id: &TaskId) -> Result<TaskWorktree, CoreError> {
         let row = sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE task_id=?")
@@ -589,6 +612,38 @@ impl V3Repository {
             return Err(CoreError::NotFound);
         }
         self.get_task_worktree(task_id).await
+    }
+    pub async fn save_task_worktree_merge_preparation(
+        &self,
+        input: CreateTaskWorktreeMergePreparation,
+        timestamp: i64,
+    ) -> Result<TaskWorktreeMergePreparation, CoreError> {
+        sqlx::query("INSERT INTO v3_task_worktree_merge_preparations (task_id,target_branch,target_commit,worktree_commit,target_advanced,merge_ready,conflicts_json,diff_json,prepared_at_ms) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET target_branch=excluded.target_branch,target_commit=excluded.target_commit,worktree_commit=excluded.worktree_commit,target_advanced=excluded.target_advanced,merge_ready=excluded.merge_ready,conflicts_json=excluded.conflicts_json,diff_json=excluded.diff_json,prepared_at_ms=excluded.prepared_at_ms")
+            .bind(input.task_id.to_string()).bind(&input.target_branch).bind(&input.target_commit).bind(&input.worktree_commit).bind(input.target_advanced).bind(input.merge_ready).bind(&input.conflicts_json).bind(&input.diff_json).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.get_task_worktree_merge_preparation(&input.task_id)
+            .await
+    }
+    pub async fn get_task_worktree_merge_preparation(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<TaskWorktreeMergePreparation, CoreError> {
+        let row = sqlx::query("SELECT * FROM v3_task_worktree_merge_preparations WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .ok_or(CoreError::NotFound)?;
+        Ok(TaskWorktreeMergePreparation {
+            task_id: TaskId(row.get("task_id")),
+            target_branch: row.get("target_branch"),
+            target_commit: row.get("target_commit"),
+            worktree_commit: row.get("worktree_commit"),
+            target_advanced: row.get("target_advanced"),
+            merge_ready: row.get("merge_ready"),
+            conflicts_json: row.get("conflicts_json"),
+            diff_json: row.get("diff_json"),
+            prepared_at_ms: row.get("prepared_at_ms"),
+        })
     }
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
