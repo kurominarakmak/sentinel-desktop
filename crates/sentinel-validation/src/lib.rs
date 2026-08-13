@@ -119,6 +119,13 @@ impl ValidationRunner {
         let worktree = WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
             .await
             .map_err(|_| ValidationError::Worktree)?;
+        let owned_worktree = std::path::Path::new(&worktree.worktree_path)
+            .canonicalize()
+            .map_err(|_| ValidationError::Worktree)?;
+        let primary = main.canonicalize().map_err(|_| ValidationError::Worktree)?;
+        if owned_worktree == primary || !owned_worktree.is_dir() {
+            return Err(ValidationError::Worktree);
+        }
         let mut results = Vec::new();
         for step in profile.steps {
             let result = repository
@@ -140,13 +147,7 @@ impl ValidationRunner {
                 .transition_validation_result(&result, ValidationLifecycle::Running, None, now())
                 .await
                 .map_err(|_| ValidationError::Storage)?;
-            let execution = execute(
-                &step,
-                std::path::Path::new(&worktree.worktree_path),
-                cancellation,
-                running.id.clone(),
-            )
-            .await;
+            let execution = execute(&step, &owned_worktree, cancellation, running.id.clone()).await;
             let lifecycle = match execution.outcome.as_str() {
                 "passed" => ValidationLifecycle::Passed,
                 "failed" => ValidationLifecycle::Failed,
@@ -188,6 +189,25 @@ async fn execute(
     let args: Vec<&str> = step.argv.iter().skip(1).map(String::as_str).collect();
     let mut stdout = String::new();
     let mut stderr = String::new();
+    let executable = std::path::Path::new(&step.argv[0]);
+    if executable.is_absolute()
+        && executable
+            .canonicalize()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .is_none_or(|metadata| !metadata.is_file())
+    {
+        return execution(
+            validation_id,
+            step,
+            None,
+            started,
+            started_instant,
+            stdout,
+            stderr,
+            "invalid",
+        );
+    }
     if step.cwd != "" && step.cwd != "."
         || step
             .env
