@@ -2,6 +2,7 @@
 mod b2_a;
 mod codex_sessions;
 mod codex_usage;
+mod v3_desktop;
 mod windowing;
 
 use sentinel_agent_api::{
@@ -588,11 +589,13 @@ fn spike_diagnostics() -> Diagnostics {
 #[tauri::command]
 async fn run_v3_validation_profile(
     state: State<'_, DesktopState>,
+    app: AppHandle,
     request: V3ValidationRequest,
 ) -> Result<V3ValidationResultDto, SafeError> {
     if request.task_id.trim().is_empty() || request.profile_id.trim().is_empty() {
         return Err(input_error());
     }
+    let task_key = request.task_id.clone();
     let task_id = sentinel_core::v3::TaskId(request.task_id);
     let worktree = state
         .repository
@@ -610,6 +613,7 @@ async fn run_v3_validation_profile(
     )
     .await
     .map_err(safe_error)?;
+    let _ = app.emit("v3-state-changed", task_key);
     Ok(V3ValidationResultDto {
         profile_id: request.profile_id,
         results: report
@@ -649,6 +653,7 @@ async fn codex_rate_limits(
 #[tauri::command]
 async fn start_codex_session_task(
     state: State<'_, DesktopState>,
+    app: AppHandle,
     request: CodexTaskRequest,
 ) -> Result<String, SafeError> {
     if request.summary.trim().is_empty() || request.prompt.trim().is_empty() {
@@ -660,6 +665,7 @@ async fn start_codex_session_task(
         .start_task(request.summary, &cwd)
         .await
         .map_err(safe_error)?;
+    let _ = app.emit("v3-state-changed", task.id.to_string());
     state
         .codex_sessions
         .start_turn(&task.id, &request.prompt)
@@ -695,16 +701,20 @@ async fn resume_codex_session_task(
 #[tauri::command]
 async fn cancel_codex_session_task(
     state: State<'_, DesktopState>,
+    app: AppHandle,
     request: CodexTaskIdRequest,
 ) -> Result<(), SafeError> {
     if request.task_id.trim().is_empty() {
         return Err(input_error());
     }
+    let task_id = sentinel_core::v3::TaskId(request.task_id);
     state
         .codex_sessions
-        .cancel(&sentinel_core::v3::TaskId(request.task_id))
+        .cancel(&task_id)
         .await
-        .map_err(safe_error)
+        .map_err(safe_error)?;
+    let _ = app.emit("v3-state-changed", task_id.to_string());
+    Ok(())
 }
 fn parse_approval_owner(
     request: &ApprovalOwnerRequest,
@@ -3677,6 +3687,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             spike_diagnostics,
             run_v3_validation_profile,
+            v3_desktop::list_v3_tasks,
+            v3_desktop::get_v3_task_detail,
+            v3_desktop::decide_v3_final_approval,
             codex_capability,
             codex_rate_limits,
             start_codex_session_task,

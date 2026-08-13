@@ -932,6 +932,19 @@ impl V3Repository {
             .transpose()?
             .ok_or(CoreError::NotFound)
     }
+    pub async fn list_approvals_for_task(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<Approval>, CoreError> {
+        sqlx::query("SELECT * FROM v3_approvals WHERE task_id=? ORDER BY created_at_ms ASC, id ASC")
+            .bind(task_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .iter()
+            .map(approval_from)
+            .collect()
+    }
     pub async fn transition_approval(
         &self,
         approval: &Approval,
@@ -1207,6 +1220,16 @@ impl V3Repository {
         };
         sqlx::query("INSERT INTO v3_artifacts (id,task_id,kind,display_name,content_hash,metadata_json,created_at_ms) VALUES (?,?,?,?,?,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(&result.kind).bind(&result.display_name).bind(&result.content_hash).bind(metadata).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
         Ok(result)
+    }
+    pub async fn list_artifacts(&self, task_id: &TaskId) -> Result<Vec<Artifact>, CoreError> {
+        sqlx::query("SELECT * FROM v3_artifacts WHERE task_id=? ORDER BY created_at_ms ASC, id ASC")
+            .bind(task_id.to_string())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .iter()
+            .map(artifact_from)
+            .collect()
     }
     pub async fn get_artifact(&self, id: &ArtifactId) -> Result<Artifact, CoreError> {
         sqlx::query("SELECT * FROM v3_artifacts WHERE id=?")

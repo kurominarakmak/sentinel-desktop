@@ -18,6 +18,7 @@ dependencies = [
  "sentinel-fake-agent",
  "sentinel-git",
  "sentinel-process",
+ "sentinel-review",
  "sentinel-runtime",
  "sentinel-validation",
  "serde",
