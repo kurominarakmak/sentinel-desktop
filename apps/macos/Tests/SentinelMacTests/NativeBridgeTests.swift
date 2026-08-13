@@ -137,4 +137,60 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertFalse(gate.apply(stale))
         XCTAssertEqual(gate.current?.repository, "/repo")
     }
+
+    func testSurfaceRegistryCreatesEachSurfaceOnlyOnce() {
+        var registry = NativeSurfaceRegistry()
+        XCTAssertTrue(registry.requestOpen(.quickPrompt))
+        XCTAssertFalse(registry.requestOpen(.quickPrompt))
+        XCTAssertTrue(registry.requestOpen(.attention))
+        XCTAssertTrue(registry.requestOpen(.taskDetail))
+        XCTAssertTrue(registry.requestOpen(.status))
+        XCTAssertTrue(registry.requestOpen(.settings))
+        XCTAssertEqual(registry.owned.count, 5)
+    }
+
+    func testFocusRestorationOnlyTargetsStillRunningPreviousApplication() {
+        var focus = PreviousApplicationFocus()
+        let sentinel: pid_t = 100
+        // The pure state machine is intentionally independent of AppKit activation.
+        // It will ignore a stale process identifier and clear it after the attempt.
+        focus = PreviousApplicationFocus(processIdentifier: 42)
+        XCTAssertNil(focus.takeRestoreCandidate(runningProcessIdentifiers: [sentinel], sentinelPID: sentinel))
+        XCTAssertNil(focus.takeRestoreCandidate(runningProcessIdentifiers: [42], sentinelPID: sentinel))
+        focus = PreviousApplicationFocus(processIdentifier: 42)
+        XCTAssertEqual(focus.takeRestoreCandidate(runningProcessIdentifiers: [42, sentinel], sentinelPID: sentinel), 42)
+    }
+
+    func testFloatingPanelPlacementCentersOffScreenFrameWithoutMovingVisibleFrame() {
+        let screen = NSRect(x: 0, y: 0, width: 1000, height: 800)
+        let offScreen = NSRect(x: 4000, y: 4000, width: 320, height: 240)
+        let visible = NSRect(x: 100, y: 100, width: 320, height: 240)
+        XCTAssertEqual(FloatingPanelPlacement.correctedFrame(offScreen, visibleFrames: [screen], preferred: screen).midX, 500)
+        XCTAssertEqual(FloatingPanelPlacement.correctedFrame(visible, visibleFrames: [screen], preferred: screen), visible)
+    }
+
+    func testActiveTaskGateRejectsStaleSameTaskAndAcceptsReplacementOrClear() {
+        var gate = TaskUpdateGate()
+        let current = NativeTask(id: "task-1", summary: "current", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 3, updatedAtMs: 3)
+        let stale = NativeTask(id: "task-1", summary: "stale", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 2, updatedAtMs: 2)
+        let replacement = NativeTask(id: "task-2", summary: "replacement", lifecycle: "reviewing", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 4)
+        XCTAssertTrue(gate.apply(current))
+        XCTAssertFalse(gate.apply(stale))
+        XCTAssertTrue(gate.apply(replacement))
+        XCTAssertEqual(gate.current?.id, "task-2")
+        XCTAssertTrue(gate.apply(nil))
+        XCTAssertNil(gate.current)
+    }
+
+    func testBridgeConnectionRejectsPreReconnectMessagesAndSubscribesOncePerGeneration() {
+        var connection = BridgeConnectionState()
+        let first = connection.began()
+        XCTAssertTrue(connection.claimSubscription(for: first))
+        XCTAssertFalse(connection.claimSubscription(for: first))
+        let second = connection.began()
+        XCTAssertFalse(connection.accepts(first))
+        XCTAssertTrue(connection.accepts(second))
+        XCTAssertTrue(connection.claimSubscription(for: second))
+        XCTAssertFalse(connection.claimSubscription(for: second))
+    }
 }

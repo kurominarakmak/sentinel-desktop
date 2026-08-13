@@ -118,6 +118,24 @@ enum TaskSubmissionState: Equatable {
 
 enum TaskSubmissionBegin: Equatable { case accepted(String), rejected(String) }
 
+struct TaskUpdateGate {
+    private(set) var current: NativeTask?
+
+    mutating func apply(_ update: NativeTask?) -> Bool {
+        guard let update else {
+            current = nil
+            return true
+        }
+        guard let current else {
+            self.current = update
+            return true
+        }
+        guard current.id != update.id || update.version >= current.version else { return false }
+        self.current = update
+        return true
+    }
+}
+
 struct TaskSubmissionGate {
     private(set) var pendingRequestID: String?
 
@@ -248,15 +266,20 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var taskDetail: NativeTaskDetail?
     @Published private(set) var status: NativeStatus?
     @Published private(set) var settings: NativeSettings?
+    @Published private(set) var bridgeConnected = false
 
     private var process: Process?
     private var input: FileHandle?
+    private var output: FileHandle?
+    private var connectionState = BridgeConnectionState()
+    private var reconnectScheduled = false
     private var submissionGate = TaskSubmissionGate()
     private var attentionActionGate = AttentionActionGate()
     private var attentionUpdateGate = AttentionUpdateGate()
     private var detailUpdateGate = DetailUpdateGate()
     private var statusUpdateGate = StatusUpdateGate()
     private var settingsUpdateGate = SettingsUpdateGate()
+    private var activeTaskUpdateGate = TaskUpdateGate()
 
     func start() {
         guard process == nil else { return }
@@ -264,6 +287,7 @@ final class NativeBridge: ObservableObject {
             availabilityMessage = "Native bridge is not bundled yet. Build sentinel-native-bridge for development."
             return
         }
+        let generation = connectionState.began()
         let process = Process()
         process.executableURL = executable
         process.arguments = [appDataDirectory().appending(path: "phase2.sqlite3").path()]
@@ -276,20 +300,27 @@ final class NativeBridge: ObservableObject {
             try process.run()
             self.process = process
             self.input = input.fileHandleForWriting
+            self.output = output.fileHandleForReading
+            bridgeConnected = true
+            availabilityMessage = nil
+            process.terminationHandler = { [weak self] _ in
+                DispatchQueue.main.async { self?.sidecarTerminated(generation: generation) }
+            }
             output.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
                 for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
-                    guard let message = try? JSONDecoder().decode(BridgeMessage.self, from: Data(line.utf8)) else { continue }
-                    DispatchQueue.main.async { self?.receive(message) }
+                    guard let message = try? JSONDecoder().decode(BridgeMessage.self, from: Data(line.utf8)) else {
+                        DispatchQueue.main.async { self?.receivedMalformedMessage(generation: generation) }
+                        continue
+                    }
+                    DispatchQueue.main.async { self?.receive(message, generation: generation) }
                 }
             }
-            send(["kind": "subscribe"])
-            send(["kind": "active_task"])
-            send(["kind": "attention_state"])
-            send(["kind": "status"])
-            send(["kind": "capabilities"])
+            refreshSnapshots(generation: generation)
         } catch {
+            bridgeConnected = false
             availabilityMessage = "Native bridge could not start."
+            scheduleReconnect()
         }
     }
 
@@ -298,7 +329,9 @@ final class NativeBridge: ObservableObject {
     }
 
     func requestAttentionAction(_ action: String) {
-        guard let attention else {
+        let task = attention?.task ?? taskDetail?.task
+        let actions = attention?.actions ?? taskDetail?.actions
+        guard let task else {
             attentionActionMessage = "There is no active task."
             return
         }
@@ -309,8 +342,8 @@ final class NativeBridge: ObservableObject {
         }
         attentionActionInFlight = true
         attentionActionMessage = nil
-        var request: [String: Any] = ["kind": "attention_action", "request_id": requestID, "action": action, "task_id": attention.task.id]
-        if (action == "approve" || action == "reject"), let approvalID = attention.actions.approvalID {
+        var request: [String: Any] = ["kind": "attention_action", "request_id": requestID, "action": action, "task_id": task.id]
+        if (action == "approve" || action == "reject"), let approvalID = actions?.approvalID {
             request["approval_id"] = approvalID
         }
         guard send(request) else {
@@ -346,9 +379,10 @@ final class NativeBridge: ObservableObject {
         }
     }
 
-    private func receive(_ message: BridgeMessage) {
+    private func receive(_ message: BridgeMessage, generation: UInt64) {
+        guard connectionState.accepts(generation) else { return }
         switch message {
-        case .activeTask(let task), .taskUpdate(let task): activeTask = task
+        case .activeTask(let task), .taskUpdate(let task): applyActiveTask(task)
         case .attentionState(let attention), .attentionUpdate(let attention): apply(attention)
         case .taskDetail(let detail):
             guard detailUpdateGate.apply(detail) else { return }
@@ -369,12 +403,12 @@ final class NativeBridge: ObservableObject {
         case .taskStartResult(let requestID, let accepted, let task, let message):
             guard submissionGate.complete(requestID: requestID) else { return }
             if accepted, let task {
-                activeTask = task
+                applyActiveTask(task)
                 taskSubmission = .accepted(task)
             } else {
                 taskSubmission = .rejected(message ?? "Task submission was rejected.")
             }
-        case .unavailable(let message): availabilityMessage = message
+        case .unavailable(let message): availabilityMessage = String(message.prefix(240))
         case .subscribed, .supervisorResult: break
         }
     }
@@ -382,14 +416,78 @@ final class NativeBridge: ObservableObject {
     private func apply(_ update: NativeAttention?) {
         guard attentionUpdateGate.apply(update) else { return }
         attention = attentionUpdateGate.current
-        activeTask = attention?.task
+        applyActiveTask(attention?.task)
         if let taskID = attention?.task.id { loadTaskDetail(taskID: taskID) }
         loadStatus()
     }
 
+    private func applyActiveTask(_ update: NativeTask?) {
+        guard activeTaskUpdateGate.apply(update) else { return }
+        activeTask = activeTaskUpdateGate.current
+        if let taskID = update?.id, taskDetail?.task.id != taskID {
+            loadTaskDetail(taskID: taskID)
+        }
+    }
+
+    private func receivedMalformedMessage(generation: UInt64) {
+        guard connectionState.accepts(generation) else { return }
+        availabilityMessage = "Native bridge returned an invalid response."
+    }
+
+    private func sidecarTerminated(generation: UInt64) {
+        guard connectionState.accepts(generation) else { return }
+        input = nil
+        output?.readabilityHandler = nil
+        output = nil
+        process = nil
+        bridgeConnected = false
+        availabilityMessage = "Native bridge disconnected. Reconnecting…"
+        if case .sending = taskSubmission {
+            submissionGate.rejectPending()
+            taskSubmission = .rejected("Native bridge disconnected before task submission was confirmed.")
+        }
+        if attentionActionInFlight {
+            attentionActionInFlight = false
+            attentionActionMessage = "Native bridge disconnected before the action was confirmed."
+        }
+        attentionActionGate = AttentionActionGate()
+        resetUpdateGates()
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        guard !reconnectScheduled, bridgeExecutable() != nil else { return }
+        reconnectScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self else { return }
+            self.reconnectScheduled = false
+            self.start()
+        }
+    }
+
+    private func resetUpdateGates() {
+        attentionUpdateGate = AttentionUpdateGate()
+        detailUpdateGate = DetailUpdateGate()
+        statusUpdateGate = StatusUpdateGate()
+        settingsUpdateGate = SettingsUpdateGate()
+        activeTaskUpdateGate = TaskUpdateGate()
+    }
+
+    private func refreshSnapshots(generation: UInt64) {
+        guard connectionState.claimSubscription(for: generation) else { return }
+        _ = send(["kind": "subscribe"])
+        _ = send(["kind": "active_task"])
+        _ = send(["kind": "attention_state"])
+        _ = send(["kind": "status"])
+        _ = send(["kind": "settings"])
+        _ = send(["kind": "capabilities"])
+    }
+
     @discardableResult
     private func send(_ value: [String: Any]) -> Bool {
-        guard let data = try? JSONSerialization.data(withJSONObject: value), let input else { return false }
+        guard process?.isRunning == true,
+              let data = try? JSONSerialization.data(withJSONObject: value),
+              let input else { return false }
         input.write(data)
         input.write(Data("\n".utf8))
         return true

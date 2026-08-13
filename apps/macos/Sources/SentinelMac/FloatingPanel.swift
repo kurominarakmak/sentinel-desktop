@@ -3,6 +3,7 @@ import SwiftUI
 
 final class SentinelFloatingPanel: NSPanel {
     var onHide: (() -> Void)?
+    private(set) var hasBeenPresented = false
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
@@ -25,7 +26,18 @@ final class SentinelFloatingPanel: NSPanel {
     }
 
     override func cancelOperation(_ sender: Any?) {
+        hide()
+    }
+
+    override func close() {
+        hide()
+    }
+
+    func hide() {
+        guard isVisible else { return }
         orderOut(nil)
         onHide?()
     }
+
+    func markPresented() { hasBeenPresented = true }
 }

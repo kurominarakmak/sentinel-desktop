@@ -5,6 +5,6 @@ struct SentinelMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        Settings { EmptyView() }
+        Settings { SettingsView(bridge: delegate.bridge) }
     }
 }

@@ -10,9 +10,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var attention: SentinelFloatingPanel?
     private var detailWindow: NSWindow?
     private var statusWindow: NSWindow?
-    private var settingsWindow: NSWindow?
     private var hotKeyRef: EventHotKeyRef?
-    private var previousApplication: NSRunningApplication?
+    private var surfaceRegistry = NativeSurfaceRegistry()
+    private var previousApplicationFocus = PreviousApplicationFocus()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -20,6 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installStatusItem()
         installPanels()
         installGlobalShortcut()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     private func installStatusItem() {
@@ -32,6 +36,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         promptItem.target = self
         let statusMenuItem = menu.addItem(withTitle: "Status", action: #selector(showStatus), keyEquivalent: "")
         statusMenuItem.target = self
+        let attentionMenuItem = menu.addItem(withTitle: "Attention", action: #selector(showAttention), keyEquivalent: "")
+        attentionMenuItem.target = self
         let settingsMenuItem = menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         settingsMenuItem.target = self
         item.menu = menu
@@ -39,12 +45,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installPanels() {
+        _ = surfaceRegistry.requestOpen(.quickPrompt)
         quickPrompt = SentinelFloatingPanel(title: "Quick Prompt") {
             QuickPromptView(bridge: self.bridge) { [weak self] in
-                self?.quickPrompt?.orderOut(nil)
-                self?.restorePreviousApplication()
+                self?.quickPrompt?.hide()
             }
         }
+        _ = surfaceRegistry.requestOpen(.attention)
         attention = SentinelFloatingPanel(title: "Sentinel") { AttentionWidgetView(bridge: self.bridge, openDetail: { self.showTaskDetail() }) }
         quickPrompt?.onHide = { [weak self] in self?.restorePreviousApplication() }
         attention?.onHide = { [weak self] in self?.restorePreviousApplication() }
@@ -55,11 +62,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showStatus() {
         if statusWindow == nil {
+            _ = surfaceRegistry.requestOpen(.status)
             statusWindow = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
                 styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false
             )
             statusWindow?.title = "Sentinel Status"
+            statusWindow?.isReleasedWhenClosed = false
             statusWindow?.contentView = NSHostingView(rootView: StatusView(bridge: bridge))
         }
         statusWindow?.makeKeyAndOrderFront(nil)
@@ -67,25 +76,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showSettings() {
-        if settingsWindow == nil {
-            settingsWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 520, height: 470),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false
-            )
-            settingsWindow?.title = "Sentinel Settings"
-            settingsWindow?.contentView = NSHostingView(rootView: SettingsView(bridge: bridge))
-        }
-        settingsWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        _ = surfaceRegistry.requestOpen(.settings)
+        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: self)
     }
 
     private func present(_ panel: NSPanel?) {
         guard let panel else { return }
         let frontmost = NSWorkspace.shared.frontmostApplication
-        if frontmost?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
-            previousApplication = frontmost
+        if !panel.isVisible {
+            previousApplicationFocus.capture(
+                frontmost: frontmost,
+                sentinelPID: ProcessInfo.processInfo.processIdentifier
+            )
+            place(panel: panel)
         }
-        panel.center()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if panel === quickPrompt {
@@ -94,16 +98,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restorePreviousApplication() {
-        previousApplication?.activate(options: [])
+        let sentinelPID = ProcessInfo.processInfo.processIdentifier
+        let running = Set(NSWorkspace.shared.runningApplications.map(\.processIdentifier))
+        guard let pid = previousApplicationFocus.takeRestoreCandidate(
+            runningProcessIdentifiers: running,
+            sentinelPID: sentinelPID
+        ), let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else { return }
+        application.activate(options: [])
+    }
+
+    private func place(panel: NSPanel) {
+        let preferred = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame ?? panel.frame
+        let visible = NSScreen.screens.map(\.visibleFrame)
+        if let floating = panel as? SentinelFloatingPanel, !floating.hasBeenPresented {
+            panel.setFrame(FloatingPanelPlacement.centeredFrame(size: panel.frame.size, preferred: preferred), display: false)
+            floating.markPresented()
+            return
+        }
+        if visible.contains(where: { $0.intersects(panel.frame) }) {
+            return
+        }
+        panel.setFrame(FloatingPanelPlacement.correctedFrame(panel.frame, visibleFrames: visible, preferred: preferred), display: false)
     }
 
     func showTaskDetail() {
         if detailWindow == nil {
+            _ = surfaceRegistry.requestOpen(.taskDetail)
             detailWindow = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 620, height: 520),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false
             )
             detailWindow?.title = "Sentinel Task Detail"
+            detailWindow?.isReleasedWhenClosed = false
             detailWindow?.contentView = NSHostingView(rootView: TaskDetailView(bridge: bridge))
         }
         detailWindow?.makeKeyAndOrderFront(nil)
