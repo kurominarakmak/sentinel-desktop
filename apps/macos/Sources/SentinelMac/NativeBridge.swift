@@ -294,6 +294,7 @@ final class NativeBridge: ObservableObject {
     private var output: FileHandle?
     private var connectionState = BridgeConnectionState()
     private var reconnectScheduled = false
+    private var outputBuffer = BridgeLineBuffer()
     private var submissionGate = TaskSubmissionGate()
     private var attentionActionGate = AttentionActionGate()
     private var attentionUpdateGate = AttentionUpdateGate()
@@ -322,6 +323,7 @@ final class NativeBridge: ObservableObject {
             self.process = process
             self.input = input.fileHandleForWriting
             self.output = output.fileHandleForReading
+            outputBuffer.reset()
             bridgeConnected = true
             availabilityMessage = nil
             process.terminationHandler = { [weak self] _ in
@@ -329,13 +331,7 @@ final class NativeBridge: ObservableObject {
             }
             output.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
-                for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
-                    guard let message = try? JSONDecoder().decode(BridgeMessage.self, from: Data(line.utf8)) else {
-                        DispatchQueue.main.async { self?.receivedMalformedMessage(generation: generation) }
-                        continue
-                    }
-                    DispatchQueue.main.async { self?.receive(message, generation: generation) }
-                }
+                DispatchQueue.main.async { self?.receivedOutput(data, generation: generation) }
             }
             refreshSnapshots(generation: generation)
         } catch {
@@ -455,11 +451,23 @@ final class NativeBridge: ObservableObject {
         availabilityMessage = "Native bridge returned an invalid response."
     }
 
+    private func receivedOutput(_ data: Data, generation: UInt64) {
+        guard connectionState.accepts(generation) else { return }
+        for line in outputBuffer.append(data) where !line.isEmpty {
+            guard let message = try? JSONDecoder().decode(BridgeMessage.self, from: line) else {
+                receivedMalformedMessage(generation: generation)
+                continue
+            }
+            receive(message, generation: generation)
+        }
+    }
+
     private func sidecarTerminated(generation: UInt64) {
         guard connectionState.accepts(generation) else { return }
         input = nil
         output?.readabilityHandler = nil
         output = nil
+        outputBuffer.reset()
         process = nil
         bridgeConnected = false
         availabilityMessage = "Native bridge disconnected. Reconnecting…"

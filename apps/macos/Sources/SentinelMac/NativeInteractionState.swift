@@ -39,6 +39,22 @@ struct BridgeConnectionState {
     }
 }
 
+struct BridgeLineBuffer {
+    private var pending = Data()
+
+    mutating func append(_ chunk: Data) -> [Data] {
+        pending.append(chunk)
+        var lines: [Data] = []
+        while let newline = pending.firstIndex(of: 10) {
+            lines.append(pending.prefix(upTo: newline))
+            pending.removeSubrange(...newline)
+        }
+        return lines
+    }
+
+    mutating func reset() { pending.removeAll(keepingCapacity: true) }
+}
+
 struct PreviousApplicationFocus {
     private(set) var processIdentifier: pid_t?
 

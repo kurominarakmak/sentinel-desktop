@@ -203,6 +203,20 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertFalse(connection.claimSubscription(for: second))
     }
 
+    func testBridgeLineBufferWaitsForWholeStatusFrameBeforeDecoding() throws {
+        var frame = Data(#"{"kind":"status","status":{"version":1,"sentinel":"ready","activeTask":null,"recoveryRequired":false,"codex":{"name":"Codex","installation":"available","runtime":"active","usage":"live","rateLimits":{"primary":{"usedPercent":39,"resetsAt":1787196921,"windowDurationMins":10080}}},"claude":{"name":"Claude Code","installation":"unavailable","runtime":"none","usage":"unavailable","rateLimits":null}}}"#.utf8)
+        frame.append(10)
+        let split = frame.index(frame.startIndex, offsetBy: 73)
+        var buffer = BridgeLineBuffer()
+        XCTAssertTrue(buffer.append(frame.prefix(upTo: split)).isEmpty)
+        let lines = buffer.append(frame.suffix(from: split))
+        XCTAssertEqual(lines.count, 1)
+        guard case .status(let status) = try JSONDecoder().decode(BridgeMessage.self, from: lines[0]) else {
+            return XCTFail("expected complete status frame")
+        }
+        XCTAssertEqual(CodexTrayTitle.make(status), "39%")
+    }
+
     func testCodexTrayTitleUsesOnlyVerifiedPrimaryUsage() {
         let codex = NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: ["primary": RateLimitWindow(usedPercent: 24.6, resetsAt: nil, windowDurationMins: nil)])
         let claude = NativeProviderStatus(name: "Claude Code", installation: "unavailable", runtime: "none", usage: "unavailable", rateLimits: nil)
