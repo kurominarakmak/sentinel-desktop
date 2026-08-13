@@ -59,4 +59,27 @@ final class NativeBridgeTests: XCTestCase {
         let rejected = Data(#"{"kind":"attention_action_result","requestId":"action-2","accepted":false,"message":"action is not authorized for the current task"}"#.utf8)
         XCTAssertEqual(try JSONDecoder().decode(BridgeMessage.self, from: rejected), .attentionActionResult(requestID: "action-2", accepted: false, message: "action is not authorized for the current task"))
     }
+
+    func testDecodesHealthyDurableTaskDetailWithApprovalAndEvidence() throws {
+        let data = Data(#"{"kind":"task_detail","detail":{"task":{"id":"task-1","summary":"Ship it","lifecycle":"ready_for_human","recoveryRequired":false,"recoveryReason":null,"version":4,"updatedAtMs":9},"sessions":[{"provider":"Codex","sessionRef":"thread-1","state":"active","updatedAtMs":8}],"activity":[{"kind":"task_prepared","provider":"Codex","occurredAtMs":1,"payload":"{}"},{"kind":"review_reported","provider":"Claude Code","occurredAtMs":2,"payload":"{}"}],"worktree":{"repositoryRoot":"/repo","path":"/worktree","branch":"agent/task","baseCommit":"abc","state":"ready"},"diff":{"targetBranch":"main","targetAdvanced":true,"mergeReady":false,"summary":"{\"filesChanged\":2}","conflicts":"[]"},"validations":[{"id":"check","profile":"test","check":"unit","required":true,"state":"failed","summary":"exit 1","updatedAtMs":3,"command":"[\"cargo\",\"test\"]","exitCode":1,"durationMs":12,"stdout":"safe output","stderr":"redacted output","outcome":"failed"}],"findings":[{"id":"finding","repairRoundId":"round-1","severity":"blocker","disposition":"confirmed_blocking","summary":"Fix me","evidence":"{\"file\":\"src/a.rs\",\"line\":3}"}],"repairRounds":[{"id":"round-1","round":1,"state":"completed","updatedAtMs":4}],"finalApprovalPacket":"{\"unresolved_risks\":[\"risk\"]}","actions":{"stop":false,"approve":true,"reject":true,"approvalID":"approval-1"}}}"#.utf8)
+        guard case .taskDetail(let detail) = try JSONDecoder().decode(BridgeMessage.self, from: data) else { return XCTFail("expected task detail") }
+        XCTAssertEqual(detail.activity.map(\.occurredAtMs), [1, 2])
+        XCTAssertEqual(detail.worktree?.branch, "agent/task")
+        XCTAssertEqual(detail.validations.first?.exitCode, 1)
+        XCTAssertEqual(detail.findings.first?.severity, "blocker")
+        XCTAssertEqual(detail.repairRounds.first?.round, 1)
+        XCTAssertEqual(detail.actions.approvalID, "approval-1")
+    }
+
+    func testDetailGateRejectsStaleUpdateAndAcceptsReplacement() {
+        let action = AttentionActions(stop: false, approve: false, reject: false, approvalID: nil)
+        let first = NativeTaskDetail(task: NativeTask(id: "task-1", summary: "one", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 2, updatedAtMs: 2), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, actions: action)
+        let stale = NativeTaskDetail(task: NativeTask(id: "task-1", summary: "old", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 1), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, actions: action)
+        let replacement = NativeTaskDetail(task: NativeTask(id: "task-2", summary: "new", lifecycle: "recovering", recoveryRequired: true, recoveryReason: "missing_thread", version: 1, updatedAtMs: 3), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, actions: action)
+        var gate = DetailUpdateGate()
+        XCTAssertTrue(gate.apply(first))
+        XCTAssertFalse(gate.apply(stale))
+        XCTAssertTrue(gate.apply(replacement))
+        XCTAssertEqual(gate.current?.task.id, "task-2")
+    }
 }

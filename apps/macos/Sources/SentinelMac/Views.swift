@@ -139,18 +139,151 @@ struct AttentionWidgetView: View {
 
 struct TaskDetailView: View {
     @ObservedObject var bridge: NativeBridge
+    @State private var expandedSections: Set<String> = ["activity", "validation", "review"]
+
     var body: some View {
-        SentinelPanel {
-            VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
-                HStack { ProviderBadge(provider: "Sentinel"); Spacer(); StateBadge(state: bridge.activeTask?.lifecycle ?? "ready") }
-                Text(bridge.activeTask?.summary ?? "No active V3 task").font(.title3.weight(.semibold))
-                Divider()
-                Text("Activity, changes, validation, review, repair history, and approval remain sourced from the Rust V3 service bridge.")
-                    .foregroundStyle(.secondary)
-                Spacer()
+        ScrollView {
+            SentinelPanel {
+                if let detail = bridge.taskDetail {
+                    VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
+                        summary(detail)
+                        if detail.task.recoveryRequired || detail.task.lifecycle == "failed" || detail.task.lifecycle == "blocked" {
+                            Label(detail.task.recoveryReason?.replacingOccurrences(of: "_", with: " ") ?? "Task requires attention.", systemImage: "exclamationmark.triangle.fill")
+                                .font(.subheadline.weight(.semibold)).foregroundStyle(.red)
+                        }
+                        section("Activity", id: "activity") { activity(detail.activity) }
+                        section("Changes", id: "changes") { changes(detail) }
+                        section("Validation · deterministic", id: "validation") { validations(detail.validations) }
+                        section("Review · model findings", id: "review") { review(detail.findings) }
+                        section("Repair History", id: "repair") { repairs(detail) }
+                        section("Final Approval", id: "approval") { approval(detail) }
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
+                        Text("No active V3 task").font(.title3.weight(.semibold))
+                        Text(bridge.availabilityMessage ?? "Task detail will appear after durable Rust state is available.").foregroundStyle(.secondary)
+                    }
+                }
             }
-        }.padding()
+            .padding()
+        }
+        .frame(minWidth: 620, minHeight: 520)
+        .onAppear { bridge.loadTaskDetail() }
     }
+
+    private func summary(_ detail: NativeTaskDetail) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            HStack {
+                ProviderBadge(provider: detail.sessions.last?.provider ?? "Sentinel")
+                Spacer()
+                StateBadge(state: detail.task.lifecycle)
+            }
+            Text(detail.task.summary).font(.title3.weight(.semibold)).lineLimit(3)
+            if let session = detail.sessions.last {
+                Text("Session · \(session.sessionRef) · \(session.state)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if let worktree = detail.worktree {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                    GridRow { Text("Repository").foregroundStyle(.secondary); Text(worktree.repositoryRoot).lineLimit(1) }
+                    GridRow { Text("Branch").foregroundStyle(.secondary); Text(worktree.branch).lineLimit(1) }
+                    GridRow { Text("Base").foregroundStyle(.secondary); Text(worktree.baseCommit).fontDesign(.monospaced).lineLimit(1) }
+                }.font(.caption)
+            }
+            if let event = detail.activity.last { Label(event.kind.replacingOccurrences(of: "_", with: " "), systemImage: "waveform.path.ecg").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func section<Content: View>(_ title: String, id: String, @ViewBuilder content: @escaping () -> Content) -> some View {
+        DisclosureGroup(isExpanded: Binding(get: { expandedSections.contains(id) }, set: { expanded in
+            if expanded { expandedSections.insert(id) } else { expandedSections.remove(id) }
+        })) {
+            content().padding(.top, SentinelTokens.compactSpacing)
+        } label: { Text(title).font(.headline) }
+    }
+
+    private func activity(_ events: [DetailEvent]) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            ForEach(events, id: \.occurredAtMs) { event in
+                DisclosureGroup {
+                    Text(event.payload).font(.caption.monospaced()).textSelection(.enabled)
+                } label: {
+                    HStack { Text(event.kind.replacingOccurrences(of: "_", with: " ")).fontWeight(meaningful(event.kind) ? .semibold : .regular); Spacer(); Text(event.provider).foregroundStyle(.secondary) }.font(.caption)
+                }
+            }
+        }
+    }
+
+    private func changes(_ detail: NativeTaskDetail) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            if let worktree = detail.worktree { Text("\(worktree.path) · \(worktree.state)").font(.caption).textSelection(.enabled) }
+            if let diff = detail.diff {
+                Text("Target \(diff.targetBranch) · \(diff.mergeReady ? "merge ready" : "not merge ready")\(diff.targetAdvanced ? " · target advanced" : "")").font(.caption)
+                DisclosureGroup("Changed-file / diff data") { Text(diff.summary).font(.caption.monospaced()).textSelection(.enabled) }
+                if !diff.conflicts.isEmpty { DisclosureGroup("Conflict evidence") { Text(diff.conflicts).font(.caption.monospaced()).textSelection(.enabled) } }
+            } else { Text("No durable diff has been prepared.").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func validations(_ values: [DetailValidation]) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            ForEach(values, id: \.id) { value in
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if let command = value.command { Text(command).font(.caption.monospaced()) }
+                        if let stdout = value.stdout { output("stdout", stdout) }
+                        if let stderr = value.stderr, !stderr.isEmpty { output("stderr", stderr) }
+                    }
+                } label: {
+                    HStack { Text("\(value.profile) / \(value.check)").font(.caption.weight(.semibold)); Spacer(); StateBadge(state: value.outcome ?? value.state) }
+                    Text([value.summary, value.exitCode.map { "exit \($0)" }, value.durationMs.map { "\($0) ms" }].compactMap { $0 }.joined(separator: " · ")).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            if values.isEmpty { Text("No validation results.").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func output(_ name: String, _ text: String) -> some View { DisclosureGroup(name) { Text(text).font(.caption.monospaced()).textSelection(.enabled) } }
+
+    private func review(_ findings: [DetailFinding]) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            ForEach(["blocker", "warning", "suggestion"], id: \.self) { severity in
+                let group = findings.filter { $0.severity.lowercased() == severity }
+                if !group.isEmpty {
+                    Text(severity.capitalized).font(.caption.weight(.bold)).foregroundStyle(severity == "blocker" ? .red : .secondary)
+                    ForEach(group, id: \.id) { finding in
+                        DisclosureGroup { Text(finding.evidence).font(.caption.monospaced()).textSelection(.enabled) } label: {
+                            Text("\(finding.summary) · \(finding.disposition)").font(.caption).foregroundStyle(severity == "blocker" && !resolved(finding.disposition) ? .red : .primary)
+                        }
+                    }
+                }
+            }
+            if findings.isEmpty { Text("No review findings.").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func repairs(_ detail: NativeTaskDetail) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            ForEach(detail.repairRounds, id: \.id) { round in
+                let count = detail.findings.filter { $0.repairRoundID == round.id }.count
+                Text("Round \(round.round) · \(round.state) · \(count) finding\(count == 1 ? "" : "s")").font(.caption)
+            }
+            if detail.repairRounds.isEmpty { Text("No repair rounds.").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func approval(_ detail: NativeTaskDetail) -> some View {
+        VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            if let packet = detail.finalApprovalPacket { DisclosureGroup("Durable approval packet") { Text(packet).font(.caption.monospaced()).textSelection(.enabled) } }
+            HStack {
+                if detail.actions.approve { Button("Approve") { bridge.requestAttentionAction("approve") }.disabled(bridge.attentionActionInFlight) }
+                if detail.actions.reject { Button("Reject") { bridge.requestAttentionAction("reject") }.disabled(bridge.attentionActionInFlight) }
+            }
+            if detail.finalApprovalPacket == nil { Text("No final approval packet.").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func meaningful(_ kind: String) -> Bool { !kind.contains("tool_") && !kind.contains("provider_") }
+    private func resolved(_ disposition: String) -> Bool { ["resolved", "repaired", "dismissed"].contains(disposition.lowercased()) }
 }
 
 struct StatusView: View { var body: some View { SentinelPanel { Text("Sentinel status").frame(width: 260, alignment: .leading) } } }

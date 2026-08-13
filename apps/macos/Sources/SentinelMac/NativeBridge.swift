@@ -33,6 +33,27 @@ struct NativeAttention: Codable, Equatable {
     let actions: AttentionActions
 }
 
+struct DetailSession: Codable, Equatable { let provider: String; let sessionRef: String; let state: String; let updatedAtMs: Int64 }
+struct DetailEvent: Codable, Equatable { let kind: String; let provider: String; let occurredAtMs: Int64; let payload: String }
+struct DetailWorktree: Codable, Equatable { let repositoryRoot: String; let path: String; let branch: String; let baseCommit: String; let state: String }
+struct DetailDiff: Codable, Equatable { let targetBranch: String; let targetAdvanced: Bool; let mergeReady: Bool; let summary: String; let conflicts: String }
+struct DetailValidation: Codable, Equatable { let id: String; let profile: String; let check: String; let required: Bool; let state: String; let summary: String?; let updatedAtMs: Int64; let command: String?; let exitCode: Int?; let durationMs: Int?; let stdout: String?; let stderr: String?; let outcome: String? }
+struct DetailFinding: Codable, Equatable { let id: String; let repairRoundID: String?; let severity: String; let disposition: String; let summary: String; let evidence: String }
+struct DetailRepairRound: Codable, Equatable { let id: String; let round: Int; let state: String; let updatedAtMs: Int64 }
+
+struct NativeTaskDetail: Codable, Equatable {
+    let task: NativeTask
+    let sessions: [DetailSession]
+    let activity: [DetailEvent]
+    let worktree: DetailWorktree?
+    let diff: DetailDiff?
+    let validations: [DetailValidation]
+    let findings: [DetailFinding]
+    let repairRounds: [DetailRepairRound]
+    let finalApprovalPacket: String?
+    let actions: AttentionActions
+}
+
 enum TaskSubmissionState: Equatable {
     case idle
     case sending
@@ -92,6 +113,16 @@ struct AttentionUpdateGate {
     }
 }
 
+struct DetailUpdateGate {
+    private(set) var current: NativeTaskDetail?
+
+    mutating func apply(_ detail: NativeTaskDetail) -> Bool {
+        if let current, current.task.id == detail.task.id, detail.task.version < current.task.version { return false }
+        current = detail
+        return true
+    }
+}
+
 enum BridgeMessage: Decodable, Equatable {
     case activeTask(NativeTask?)
     case taskUpdate(NativeTask?)
@@ -100,11 +131,12 @@ enum BridgeMessage: Decodable, Equatable {
     case attentionState(NativeAttention?)
     case attentionUpdate(NativeAttention?)
     case attentionActionResult(requestID: String, accepted: Bool, message: String?)
+    case taskDetail(NativeTaskDetail)
     case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
     case supervisorResult(Bool)
     case unavailable(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, task, ok, message, repository, providers, requestId, accepted, attention }
+    private enum CodingKeys: String, CodingKey { case kind, task, ok, message, repository, providers, requestId, accepted, attention, detail }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -116,6 +148,7 @@ enum BridgeMessage: Decodable, Equatable {
         case "attention_state": self = .attentionState(try values.decodeIfPresent(NativeAttention.self, forKey: .attention))
         case "attention_update": self = .attentionUpdate(try values.decodeIfPresent(NativeAttention.self, forKey: .attention))
         case "attention_action_result": self = .attentionActionResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), message: try values.decodeIfPresent(String.self, forKey: .message))
+        case "task_detail": self = .taskDetail(try values.decode(NativeTaskDetail.self, forKey: .detail))
         case "task_start_result": self = .taskStartResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), task: try values.decodeIfPresent(NativeTask.self, forKey: .task), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "supervisor_result": self = .supervisorResult(try values.decode(Bool.self, forKey: .ok))
         default: self = .unavailable(try values.decodeIfPresent(String.self, forKey: .message) ?? "Native bridge unavailable")
@@ -133,12 +166,14 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var attention: NativeAttention?
     @Published private(set) var attentionActionMessage: String?
     @Published private(set) var attentionActionInFlight = false
+    @Published private(set) var taskDetail: NativeTaskDetail?
 
     private var process: Process?
     private var input: FileHandle?
     private var submissionGate = TaskSubmissionGate()
     private var attentionActionGate = AttentionActionGate()
     private var attentionUpdateGate = AttentionUpdateGate()
+    private var detailUpdateGate = DetailUpdateGate()
 
     func start() {
         guard process == nil else { return }
@@ -202,6 +237,11 @@ final class NativeBridge: ObservableObject {
         }
     }
 
+    func loadTaskDetail(taskID: String? = nil) {
+        guard let taskID = taskID ?? attention?.task.id ?? activeTask?.id else { return }
+        _ = send(["kind": "task_detail", "task_id": taskID])
+    }
+
     func submitTask(provider: String, summary: String, prompt: String) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestID = UUID().uuidString.lowercased()
@@ -223,6 +263,9 @@ final class NativeBridge: ObservableObject {
         switch message {
         case .activeTask(let task), .taskUpdate(let task): activeTask = task
         case .attentionState(let attention), .attentionUpdate(let attention): apply(attention)
+        case .taskDetail(let detail):
+            guard detailUpdateGate.apply(detail) else { return }
+            taskDetail = detailUpdateGate.current
         case .attentionActionResult(let requestID, let accepted, let message):
             guard attentionActionGate.complete(requestID: requestID) else { return }
             attentionActionInFlight = false
@@ -247,6 +290,7 @@ final class NativeBridge: ObservableObject {
         guard attentionUpdateGate.apply(update) else { return }
         attention = attentionUpdateGate.current
         activeTask = attention?.task
+        if let taskID = attention?.task.id { loadTaskDetail(taskID: taskID) }
     }
 
     @discardableResult

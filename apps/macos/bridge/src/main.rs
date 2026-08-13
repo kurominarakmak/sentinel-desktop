@@ -200,22 +200,79 @@ async fn active_task_record(
     Ok(tasks.pop())
 }
 
-async fn task_detail(repository: &RunRepository, task_id: String) -> Result<Value, CoreError> {
+async fn task_detail(
+    repository: &RunRepository,
+    task_id: String,
+    owned_tasks: &HashMap<TaskId, StartedCodexTask>,
+) -> Result<Value, CoreError> {
     let task_id = sentinel_core::v3::TaskId(task_id);
     let task = repository.v3().get_task(&task_id).await?;
     let events = repository.v3().list_events(&task_id).await?;
     let worktree = repository.v3().get_task_worktree(&task_id).await.ok();
+    let merge = repository
+        .v3()
+        .get_task_worktree_merge_preparation(&task_id)
+        .await
+        .ok();
     let validations = repository.v3().list_validation_results(&task_id).await?;
     let findings = repository.v3().list_review_findings(&task_id).await?;
     let repair_rounds = repository.v3().list_repair_rounds(&task_id).await?;
+    let sessions = repository.v3().list_sessions_for_task(&task_id).await?;
+    let artifacts = repository.v3().list_artifacts(&task_id).await?;
+    let detail_actions = attention_state(repository, owned_tasks)
+        .await?
+        .filter(|state| state.task.id == task_id.0)
+        .map(|state| state.actions)
+        .unwrap_or(AttentionActionsDto {
+            stop: false,
+            approve: false,
+            reject: false,
+            approval_id: None,
+        });
+    let validation_details = futures_join_validations(repository, validations).await?;
+    let final_packet = artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.kind == "final_approval_packet")
+        .map(|artifact| serde_json::to_string(&artifact.metadata).unwrap_or_default());
     Ok(json!({
         "task": task_dto(task),
-        "activity": events.into_iter().map(|event| json!({"kind":format!("{:?}", event.kind).to_lowercase(),"provider":event.provider,"occurredAtMs":event.occurred_at_ms,"payload":event.payload})).collect::<Vec<_>>(),
+        "sessions": sessions.into_iter().map(|session| json!({"provider":provider_identity(session.provider),"sessionRef":session.provider_session_ref,"state":format!("{:?}",session.lifecycle).to_lowercase(),"updatedAtMs":session.updated_at_ms})).collect::<Vec<_>>(),
+        "activity": events.into_iter().map(|event| json!({"kind":format!("{:?}", event.kind).to_lowercase(),"provider":provider_identity(event.provider),"occurredAtMs":event.occurred_at_ms,"payload":serde_json::to_string(&event.payload).unwrap_or_default()})).collect::<Vec<_>>(),
         "worktree": worktree.map(|value| json!({"repositoryRoot":value.repository_root,"path":value.worktree_path,"branch":value.branch,"baseCommit":value.base_commit,"state":value.state})),
-        "validations": validations.into_iter().map(|value| json!({"id":value.id.to_string(),"profile":value.profile_id,"check":value.check_name,"required":value.required,"state":format!("{:?}",value.lifecycle).to_lowercase(),"summary":value.summary,"updatedAtMs":value.updated_at_ms})).collect::<Vec<_>>(),
-        "findings": findings.into_iter().map(|value| json!({"id":value.id.to_string(),"severity":value.severity,"disposition":format!("{:?}",value.disposition).to_lowercase(),"summary":value.summary,"evidence":value.evidence})).collect::<Vec<_>>(),
-        "repairRounds": repair_rounds.into_iter().map(|value| json!({"id":value.id.to_string(),"round":value.round_number,"state":format!("{:?}",value.lifecycle).to_lowercase(),"updatedAtMs":value.updated_at_ms})).collect::<Vec<_>>()
+        "diff": merge.map(|value| json!({"targetBranch":value.target_branch,"targetAdvanced":value.target_advanced,"mergeReady":value.merge_ready,"summary":value.diff_json,"conflicts":value.conflicts_json})),
+        "validations": validation_details,
+        "findings": findings.iter().map(|value| json!({"id":value.id.to_string(),"repairRoundId":value.repair_round_id.as_ref().map(ToString::to_string),"severity":value.severity,"disposition":format!("{:?}",value.disposition).to_lowercase(),"summary":value.summary,"evidence":serde_json::to_string(&value.evidence).unwrap_or_default()})).collect::<Vec<_>>(),
+        "repairRounds": repair_rounds.into_iter().map(|value| json!({"id":value.id.to_string(),"round":value.round_number,"state":format!("{:?}",value.lifecycle).to_lowercase(),"updatedAtMs":value.updated_at_ms})).collect::<Vec<_>>(),
+        "finalApprovalPacket": final_packet,
+        "actions": detail_actions
     }))
+}
+
+async fn futures_join_validations(
+    repository: &RunRepository,
+    validations: Vec<sentinel_core::v3::ValidationResult>,
+) -> Result<Vec<Value>, CoreError> {
+    let mut result = Vec::with_capacity(validations.len());
+    for value in validations {
+        let execution = repository
+            .v3()
+            .get_validation_execution(&value.id)
+            .await
+            .ok();
+        result.push(json!({
+            "id":value.id.to_string(),"profile":value.profile_id,"check":value.check_name,
+            "required":value.required,"state":format!("{:?}",value.lifecycle).to_lowercase(),
+            "summary":value.summary,"updatedAtMs":value.updated_at_ms,
+            "command":execution.as_ref().map(|entry| &entry.command_json),
+            "exitCode":execution.as_ref().and_then(|entry| entry.exit_code),
+            "durationMs":execution.as_ref().map(|entry| entry.duration_ms),
+            "stdout":execution.as_ref().map(|entry| &entry.stdout),
+            "stderr":execution.as_ref().map(|entry| &entry.stderr),
+            "outcome":execution.as_ref().map(|entry| &entry.outcome)
+        }));
+    }
+    Ok(result)
 }
 
 fn codex_program() -> Option<CodexProgram> {
@@ -370,12 +427,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Ok(Request::TaskDetail { task_id }) => match runtime
-                .block_on(task_detail(&repository, task_id))
-            {
-                Ok(detail) => response(json!({"kind":"task_detail","detail":detail})),
-                Err(_) => response(json!({"kind":"error","message":"could not read task detail"})),
-            },
+            Ok(Request::TaskDetail { task_id }) => {
+                match runtime.block_on(task_detail(&repository, task_id, &owned_tasks)) {
+                    Ok(detail) => response(json!({"kind":"task_detail","detail":detail})),
+                    Err(_) => {
+                        response(json!({"kind":"error","message":"could not read task detail"}))
+                    }
+                }
+            }
             Ok(Request::Subscribe) => {
                 subscribed = true;
                 last_snapshot = None;
