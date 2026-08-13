@@ -4,9 +4,9 @@
 //! snapshots and forwards the already-existing final-approval supervisor call.
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
-use sentinel_codex::{CodexProgram, CodexTaskStarter, StartedCodexTask};
+use sentinel_codex::{CodexAppServer, CodexProgram, CodexTaskStarter, StartedCodexTask};
 use sentinel_core::{
-    v3::{ApprovalId, TaskId},
+    v3::{ApprovalId, CreateTask, TaskId},
     CoreError, RunRepository,
 };
 use sentinel_git::inspect_repository;
@@ -19,7 +19,7 @@ use std::{
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     sync::mpsc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +155,75 @@ struct SettingsDto {
     validation_error: Option<String>,
 }
 
+/// A native-shell-only account usage reader. Its provider protocol events live
+/// in a separate database so usage polling can never become an active V3 task
+/// or otherwise affect the workflow repository presented to Swift.
+struct CodexUsageCollector {
+    program: Option<CodexProgram>,
+    repository: RunRepository,
+    cwd: Option<PathBuf>,
+    server: Option<CodexAppServer>,
+}
+
+impl CodexUsageCollector {
+    fn new(program: Option<CodexProgram>, repository: RunRepository, cwd: Option<PathBuf>) -> Self {
+        Self {
+            program,
+            repository,
+            cwd,
+            server: None,
+        }
+    }
+
+    async fn rate_limits(&mut self) -> Option<Value> {
+        if self.server.as_ref().is_some_and(CodexAppServer::is_alive) {
+            return self
+                .server
+                .as_ref()
+                .and_then(CodexAppServer::latest_rate_limits)
+                .map(|limits| limits.0);
+        }
+        self.server = None;
+        let (Some(program), Some(cwd)) = (self.program.clone(), self.cwd.as_deref()) else {
+            return None;
+        };
+        let task = self
+            .repository
+            .v3()
+            .create_task(
+                CreateTask {
+                    project_id: None,
+                    workflow_id: "native-provider-usage".into(),
+                    summary: "Native Codex account usage".into(),
+                },
+                now_ms(),
+            )
+            .await
+            .ok()?;
+        let server = CodexAppServer::start(program, self.repository.clone(), task.id, cwd)
+            .await
+            .ok()?;
+        let latest = server.latest_rate_limits().map(|limits| limits.0);
+        self.server = Some(server);
+        latest
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn usage_database_path(database_path: &Path) -> PathBuf {
+    let name = database_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sentinel-native");
+    database_path.with_file_name(format!("{name}-codex-usage.sqlite3"))
+}
+
 fn task_dto(task: sentinel_core::v3::Task) -> TaskDto {
     let recovery_required = task.recovery_condition != sentinel_core::v3::RecoveryCondition::None;
     TaskDto {
@@ -273,7 +342,10 @@ fn installation_status(status: InstallationStatus) -> String {
     }
 }
 
-async fn status_snapshot(repository: &RunRepository) -> Result<StatusDto, CoreError> {
+async fn status_snapshot(
+    repository: &RunRepository,
+    usage: &mut CodexUsageCollector,
+) -> Result<StatusDto, CoreError> {
     let task = active_task_record(repository).await?;
     let (version, recovery_required, sentinel) = match task.as_ref() {
         Some(task) => (
@@ -318,8 +390,8 @@ async fn status_snapshot(repository: &RunRepository) -> Result<StatusDto, CoreEr
             name: "Codex".into(),
             installation: installation_status(detect_installation(AgentKind::Codex)),
             runtime: codex_runtime,
-            usage: "Live account usage is unavailable in the native bridge.".into(),
-            rate_limits: None,
+            usage: "Codex App Server account/rateLimits/read".into(),
+            rate_limits: usage.rate_limits().await,
         },
         claude: ProviderStatusDto {
             name: "Claude Code".into(),
@@ -583,14 +655,19 @@ fn response(value: Value) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_path = std::env::args()
-        .nth(1)
-        .ok_or("database path argument is required")?;
-    let database_url = format!("sqlite://{}", PathBuf::from(database_path).display());
+    let database_path = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .ok_or("database path argument is required")?,
+    );
+    let database_url = format!("sqlite://{}", database_path.display());
+    let usage_database_url = format!("sqlite://{}", usage_database_path(&database_path).display());
     let runtime = tokio::runtime::Runtime::new()?;
     let repository = runtime.block_on(RunRepository::open(&database_url))?;
     let root = repository_root();
     let program = codex_program();
+    let usage_repository = runtime.block_on(RunRepository::open(&usage_database_url))?;
+    let mut usage = CodexUsageCollector::new(program.clone(), usage_repository, root.clone());
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
@@ -630,7 +707,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Ok(Request::Status) => match runtime.block_on(status_snapshot(&repository)) {
+            Ok(Request::Status) => match runtime.block_on(status_snapshot(&repository, &mut usage))
+            {
                 Ok(status) => response(json!({"kind":"status","status":status})),
                 Err(_) => {
                     response(json!({"kind":"error","message":"could not read provider status"}))
@@ -748,7 +826,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             last_snapshot = Some(snapshot);
                             response(json!({"kind":"attention_update","attention":attention}));
                         }
-                        if let Ok(status) = runtime.block_on(status_snapshot(&repository)) {
+                        if let Ok(status) =
+                            runtime.block_on(status_snapshot(&repository, &mut usage))
+                        {
                             let snapshot = serde_json::to_string(&status).unwrap_or_default();
                             if last_status.as_ref() != Some(&snapshot) {
                                 last_status = Some(snapshot);
@@ -806,5 +886,15 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"kind":"attention_action","action":"merge"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn native_usage_database_is_isolated_from_workflow_state() {
+        let workflow = PathBuf::from("/tmp/phase2.sqlite3");
+        assert_eq!(
+            usage_database_path(&workflow),
+            PathBuf::from("/tmp/phase2-codex-usage.sqlite3")
+        );
+        assert_ne!(usage_database_path(&workflow), workflow);
     }
 }
