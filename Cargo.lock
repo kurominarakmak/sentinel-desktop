@@ -3156,11 +3156,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentinel-validation"
+version = "0.1.0"
+dependencies = [
+ "sentinel-core",
+ "sentinel-process",
+ "sentinel-worktree",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "sentinel-worktree"
 version = "0.1.0"
 dependencies = [
  "sentinel-core",
  "sentinel-git",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

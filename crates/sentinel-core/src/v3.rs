@@ -452,6 +452,18 @@ pub struct CreateValidationResult {
     pub summary: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationExecution {
+    pub validation_id: ValidationResultId,
+    pub command_json: String,
+    pub exit_code: Option<i64>,
+    pub duration_ms: i64,
+    pub stdout: String,
+    pub stderr: String,
+    pub outcome: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepairRound {
     pub id: RepairRoundId,
     pub task_id: TaskId,
@@ -981,6 +993,40 @@ impl V3Repository {
             return Err(CoreError::V3Conflict);
         }
         self.get_validation_result(&value.id).await
+    }
+    pub async fn save_validation_execution(
+        &self,
+        value: &ValidationExecution,
+    ) -> Result<(), CoreError> {
+        sqlx::query("INSERT INTO v3_validation_executions (validation_id,command_json,exit_code,duration_ms,stdout,stderr,outcome,started_at_ms,finished_at_ms) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(value.validation_id.to_string()).bind(&value.command_json).bind(value.exit_code).bind(value.duration_ms).bind(&value.stdout).bind(&value.stderr).bind(&value.outcome).bind(value.started_at_ms).bind(value.finished_at_ms).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        Ok(())
+    }
+    pub async fn get_validation_execution(
+        &self,
+        id: &ValidationResultId,
+    ) -> Result<ValidationExecution, CoreError> {
+        let row = sqlx::query("SELECT * FROM v3_validation_executions WHERE validation_id=?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .ok_or(CoreError::NotFound)?;
+        Ok(ValidationExecution {
+            validation_id: ValidationResultId(row.get("validation_id")),
+            command_json: row.get("command_json"),
+            exit_code: row.get("exit_code"),
+            duration_ms: row.get("duration_ms"),
+            stdout: row.get("stdout"),
+            stderr: row.get("stderr"),
+            outcome: row.get("outcome"),
+            started_at_ms: row.get("started_at_ms"),
+            finished_at_ms: row.get("finished_at_ms"),
+        })
+    }
+    pub async fn recover_interrupted_validations(&self, timestamp: i64) -> Result<u64, CoreError> {
+        let result = sqlx::query("UPDATE v3_validation_results SET lifecycle='incomplete',summary='interrupted by restart',updated_at_ms=? WHERE lifecycle='running'").bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        Ok(result.rows_affected())
     }
     pub async fn create_repair_round(
         &self,

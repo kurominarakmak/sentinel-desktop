@@ -31,6 +31,12 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
   through reconciliation, pinned-base diff and merge preparation, and explicit
   approval-gated discard/retention. Destructive preflight refreshes identity,
   branch, HEAD, and cleanliness and never touches the primary or unrelated trees.
+
+### PARTIAL
+
+- V3 Phase 5 is **PARTIAL**. Deterministic task-worktree validation profiles
+  execute fixed argv steps with timeouts/cancellation, bounded redacted output,
+  durable results/artifacts, and explicit restart interruption recovery.
 - Git worktrees, diffs, approvals, validation/evidence, and recovery exist as V1 foundations, but are not composed into V3 worktree transactions, final-action approval, or review/repair orchestration.
 - The prompt, tray, hotkey, status, and settings surfaces exist, but are not yet the V3 Quick Prompt, Attention Widget, and Task Detail experience.
 
@@ -55,5 +61,5 @@ Phase 2 is complete with known provider limitations recorded in
 [Phase 2D validation](docs/v3-phase2d-validation.md). Phase 3 is COMPLETE WITH
 AUTH-LIMITED VALIDATION; authenticated Claude smoke/reconciliation is deferred
 to Phase 8 or available credentials. Phase 4 is COMPLETE. Next is Phase 5:
-configurable deterministic build/lint/test command profiles with durable,
-redacted artifacts.
+profile execution is implemented; broader profile configuration and integration
+remain before Phase 5 can be considered complete.
