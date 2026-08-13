@@ -57,12 +57,8 @@ export function V3AttentionWidget() {
     finally { setBusy(false); }
   };
 
-  return <section className="v3-attention" aria-label="V3 attention" aria-live="polite">
-    <header><strong>Attention</strong><span className="state-dot" aria-label={stateLabel[state]} /></header>
-    <p className="utility-title">{stateLabel[state]}</p>
-    {task ? <><p className="muted">{agent} · {task.summary}</p><button onClick={() => void openV3TaskDetail(task.id)}>Open Task Detail</button>
-      {state === "working" && <button disabled={busy} onClick={() => void stop()}>Stop</button>}
-      {detail?.finalApprovalId && <><button disabled={busy} onClick={() => void decide(true)}>Approve</button><button disabled={busy} onClick={() => void decide(false)}>Reject</button></>}
-    </> : <p className="muted">No managed V3 task is active.</p>}
-  </section>;
+  const activity = detail?.activity.at(-1)?.kind ?? (state === "working" ? "In progress" : stateLabel[state]);
+  const validation = detail?.validations.at(-1)?.state;
+  const findings = detail?.findings.filter((finding) => ["blocker", "high"].includes(String(finding.severity))).length ?? 0;
+  return <section className="v3-attention" aria-label="V3 attention" aria-live="polite"><header><span><strong>Sentinel attention</strong><small>{agent}</small></span><span className={`v3-status-badge v3-status-${state}`}>{stateLabel[state]}</span></header>{task ? <><p className="v3-attention-task">{task.summary}</p><p className="muted v3-attention-activity">{String(activity).replaceAll("_", " ")}{validation ? ` · validation ${validation}` : ""}{findings ? ` · ${findings} finding${findings === 1 ? "" : "s"}` : ""}</p><div className="v3-attention-actions"><button className="v3-detail-action" onClick={() => void openV3TaskDetail(task.id)}>Open Task Detail</button>{state === "working" && <button disabled={busy} onClick={() => void stop()}>Stop</button>}{detail?.finalApprovalId && <><button className="v3-approve-action" disabled={busy} onClick={() => void decide(true)}>Approve</button><button className="v3-reject-action" disabled={busy} onClick={() => void decide(false)}>Reject</button></>}</div></> : <p className="muted">No managed V3 task is active.</p>}</section>;
 }

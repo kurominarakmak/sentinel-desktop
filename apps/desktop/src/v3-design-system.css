@@ -76,3 +76,23 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   :root { --v3-surface: color-mix(in srgb, #1d2939 86%, transparent); --v3-raised: color-mix(in srgb, #273549 90%, transparent); --v3-border: rgb(208 213 221 / 24%); --v3-divider: rgb(208 213 221 / 17%); --v3-text: #f2f4f7; --v3-muted: #c0c8d4; --v3-shadow: 0 14px 42px rgb(0 0 0 / 34%); }
   @supports not (backdrop-filter: blur(1px)) { main, #root > section, .utility-window { background: #1d2939; } }
 }
+
+.v3-prompt-shell { border: 0; background: transparent; padding: 0; margin: 0; }
+.v3-prompt-shell header span:first-child, .v3-attention header span:first-child { display: grid; gap: 1px; }
+.v3-prompt-shell small, .v3-attention small { color: var(--v3-muted); font-size: 11px; font-weight: 500; }
+.v3-status-badge { white-space: nowrap; color: var(--v3-accent); background: color-mix(in srgb, var(--v3-accent) 10%, transparent); border-radius: 999px; font-size: 11px; font-weight: 700; padding: 4px 7px; }
+.v3-prompt-input { margin: var(--v3-space-2) 0; font-size: 12px; }
+.v3-prompt-input textarea { font-size: 14px; line-height: 1.4; }
+.v3-prompt-actions, .v3-attention-actions { align-items: center; display: flex; gap: var(--v3-space-2); justify-content: space-between; min-height: 34px; }
+.v3-prompt-actions button, .v3-attention-actions button { margin: 0; }
+.v3-primary-action { min-width: 116px; font-weight: 700; }
+.v3-task-picker { margin: var(--v3-space-3) 0 0; }
+.v3-attention { min-height: 126px; display: grid; align-content: start; }
+.v3-attention-task { font-size: 13px; font-weight: 700; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-attention-activity { min-height: 17px; margin: var(--v3-space-1) 0 var(--v3-space-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-detail-action { background: transparent; border-color: var(--v3-border); color: var(--v3-text); }
+.v3-approve-action { background: #067647; }
+.v3-reject-action { background: var(--v3-danger); }
+.v3-status-approval-required { color: #9a6700; background: #fef0c7; }
+.v3-status-failed, .v3-status-recovery-required { color: var(--v3-danger); background: #fee4e2; }
+.v3-status-ready-for-review { color: #067647; background: #d1fadf; }
