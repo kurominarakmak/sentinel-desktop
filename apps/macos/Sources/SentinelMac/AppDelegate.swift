@@ -1,5 +1,4 @@
 import AppKit
-import Carbon.HIToolbox
 import Combine
 import SwiftUI
 
@@ -12,10 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var detailWindow: NSWindow?
     private var statusWindow: NSWindow?
     private var settingsWindow: NSWindow?
-    private var hotKeyRef: EventHotKeyRef?
+    private var quickPromptMenuItem: NSMenuItem?
     private var surfaceRegistry = NativeSurfaceRegistry()
     private var previousApplicationFocus = PreviousApplicationFocus()
     private var bridgeSubscriptions = Set<AnyCancellable>()
+    private let shortcutController = GlobalShortcutController()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -24,6 +24,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         observeStatusItem()
         installPanels()
         installGlobalShortcut()
+        observeGlobalShortcut()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(accessibilityDisplayOptionsChanged),
+            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: nil
+        )
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -45,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         let promptItem = menu.addItem(withTitle: "Quick Prompt", action: #selector(showQuickPrompt), keyEquivalent: "")
         promptItem.target = self
+        quickPromptMenuItem = promptItem
         let statusMenuItem = menu.addItem(withTitle: "Status", action: #selector(showStatus), keyEquivalent: "")
         statusMenuItem.target = self
         let attentionMenuItem = menu.addItem(withTitle: "Attention", action: #selector(showAttention), keyEquivalent: "")
@@ -107,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusWindow?.title = "Sentinel Status"
             statusWindow?.isReleasedWhenClosed = false
             statusWindow?.contentView = NSHostingView(rootView: StatusView(bridge: bridge))
+            configureInspectionWindow(statusWindow)
         }
         statusWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -121,7 +130,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             settingsWindow?.title = "Sentinel Settings"
             settingsWindow?.isReleasedWhenClosed = false
-            settingsWindow?.contentView = NSHostingView(rootView: SettingsView(bridge: bridge))
+            settingsWindow?.contentView = NSHostingView(
+                rootView: SettingsView(bridge: bridge, shortcutController: shortcutController)
+            )
+            configureInspectionWindow(settingsWindow)
         }
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -178,20 +190,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             detailWindow?.title = "Sentinel Task Detail"
             detailWindow?.isReleasedWhenClosed = false
             detailWindow?.contentView = NSHostingView(rootView: TaskDetailView(bridge: bridge))
+            configureInspectionWindow(detailWindow)
         }
         detailWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
     private func installGlobalShortcut() {
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: OSType(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
-            guard let userData else { return noErr }
-            let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async { delegate.showQuickPrompt() }
-            return noErr
-        }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), nil)
-        let identifier = EventHotKeyID(signature: OSType(0x534E544C), id: 1)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(cmdKey | shiftKey), identifier, GetApplicationEventTarget(), 0, &hotKeyRef)
+        shortcutController.start { [weak self] in self?.showQuickPrompt() }
+    }
+
+    private func observeGlobalShortcut() {
+        shortcutController.$current
+            .receive(on: RunLoop.main)
+            .sink { [weak self] shortcut in
+                self?.quickPromptMenuItem?.title = "Quick Prompt  \(shortcut.displayName)"
+            }
+            .store(in: &bridgeSubscriptions)
+    }
+
+    private func configureInspectionWindow(_ window: NSWindow?) {
+        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        window?.isOpaque = reduceTransparency
+        window?.backgroundColor = reduceTransparency ? .windowBackgroundColor : .clear
+        window?.titlebarAppearsTransparent = true
+        window?.titlebarSeparatorStyle = .none
+    }
+
+    @objc private func accessibilityDisplayOptionsChanged() {
+        configureInspectionWindow(detailWindow)
+        configureInspectionWindow(statusWindow)
+        configureInspectionWindow(settingsWindow)
     }
 }

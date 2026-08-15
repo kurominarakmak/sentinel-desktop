@@ -26,7 +26,7 @@ struct QuickPromptView: View {
     }
 
     var body: some View {
-        SentinelPanel {
+        SentinelPanel(style: .floating) {
             VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
                 HStack { ProviderBadge(provider: "Sentinel"); Spacer(); Text("Quick Prompt").font(.headline) }
                 if let repository = bridge.repositoryContext {
@@ -53,6 +53,7 @@ struct QuickPromptView: View {
                     Spacer()
                     Button(sending ? "Sending…" : "Send", action: send)
                         .keyboardShortcut(.return, modifiers: .command)
+                        .sentinelPrimaryButtonStyle()
                         .disabled(sending || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bridge.providers.first(where: { $0.id == provider })?.available != true)
                 }
                 if let feedback {
@@ -85,7 +86,7 @@ struct AttentionWidgetView: View {
     let openDetail: () -> Void
 
     var body: some View {
-        SentinelPanel {
+        SentinelPanel(style: .floating) {
             VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
                 if let attention = bridge.attention {
                     HStack {
@@ -110,8 +111,9 @@ struct AttentionWidgetView: View {
                 } else {
                     HStack { ProviderBadge(provider: "Sentinel"); Spacer(); StateBadge(state: "ready") }
                     Text("No active task").font(.headline)
-                    Text(bridge.availabilityMessage ?? "Use ⌘⇧Space to create a task.").font(.caption).foregroundStyle(.secondary)
+                    Text(bridge.availabilityMessage ?? "Open Quick Prompt to create a task.").font(.caption).foregroundStyle(.secondary)
                     Button("Open Task Detail", action: openDetail)
+                        .sentinelPrimaryButtonStyle()
                 }
                 if let message = bridge.attentionActionMessage {
                     if bridge.attentionActionInFlight {
@@ -132,7 +134,9 @@ struct AttentionWidgetView: View {
             if actions.approve { Button("Approve") { bridge.requestAttentionAction("approve") }.disabled(bridge.attentionActionInFlight) }
             if actions.reject { Button("Reject") { bridge.requestAttentionAction("reject") }.disabled(bridge.attentionActionInFlight) }
             Spacer()
-            Button("Open Task Detail", action: openDetail).keyboardShortcut(.return)
+            Button("Open Task Detail", action: openDetail)
+                .keyboardShortcut(.return)
+                .sentinelPrimaryButtonStyle()
         }
     }
 }
@@ -205,7 +209,10 @@ struct TaskDetailView: View {
         VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
             ForEach(events, id: \.occurredAtMs) { event in
                 DisclosureGroup {
-                    Text(event.payload).font(.caption.monospaced()).textSelection(.enabled)
+                    Text(event.payload)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .sentinelEvidenceSurface()
                 } label: {
                     HStack { Text(event.kind.replacingOccurrences(of: "_", with: " ")).fontWeight(meaningful(event.kind) ? .semibold : .regular); Spacer(); Text(event.provider).foregroundStyle(.secondary) }.font(.caption)
                 }
@@ -218,8 +225,14 @@ struct TaskDetailView: View {
             if let worktree = detail.worktree { Text("\(worktree.path) · \(worktree.state)").font(.caption).textSelection(.enabled) }
             if let diff = detail.diff {
                 Text("Target \(diff.targetBranch) · \(diff.mergeReady ? "merge ready" : "not merge ready")\(diff.targetAdvanced ? " · target advanced" : "")").font(.caption)
-                DisclosureGroup("Changed-file / diff data") { Text(diff.summary).font(.caption.monospaced()).textSelection(.enabled) }
-                if !diff.conflicts.isEmpty { DisclosureGroup("Conflict evidence") { Text(diff.conflicts).font(.caption.monospaced()).textSelection(.enabled) } }
+                DisclosureGroup("Changed-file / diff data") {
+                    Text(diff.summary).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
+                }
+                if !diff.conflicts.isEmpty {
+                    DisclosureGroup("Conflict evidence") {
+                        Text(diff.conflicts).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
+                    }
+                }
             } else { Text("No durable diff has been prepared.").font(.caption).foregroundStyle(.secondary) }
         }
     }
@@ -242,7 +255,11 @@ struct TaskDetailView: View {
         }
     }
 
-    private func output(_ name: String, _ text: String) -> some View { DisclosureGroup(name) { Text(text).font(.caption.monospaced()).textSelection(.enabled) } }
+    private func output(_ name: String, _ text: String) -> some View {
+        DisclosureGroup(name) {
+            Text(text).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
+        }
+    }
 
     private func review(_ findings: [DetailFinding]) -> some View {
         VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
@@ -251,7 +268,9 @@ struct TaskDetailView: View {
                 if !group.isEmpty {
                     Text(severity.capitalized).font(.caption.weight(.bold)).foregroundStyle(severity == "blocker" ? .red : .secondary)
                     ForEach(group, id: \.id) { finding in
-                        DisclosureGroup { Text(finding.evidence).font(.caption.monospaced()).textSelection(.enabled) } label: {
+                        DisclosureGroup {
+                            Text(finding.evidence).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
+                        } label: {
                             Text("\(finding.summary) · \(finding.disposition)").font(.caption).foregroundStyle(severity == "blocker" && !resolved(finding.disposition) ? .red : .primary)
                         }
                     }
@@ -273,7 +292,11 @@ struct TaskDetailView: View {
 
     private func approval(_ detail: NativeTaskDetail) -> some View {
         VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
-            if let packet = detail.finalApprovalPacket { DisclosureGroup("Durable approval packet") { Text(packet).font(.caption.monospaced()).textSelection(.enabled) } }
+            if let packet = detail.finalApprovalPacket {
+                DisclosureGroup("Durable approval packet") {
+                    Text(packet).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
+                }
+            }
             HStack {
                 if detail.actions.approve { Button("Approve") { bridge.requestAttentionAction("approve") }.disabled(bridge.attentionActionInFlight) }
                 if detail.actions.reject { Button("Reject") { bridge.requestAttentionAction("reject") }.disabled(bridge.attentionActionInFlight) }
@@ -344,6 +367,7 @@ struct StatusView: View {
 }
 struct SettingsView: View {
     @ObservedObject var bridge: NativeBridge
+    @ObservedObject var shortcutController: GlobalShortcutController
 
     var body: some View {
         ScrollView {
@@ -365,6 +389,7 @@ struct SettingsView: View {
                 } else {
                     VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
                         Text("Sentinel Settings").font(.headline)
+                        shortcutSettings()
                         Text(bridge.availabilityMessage ?? "Waiting for Rust-confirmed settings…")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -375,13 +400,51 @@ struct SettingsView: View {
         }
         .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 470)
         .onAppear { bridge.loadSettings() }
+        .onDisappear { shortcutController.cancelRecording() }
     }
 
     private func general(_ settings: NativeSettings) -> some View {
         settingsSection("General") {
-            settingRow("Global shortcut", settings.globalShortcut)
+            shortcutSettings()
             settingRow("Default provider", settings.defaultProvider.capitalized)
             settingRow("Repository", settings.repository ?? "No repository context")
+        }
+    }
+
+    private func shortcutSettings() -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: SentinelTokens.compactSpacing) {
+                Text("Open Quick Prompt")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 124, alignment: .leading)
+                Text(shortcutController.current.displayName)
+                    .font(.caption.monospaced())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .accessibilityLabel("Current shortcut \(shortcutController.current.displayName)")
+                Spacer()
+                Button(shortcutController.isRecording ? "Cancel" : "Record") {
+                    shortcutController.beginRecording()
+                }
+                .accessibilityLabel(shortcutController.isRecording ? "Cancel shortcut recording" : "Record Quick Prompt shortcut")
+                Button("Reset to Default") {
+                    _ = shortcutController.resetToDefault()
+                }
+                .disabled(shortcutController.current == .default && !shortcutController.isRecording)
+            }
+            if shortcutController.isRecording {
+                Text("Press a key with Command, Option, or Control. Press Escape to cancel.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if let error = shortcutController.errorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Shortcut error: \(error)")
+            }
         }
     }
 
