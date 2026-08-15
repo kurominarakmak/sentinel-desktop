@@ -107,7 +107,18 @@ fn request_body(request: &ProviderRequest, dialect: OpenAiDialect) -> Value {
         ("stream".into(), Value::Bool(true)),
     ]);
     if let Some(max_tokens) = request.max_output_tokens {
-        body.insert("max_tokens".into(), Value::from(max_tokens));
+        body.insert(
+            if dialect == OpenAiDialect::Kimi {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            }
+            .into(),
+            Value::from(max_tokens),
+        );
+    }
+    if dialect == OpenAiDialect::Kimi {
+        body.insert("stream_options".into(), json!({"include_usage":true}));
     }
     if !request.tools.is_empty() {
         body.insert(

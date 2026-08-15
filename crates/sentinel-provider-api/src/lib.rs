@@ -21,6 +21,7 @@ use thiserror::Error;
 use tokio::{sync::Notify, task::JoinHandle};
 
 pub mod glm;
+pub mod kimi;
 mod openai_chat;
 
 pub const CODEX_PROVIDER_ID: &str = "codex";
