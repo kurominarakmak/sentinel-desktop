@@ -10,6 +10,11 @@ use sentinel_core::{
     CoreError, RunRepository,
 };
 use sentinel_git::inspect_repository;
+use sentinel_provider_api::{
+    openai_compatible::CustomProviderSpec,
+    settings::{ProviderSettingsSnapshot, ProviderSettingsStore},
+    MacOsKeychainCredentialStore, ProviderId, SecretString, WorkflowProviderConfiguration,
+};
 use sentinel_review::FinalApprovalSupervisor;
 use sentinel_validation::load_repository_profiles;
 use serde::{Deserialize, Serialize};
@@ -18,7 +23,7 @@ use std::{
     collections::HashMap,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{mpsc, Arc},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -46,10 +51,43 @@ enum Request {
         task_id: String,
         approval_id: Option<String>,
     },
+    ProviderSettingsMutation {
+        request_id: String,
+        mutation: ProviderSettingsMutation,
+    },
     Supervisor {
         command: String,
         approval_id: Option<String>,
         approve: Option<bool>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum ProviderSettingsMutation {
+    SetEnabled {
+        provider_id: ProviderId,
+        enabled: bool,
+    },
+    SetModel {
+        provider_id: ProviderId,
+        model_id: String,
+    },
+    SetCredential {
+        provider_id: ProviderId,
+        api_key: String,
+    },
+    RemoveCredential {
+        provider_id: ProviderId,
+    },
+    SetWorkflow {
+        workflow: WorkflowProviderConfiguration,
+    },
+    UpsertCustom {
+        provider: CustomProviderSpec,
+    },
+    RemoveCustom {
+        provider_id: ProviderId,
     },
 }
 
@@ -153,6 +191,7 @@ struct SettingsDto {
     claude: SettingsProviderDto,
     validation_profiles: Vec<SettingsProfileDto>,
     validation_error: Option<String>,
+    provider_settings: ProviderSettingsSnapshot,
 }
 
 /// A native-shell-only account usage reader. Its provider protocol events live
@@ -406,11 +445,16 @@ async fn status_snapshot(
 async fn settings_snapshot(
     repository: &RunRepository,
     root: Option<&Path>,
+    provider_store: &ProviderSettingsStore,
 ) -> Result<SettingsDto, CoreError> {
-    let version = active_task_record(repository)
+    let task_version = active_task_record(repository)
         .await?
         .map(|task| task.version)
         .unwrap_or(0);
+    let provider_settings = provider_store.snapshot();
+    let version = task_version
+        .saturating_mul(1_000_000)
+        .saturating_add(provider_settings.version);
     let (validation_profiles, validation_error) = match root {
         Some(root) => match load_repository_profiles(root) {
             Ok(profiles) => (
@@ -471,7 +515,44 @@ async fn settings_snapshot(
         },
         validation_profiles,
         validation_error,
+        provider_settings,
     })
+}
+
+fn apply_provider_settings_mutation(
+    store: &ProviderSettingsStore,
+    mutation: ProviderSettingsMutation,
+) -> Result<(), &'static str> {
+    let result = match mutation {
+        ProviderSettingsMutation::SetEnabled {
+            provider_id,
+            enabled,
+        } => store.set_enabled(&provider_id, enabled),
+        ProviderSettingsMutation::SetModel {
+            provider_id,
+            model_id,
+        } => store.set_model(&provider_id, model_id),
+        ProviderSettingsMutation::SetCredential {
+            provider_id,
+            api_key,
+        } => {
+            if api_key.trim() != api_key || api_key.len() < 8 || api_key.contains('\0') {
+                return Err("the API key was rejected");
+            }
+            let secret =
+                SecretString::new(api_key.into_bytes()).map_err(|_| "the API key was rejected")?;
+            store.set_credential(&provider_id, secret)
+        }
+        ProviderSettingsMutation::RemoveCredential { provider_id } => {
+            store.remove_credential(&provider_id)
+        }
+        ProviderSettingsMutation::SetWorkflow { workflow } => store.set_workflow(workflow),
+        ProviderSettingsMutation::UpsertCustom { provider } => store.upsert_custom(provider),
+        ProviderSettingsMutation::RemoveCustom { provider_id } => store.remove_custom(&provider_id),
+    };
+    result
+        .map(|_| ())
+        .map_err(|_| "provider settings were rejected by Rust")
 }
 
 async fn task_detail(
@@ -672,6 +753,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let usage_database_url = format!("sqlite://{}", usage_database_path(&database_path).display());
     let runtime = tokio::runtime::Runtime::new()?;
     let repository = runtime.block_on(RunRepository::open(&database_url))?;
+    let provider_settings = ProviderSettingsStore::load(
+        database_path.with_file_name("api-providers.json"),
+        Arc::new(MacOsKeychainCredentialStore),
+    )?;
     let root = repository_root();
     let program = codex_program();
     let usage_repository = runtime.block_on(RunRepository::open(&usage_database_url))?;
@@ -693,6 +778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut owned_tasks = HashMap::new();
     let mut accepted_submissions = HashMap::new();
     let mut completed_actions: HashMap<String, Value> = HashMap::new();
+    let mut completed_provider_mutations: HashMap<String, (String, Value)> = HashMap::new();
     loop {
         match receiver.recv_timeout(Duration::from_millis(400)) {
             Ok(Request::Capabilities) => response(json!({
@@ -723,7 +809,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             Ok(Request::Settings) => {
-                match runtime.block_on(settings_snapshot(&repository, root.as_deref())) {
+                match runtime.block_on(settings_snapshot(
+                    &repository,
+                    root.as_deref(),
+                    &provider_settings,
+                )) {
                     Ok(settings) => response(json!({"kind":"settings","settings":settings})),
                     Err(_) => response(json!({"kind":"error","message":"could not read settings"})),
                 }
@@ -805,6 +895,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 completed_actions.insert(request_id, payload.clone());
                 response(payload);
             }
+            Ok(Request::ProviderSettingsMutation {
+                request_id,
+                mutation,
+            }) => {
+                let fingerprint = serde_json::to_string(&mutation).unwrap_or_default();
+                if let Some((previous_fingerprint, result)) =
+                    completed_provider_mutations.get(&request_id)
+                {
+                    if previous_fingerprint == &fingerprint {
+                        response(result.clone());
+                    } else {
+                        response(
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"the request ID conflicts with an existing provider settings intent"}),
+                        );
+                    }
+                    continue;
+                }
+                let payload = match apply_provider_settings_mutation(&provider_settings, mutation) {
+                    Ok(()) => match runtime.block_on(settings_snapshot(
+                        &repository,
+                        root.as_deref(),
+                        &provider_settings,
+                    )) {
+                        Ok(settings) => {
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":true,"settings":settings})
+                        }
+                        Err(_) => {
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"confirmed provider settings could not be loaded"})
+                        }
+                    },
+                    Err(message) => {
+                        json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":message})
+                    }
+                };
+                completed_provider_mutations.insert(request_id, (fingerprint, payload.clone()));
+                response(payload);
+            }
             Ok(Request::Supervisor {
                 command,
                 approval_id,
@@ -859,6 +986,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentinel_provider_api::{CredentialStore, MemoryCredentialStore};
 
     #[test]
     fn bridge_requests_are_narrow_and_typed() {
@@ -894,6 +1022,61 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"kind":"attention_action","action":"merge"}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn provider_settings_requests_never_return_plaintext_keys() {
+        let request = serde_json::from_str::<Request>(
+            r#"{"kind":"provider_settings_mutation","request_id":"provider-1","mutation":{"action":"set_credential","provider_id":"glm","api_key":"super-secret-api-key"}}"#,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentialStore::default());
+        let store = ProviderSettingsStore::load(
+            directory.path().join("api-providers.json"),
+            credentials.clone(),
+        )
+        .unwrap();
+        let Request::ProviderSettingsMutation { mutation, .. } = request else {
+            panic!("expected provider settings mutation");
+        };
+        apply_provider_settings_mutation(&store, mutation).unwrap();
+        let snapshot = serde_json::to_string(&store.snapshot()).unwrap();
+        assert!(snapshot.contains("configured"));
+        assert!(!snapshot.contains("super-secret-api-key"));
+        assert!(!snapshot.to_ascii_lowercase().contains("api_key"));
+
+        let reference = sentinel_provider_api::CredentialReference::for_provider(
+            &ProviderId::new("glm").unwrap(),
+        );
+        assert_eq!(
+            credentials.state(&reference),
+            sentinel_provider_api::CredentialState::Configured
+        );
+    }
+
+    #[test]
+    fn invalid_provider_mutations_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderSettingsStore::load(
+            directory.path().join("api-providers.json"),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let before = store.snapshot();
+        assert!(apply_provider_settings_mutation(
+            &store,
+            ProviderSettingsMutation::SetModel {
+                provider_id: ProviderId::new("missing").unwrap(),
+                model_id: "model".into(),
+            },
+        )
+        .is_err());
+        assert_eq!(store.snapshot(), before);
+        assert!(serde_json::from_str::<Request>(
+            r#"{"kind":"provider_settings_mutation","request_id":"provider-2","mutation":{"action":"run_executable","path":"/tmp/script"}}"#,
+        )
+        .is_err());
     }
 
     #[test]

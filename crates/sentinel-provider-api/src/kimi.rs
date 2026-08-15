@@ -60,6 +60,20 @@ impl KimiAdapter {
                 max_output_tokens: (model_id == "kimi-k3").then_some(1_048_576),
             },
         )?;
+        Self::from_config(config)
+    }
+
+    pub fn from_config(config: ProviderConfig) -> Result<Self, ProviderError> {
+        if config.id.as_str() != "kimi"
+            || config.transport != crate::ProviderTransport::Api
+            || (!SUPPORTED_KIMI_MODELS.contains(&config.model_id.as_str())
+                && !config.base_url.as_deref().is_some_and(is_loopback))
+        {
+            return Err(ProviderError::InvalidConfiguration(
+                "invalid Kimi provider configuration".into(),
+            ));
+        }
+        config.validate()?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -208,6 +222,7 @@ mod tests {
                 role: MessageRole::User,
                 content: "hello".into(),
                 tool_call_id: None,
+                name: None,
             }],
             tools: vec![ToolDefinition {
                 name: "inspect".into(),

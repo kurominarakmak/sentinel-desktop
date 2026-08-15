@@ -20,9 +20,12 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::Notify, task::JoinHandle};
 
+pub mod gemini;
 pub mod glm;
 pub mod kimi;
 mod openai_chat;
+pub mod openai_compatible;
+pub mod settings;
 
 pub const CODEX_PROVIDER_ID: &str = "codex";
 pub const CLAUDE_PROVIDER_ID: &str = "claude_code";
@@ -137,6 +140,7 @@ pub struct ProviderConfig {
 
 impl ProviderConfig {
     pub fn validate(&self) -> Result<(), ProviderError> {
+        ProviderId::new(self.id.to_string())?;
         if self.display_name.trim().is_empty()
             || self.display_name.len() > 80
             || self.model_id.trim().is_empty()
@@ -203,6 +207,8 @@ pub struct ProviderMessage {
     pub role: MessageRole,
     pub content: String,
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1246,6 +1252,7 @@ mod tests {
                 role: MessageRole::User,
                 content: "hello".into(),
                 tool_call_id: None,
+                name: None,
             }],
             tools: Vec::new(),
             response_format: ResponseFormat::Text,

@@ -453,6 +453,10 @@ struct SettingsView: View {
             provider(settings.codex)
             Divider()
             provider(settings.claude)
+            if let apiProviders = settings.providerSettings {
+                Divider()
+                APIProviderSettingsSection(snapshot: apiProviders, bridge: bridge)
+            }
         }
     }
 

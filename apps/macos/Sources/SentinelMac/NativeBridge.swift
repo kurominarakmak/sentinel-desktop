@@ -161,6 +161,29 @@ struct NativeSettings: Codable, Equatable {
     let claude: SettingsProvider
     let validationProfiles: [SettingsProfile]
     let validationError: String?
+    let providerSettings: APIProviderSettingsSnapshot?
+
+    init(
+        version: UInt64,
+        globalShortcut: String,
+        repository: String?,
+        defaultProvider: String,
+        codex: SettingsProvider,
+        claude: SettingsProvider,
+        validationProfiles: [SettingsProfile],
+        validationError: String?,
+        providerSettings: APIProviderSettingsSnapshot? = nil
+    ) {
+        self.version = version
+        self.globalShortcut = globalShortcut
+        self.repository = repository
+        self.defaultProvider = defaultProvider
+        self.codex = codex
+        self.claude = claude
+        self.validationProfiles = validationProfiles
+        self.validationError = validationError
+        self.providerSettings = providerSettings
+    }
 }
 
 enum TaskSubmissionState: Equatable {
@@ -268,6 +291,22 @@ struct SettingsUpdateGate {
     }
 }
 
+struct SettingsMutationGate {
+    private(set) var pendingRequestID: String?
+
+    mutating func begin(requestID: String) -> Bool {
+        guard pendingRequestID == nil else { return false }
+        pendingRequestID = requestID
+        return true
+    }
+
+    mutating func complete(requestID: String) -> Bool {
+        guard pendingRequestID == requestID else { return false }
+        pendingRequestID = nil
+        return true
+    }
+}
+
 enum BridgeMessage: Decodable, Equatable {
     case activeTask(NativeTask?)
     case taskUpdate(NativeTask?)
@@ -280,6 +319,7 @@ enum BridgeMessage: Decodable, Equatable {
     case status(NativeStatus)
     case statusUpdate(NativeStatus)
     case settings(NativeSettings)
+    case settingsMutationResult(requestID: String, accepted: Bool, settings: NativeSettings?, message: String?)
     case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
     case supervisorResult(Bool)
     case unavailable(String)
@@ -300,6 +340,7 @@ enum BridgeMessage: Decodable, Equatable {
         case "status": self = .status(try values.decode(NativeStatus.self, forKey: .status))
         case "status_update": self = .statusUpdate(try values.decode(NativeStatus.self, forKey: .status))
         case "settings": self = .settings(try values.decode(NativeSettings.self, forKey: .settings))
+        case "settings_mutation_result": self = .settingsMutationResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), settings: try values.decodeIfPresent(NativeSettings.self, forKey: .settings), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "task_start_result": self = .taskStartResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), task: try values.decodeIfPresent(NativeTask.self, forKey: .task), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "supervisor_result": self = .supervisorResult(try values.decode(Bool.self, forKey: .ok))
         default: self = .unavailable(try values.decodeIfPresent(String.self, forKey: .message) ?? "Native bridge unavailable")
@@ -320,6 +361,8 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var taskDetail: NativeTaskDetail?
     @Published private(set) var status: NativeStatus?
     @Published private(set) var settings: NativeSettings?
+    @Published private(set) var settingsMutationMessage: String?
+    @Published private(set) var settingsMutationInFlight = false
     @Published private(set) var bridgeConnected = false
 
     private var process: Process?
@@ -334,6 +377,8 @@ final class NativeBridge: ObservableObject {
     private var detailUpdateGate = DetailUpdateGate()
     private var statusUpdateGate = StatusUpdateGate()
     private var settingsUpdateGate = SettingsUpdateGate()
+    private var settingsMutationGate = SettingsMutationGate()
+    private var settingsMutationSuccessMessage = "Settings updated."
     private var activeTaskUpdateGate = TaskUpdateGate()
 
     func start() {
@@ -412,6 +457,86 @@ final class NativeBridge: ObservableObject {
     func loadStatus() { _ = send(["kind": "status"]) }
     func loadSettings() { _ = send(["kind": "settings"]) }
 
+    func setAPIProviderEnabled(_ providerID: String, enabled: Bool) {
+        mutateProviderSettings(
+            ["action": "set_enabled", "provider_id": providerID, "enabled": enabled],
+            success: "Provider updated."
+        )
+    }
+
+    func setAPIProviderModel(_ providerID: String, modelID: String) {
+        mutateProviderSettings(
+            ["action": "set_model", "provider_id": providerID, "model_id": modelID],
+            success: "Model updated."
+        )
+    }
+
+    func setAPIProviderCredential(_ providerID: String, apiKey: String) {
+        mutateProviderSettings(
+            ["action": "set_credential", "provider_id": providerID, "api_key": apiKey],
+            success: "API key stored securely in Keychain."
+        )
+    }
+
+    func removeAPIProviderCredential(_ providerID: String) {
+        mutateProviderSettings(
+            ["action": "remove_credential", "provider_id": providerID],
+            success: "API key removed from Keychain."
+        )
+    }
+
+    func setWorkflowProviders(_ workflow: APIWorkflowProviderConfiguration) {
+        guard let encoded = try? JSONEncoder().encode(workflow),
+              let value = try? JSONSerialization.jsonObject(with: encoded) else {
+            settingsMutationMessage = "Provider selection is invalid."
+            return
+        }
+        mutateProviderSettings(
+            ["action": "set_workflow", "workflow": value],
+            success: "Workflow providers updated."
+        )
+    }
+
+    func upsertCustomProvider(_ provider: APICustomProviderIntent) {
+        guard let encoded = try? JSONEncoder().encode(provider),
+              let value = try? JSONSerialization.jsonObject(with: encoded) else {
+            settingsMutationMessage = "Custom provider configuration is invalid."
+            return
+        }
+        mutateProviderSettings(
+            ["action": "upsert_custom", "provider": value],
+            success: "Custom provider updated."
+        )
+    }
+
+    func removeCustomProvider(_ providerID: String) {
+        mutateProviderSettings(
+            ["action": "remove_custom", "provider_id": providerID],
+            success: "Custom provider removed."
+        )
+    }
+
+    private func mutateProviderSettings(_ mutation: [String: Any], success: String) {
+        let requestID = UUID().uuidString.lowercased()
+        guard settingsMutationGate.begin(requestID: requestID) else {
+            settingsMutationMessage = "A settings change is already in progress."
+            return
+        }
+        settingsMutationInFlight = true
+        settingsMutationSuccessMessage = success
+        settingsMutationMessage = nil
+        guard send([
+            "kind": "provider_settings_mutation",
+            "request_id": requestID,
+            "mutation": mutation,
+        ]) else {
+            _ = settingsMutationGate.complete(requestID: requestID)
+            settingsMutationInFlight = false
+            settingsMutationMessage = "Native bridge is unavailable."
+            return
+        }
+    }
+
     func submitTask(provider: String, summary: String, prompt: String) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestID = UUID().uuidString.lowercased()
@@ -443,6 +568,16 @@ final class NativeBridge: ObservableObject {
         case .settings(let settings):
             guard settingsUpdateGate.apply(settings) else { return }
             self.settings = settingsUpdateGate.current
+        case .settingsMutationResult(let requestID, let accepted, let settings, let message):
+            guard settingsMutationGate.complete(requestID: requestID) else { return }
+            settingsMutationInFlight = false
+            if accepted, let settings, settingsUpdateGate.apply(settings) {
+                self.settings = settingsUpdateGate.current
+                repositoryContext = settings.repository
+                settingsMutationMessage = settingsMutationSuccessMessage
+            } else {
+                settingsMutationMessage = message ?? "Provider setting was rejected."
+            }
         case .attentionActionResult(let requestID, let accepted, let message):
             guard attentionActionGate.complete(requestID: requestID) else { return }
             attentionActionInFlight = false
@@ -512,7 +647,12 @@ final class NativeBridge: ObservableObject {
             attentionActionInFlight = false
             attentionActionMessage = "Native bridge disconnected before the action was confirmed."
         }
+        if settingsMutationInFlight {
+            settingsMutationInFlight = false
+            settingsMutationMessage = "Native bridge disconnected before the setting was confirmed."
+        }
         attentionActionGate = AttentionActionGate()
+        settingsMutationGate = SettingsMutationGate()
         resetUpdateGates()
         scheduleReconnect()
     }

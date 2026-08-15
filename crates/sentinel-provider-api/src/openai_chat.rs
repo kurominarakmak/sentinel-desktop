@@ -15,6 +15,7 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) enum OpenAiDialect {
     Glm,
     Kimi,
+    Compatible,
 }
 
 pub(crate) async fn execute(
@@ -555,10 +556,11 @@ pub(crate) fn validate_api_base_url(base_url: &str) -> Result<(), ProviderError>
         || parsed.host_str().is_none()
         || parsed.username() != ""
         || parsed.password().is_some()
+        || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
         return Err(ProviderError::InvalidConfiguration(
-            "base URL must be HTTPS without embedded credentials (HTTP is loopback-test-only)"
+            "base URL must be HTTPS without query, fragment, or embedded credentials (HTTP is loopback-test-only)"
                 .into(),
         ));
     }
