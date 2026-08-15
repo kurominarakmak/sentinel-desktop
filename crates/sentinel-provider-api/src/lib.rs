@@ -20,6 +20,9 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::Notify, task::JoinHandle};
 
+pub mod glm;
+mod openai_chat;
+
 pub const CODEX_PROVIDER_ID: &str = "codex";
 pub const CLAUDE_PROVIDER_ID: &str = "claude_code";
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "dev.agent-sentinel.api-provider";
@@ -322,6 +325,12 @@ pub enum ProviderEventKind {
     },
     ToolCall {
         call: ToolCall,
+    },
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: String,
     },
     RateLimits {
         metadata: RateLimitMetadata,
