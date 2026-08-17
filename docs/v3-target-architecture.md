@@ -34,8 +34,9 @@ flowchart TB
 | `sentinel-runtime` and `sentinel-process` | supervised provider/validation processes, event fan-out, cancellation and restart reconciliation |
 | `sentinel-agent-api` | versioned adapter trait, normalized event schema, capability and recovery contracts |
 | `sentinel-git` | transaction-owned worktree/branch lifecycle and protected-main-tree checks |
-| desktop Tauri app | thin trusted bridge, native ambient windows/tray/focus integration |
-| React app | non-authoritative task/attention/approval presentation and user intent capture |
+| `sentinel-supervisor` | reusable product workflow authority composing worktree, provider, validation, review, repair, recovery, and approval boundaries |
+| native SwiftUI/AppKit app | presentation-only menu-bar, window, focus, keyboard, status, and typed-intent UI through `sentinel-native-bridge` |
+| desktop Tauri/React app | retained previous frontend/reference until native parity is accepted; remains non-authoritative |
 | `sentinel-fake-agent` | deterministic compatibility fixtures for every adapter/workflow state |
 
 New modules may be added only when a boundary needs isolation: `sentinel-validation`, `sentinel-review`, and `sentinel-workflow`. They depend on the core contract, never on the UI. Provider-specific Codex and Claude adapters are separate modules/crates and cannot call Git, finalize tasks, or persist arbitrary state directly. ACP, OpenCode, Gemini CLI, Hermes, and quant-development tooling may later implement optional-pack interfaces but cannot become hidden core dependencies.
