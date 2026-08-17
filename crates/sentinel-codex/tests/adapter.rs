@@ -1,12 +1,13 @@
 use sentinel_codex::{
-    detect_installation, CodexAppServer, CodexError, CodexInstallation, CodexProgram, CodexTimeouts,
+    detect_installation, CodexAppServer, CodexError, CodexInstallation, CodexProgram,
+    CodexTimeouts, CodexTurn,
 };
 use sentinel_core::{
     v3::{CreateTask, EventKind},
     RunRepository,
 };
 use std::time::Duration;
-use std::{process::Command, sync::Mutex};
+use std::{fs, process::Command, sync::Mutex};
 use tempfile::TempDir;
 
 static FAKE_SERVER_ENV: Mutex<()> = Mutex::new(());
@@ -52,6 +53,19 @@ async fn detects_a_supported_explicit_executable_and_missing_file() {
         CodexInstallation::Missing
     ));
     assert!(CodexProgram::from_executable("/definitely/missing/codex").is_err());
+}
+
+#[tokio::test]
+async fn refuses_an_executable_replaced_after_configuration() {
+    let (directory, repository, task) = fixture().await;
+    let executable = directory.path().join("codex-copy");
+    fs::copy(fake(), &executable).unwrap();
+    let program = CodexProgram::from_executable(&executable).unwrap();
+    fs::write(&executable, b"replaced after validation").unwrap();
+    assert!(matches!(
+        CodexAppServer::start(program, repository, task.id, directory.path()).await,
+        Err(CodexError::MissingExecutable)
+    ));
 }
 
 /// Opt-in local integration check. It never runs in CI and only uses a fresh
@@ -127,6 +141,167 @@ async fn real_local_app_server_smoke_uses_only_a_temporary_git_repository() {
         .await
         .unwrap()
         .is_empty());
+    replacement.shutdown().await.unwrap();
+}
+
+/// Opt-in evidence for a provider-confirmed in-flight interrupt. The prompt is
+/// deliberately harmless and asks Codex to wait without inspecting or editing
+/// the disposable repository.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires an explicitly authorized local Codex account"]
+async fn real_local_app_server_interrupts_an_in_flight_turn() {
+    assert_eq!(
+        std::env::var("SENTINEL_REAL_CODEX_SMOKE").as_deref(),
+        Ok("1")
+    );
+    let executable = std::env::var_os("SENTINEL_REAL_CODEX_EXECUTABLE")
+        .map(std::path::PathBuf::from)
+        .expect("set SENTINEL_REAL_CODEX_EXECUTABLE to the local codex binary");
+    let directory = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(directory.path())
+        .status()
+        .unwrap()
+        .success());
+    let repository = RunRepository::open(&url(&directory)).await.unwrap();
+    let task = repository
+        .v3()
+        .create_task(
+            CreateTask {
+                project_id: None,
+                workflow_id: "real-interrupt".into(),
+                summary: "temporary interrupt smoke".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let mut server = CodexAppServer::start(
+        CodexProgram::from_executable(executable).unwrap(),
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+    )
+    .await
+    .unwrap();
+    let session = server.start_thread(directory.path()).await.unwrap();
+    {
+        let start = server.start_turn(&session, "For this temporary smoke test, use your shell tool to run `sleep 30`. Do not inspect or modify files, and do not respond until that command completes; this test will interrupt the turn first.");
+        tokio::pin!(start);
+        let turn = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                tokio::select! {
+                    result = &mut start => panic!("long turn completed before it could be interrupted: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                        let events = repository.v3().list_events(&task.id).await.unwrap();
+                        if let Some(turn_id) = events.iter().find_map(|event| {
+                            (event.payload.get("event").and_then(|value| value.as_str()) == Some("turn_started"))
+                                .then(|| event.payload.get("turn_id").and_then(|value| value.as_str()))
+                                .flatten()
+                                .map(str::to_owned)
+                        }) {
+                            break CodexTurn { turn_id };
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("provider did not announce a long-running turn");
+        server.interrupt_turn(&session, &turn).await.unwrap();
+        assert_eq!(start.await.unwrap(), turn);
+    }
+    let events = repository.v3().list_events(&task.id).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::SessionCancelled)));
+    server.shutdown().await.unwrap();
+}
+
+/// Opt-in evidence that only the owned child is terminated and a fresh server
+/// resumes the one durable provider thread without adding another session.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires an explicitly authorized local Codex account"]
+async fn real_local_app_server_recovers_after_owned_child_death() {
+    assert_eq!(
+        std::env::var("SENTINEL_REAL_CODEX_SMOKE").as_deref(),
+        Ok("1")
+    );
+    let executable = std::env::var_os("SENTINEL_REAL_CODEX_EXECUTABLE")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(directory.path())
+        .status()
+        .unwrap()
+        .success());
+    let repository = RunRepository::open(&url(&directory)).await.unwrap();
+    let task = repository
+        .v3()
+        .create_task(
+            CreateTask {
+                project_id: None,
+                workflow_id: "real-recovery".into(),
+                summary: "temporary death recovery smoke".into(),
+            },
+            1,
+        )
+        .await
+        .unwrap();
+    let program = CodexProgram::from_executable(executable).unwrap();
+    let mut server = CodexAppServer::start(
+        program.clone(),
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+    )
+    .await
+    .unwrap();
+    let session = server.start_thread(directory.path()).await.unwrap();
+    server
+        .start_turn(
+            &session,
+            "For this temporary smoke test, reply with exactly `ready` and do not inspect or modify files.",
+        )
+        .await
+        .unwrap();
+    let pid = server.pid().unwrap();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    for _ in 0..50 {
+        if !server.is_alive() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!server.is_alive());
+    let mut replacement = CodexAppServer::start(
+        program,
+        repository.clone(),
+        task.id.clone(),
+        directory.path(),
+    )
+    .await
+    .unwrap();
+    let resumed = replacement.resume_thread(&session.thread_id).await.unwrap();
+    assert_eq!(resumed.session_id, session.session_id);
+    let sessions = repository
+        .v3()
+        .list_sessions_for_task(&task.id)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    let events = repository.v3().list_events(&task.id).await.unwrap();
+    assert!(events
+        .windows(2)
+        .all(|pair| pair[0].sequence_number < pair[1].sequence_number));
+    let _ = server.shutdown().await;
     replacement.shutdown().await.unwrap();
 }
 

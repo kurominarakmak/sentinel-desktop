@@ -65,30 +65,37 @@ V3 product, architecture, and workflow decisions are respectively defined by [V3
   visual system while durable supervisor state remains the only workflow
   authority.
 
+### NATIVE MIGRATION — CODE COMPLETE, PARITY ACCEPTANCE PENDING
+
+- The SwiftUI/AppKit menu-bar shell implements Quick Prompt, Attention Widget,
+  Task Detail, Status, and Settings through a bundled newline-delimited JSON
+  sidecar. Swift is presentation-only.
+- The shared Rust `sentinel-supervisor` creates and reconciles the owned
+  worktree before provider startup, advances deterministic validation and
+  read-only cross-model review, bounds repair rounds, and creates the durable
+  human-approval packet. Provider completion never finalizes a task.
+- Bridge mutation IDs/responses are durable and intent-bound. Reconnect reloads
+  fresh Rust snapshots and never automatically replays an unproven mutation.
+- The Tauri frontend remains present as the previous frontend/reference. Native
+  promotion still requires accepted hands-on macOS interaction QA and release
+  signing/notarization policy; automated controller tests do not prove those.
+
 ### PLANNED
 
-- No additional V3 delivery phase is planned. Known limitations are retained
-  in the Phase 8C provenance/recovery audit and provider capability records.
-- V3 Phase 8 is **PARTIAL**. Phase 8A hardens provider/session recovery and
-  Phase 8B is **COMPLETE** with execution, credential, and single-use action
-  authorization boundaries; Phase 8C provenance/recovery audit remains.
-- Supported Codex and Claude Code adapters with start, stream, cancel, resume/reconcile, and recovery capability reporting.
-- Supervisor-owned worktree transaction lifecycle; configurable build/lint/test profiles; read-only review; confirmed-blocker repair loops; and human-gated final actions.
-- Phase 8 security, recovery, and provenance hardening, followed by final UI redesign.
+- Complete hands-on native parity acceptance across focus restoration, Spaces,
+  fullscreen applications, multiple displays, sleep/wake, provider death, and
+  bridge restart.
+- Decide whether to promote Native Swift and retire Tauri only after that
+  evidence exists. Configure Developer ID signing/notarization before external
+  distribution.
 
 ### DEFERRED
 
 - Cloud synchronization, teams, remote execution, automatic pull requests, IDE/browser plugins, mobile clients, daemon extraction, autonomous commit/merge/push, and automatic worktree deletion.
 - Optional adapters/packs: ACP, OpenCode, Gemini CLI, Hermes, and quant-development workflows.
 
-## Working-tree note
-
-Existing uncommitted desktop changes were present before this documentation reconciliation. They are outside this documentation-only commit and remain untouched.
-
 ## Next action
 
-Phase 2 is complete with known provider limitations recorded in
-[Phase 2D validation](docs/v3-phase2d-validation.md). Phase 3 is COMPLETE WITH
-AUTH-LIMITED VALIDATION; authenticated Claude smoke/reconciliation is deferred
-to Phase 8 or available credentials. Phases 4–6 are COMPLETE. Next is Phase 7:
-ambient desktop workflow surfaces and task-detail integration.
+Run and record the focused native parity smoke matrix, then make the explicit
+Tauri retirement decision. Do not treat unit tests as proof of unperformed
+manual macOS behavior.

@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
+    fs::{File, OpenOptions},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -47,7 +49,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use windowing::{
     should_hide_on_close, tray_action, TrayAction, DEFAULT_GLOBAL_SHORTCUT, PROMPT_WINDOW_LABEL,
-    STATUS_WINDOW_LABEL,
+    SETTINGS_WINDOW_LABEL, STATUS_WINDOW_LABEL,
 };
 
 #[cfg(target_os = "macos")]
@@ -566,6 +568,86 @@ const RUN_EVENT: &str = "phase2-run-event";
 #[allow(dead_code)]
 struct TrayState<R: tauri::Runtime>(TrayIcon<R>);
 
+/// Held for the desktop process lifetime so another launch cannot create a
+/// second tray/App Server owner. `flock` releases automatically on a crash.
+struct SingleInstanceGuard {
+    _lock: File,
+}
+
+fn acquire_single_instance(data_dir: &Path) -> Result<SingleInstanceGuard, std::io::Error> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("desktop-instance.lock"))?;
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "Agent Sentinel is already running",
+            ));
+        }
+    }
+    Ok(SingleInstanceGuard { _lock: lock })
+}
+
+async fn open_desktop_repository(database_path: &Path) -> Result<RunRepository, String> {
+    let database_url = format!("sqlite://{}", database_path.display());
+    match RunRepository::open(&database_url).await {
+        Ok(repository) => Ok(repository),
+        Err(CoreError::IncompatibleMigrations) => {
+            let wal_path = PathBuf::from(format!("{}-wal", database_path.display()));
+            let shm_path = PathBuf::from(format!("{}-shm", database_path.display()));
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let backup_path = (0_u16..100)
+                .map(|attempt| {
+                    database_path.with_file_name(format!(
+                        "phase2.sqlite3.incompatible-{timestamp}-{attempt}"
+                    ))
+                })
+                .find(|candidate| {
+                    !candidate.exists()
+                        && !PathBuf::from(format!("{}-wal", candidate.display())).exists()
+                        && !PathBuf::from(format!("{}-shm", candidate.display())).exists()
+                })
+                .ok_or_else(|| "could not allocate a local database recovery backup".to_string())?;
+            let backup_wal_path = PathBuf::from(format!("{}-wal", backup_path.display()));
+            let backup_shm_path = PathBuf::from(format!("{}-shm", backup_path.display()));
+            let mut archived_sidecars = Vec::new();
+            for (source, destination) in
+                [(&wal_path, &backup_wal_path), (&shm_path, &backup_shm_path)]
+            {
+                if source.exists() {
+                    if let Err(error) = std::fs::rename(source, destination) {
+                        for (archived, original) in archived_sidecars.into_iter().rev() {
+                            let _ = std::fs::rename(archived, original);
+                        }
+                        return Err(format!(
+                            "could not preserve incompatible local database sidecar before recovery: {error}"
+                        ));
+                    }
+                    archived_sidecars.push((destination, source));
+                }
+            }
+            std::fs::rename(database_path, &backup_path).map_err(|error| {
+                for (archived, original) in archived_sidecars.into_iter().rev() {
+                    let _ = std::fs::rename(archived, original);
+                }
+                format!("could not preserve incompatible local database before recovery: {error}")
+            })?;
+            RunRepository::open(&database_url)
+                .await
+                .map_err(|_| "could not initialize a fresh local database after recovery".into())
+        }
+        Err(_) => Err("could not initialize local database".into()),
+    }
+}
+
 fn codex_tray_title(snapshot: Option<&serde_json::Value>) -> String {
     let percent = snapshot
         .and_then(|value| value.get("primary"))
@@ -574,7 +656,7 @@ fn codex_tray_title(snapshot: Option<&serde_json::Value>) -> String {
         .filter(|value| (0.0..=100.0).contains(value))
         .map(|value| format!("{value:.0}%"))
         .unwrap_or_else(|| "—".into());
-    format!("Codex · {percent}")
+    percent
 }
 
 #[tauri::command]
@@ -3457,15 +3539,39 @@ fn show_prompt(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-fn show_status(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(window) = app.get_webview_window(STATUS_WINDOW_LABEL) {
+fn discover_codex_executable() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE").map(PathBuf::from) {
+        return path.is_file().then_some(path);
+    }
+    if let Some(path) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("codex"))
+            .find(|candidate| candidate.is_file())
+    }) {
+        return Some(path);
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/bin/codex"))
+        .filter(|candidate| candidate.is_file())
+}
+
+fn show_utility_window(
+    app: &AppHandle,
+    label: &str,
+    title: &str,
+    width: f64,
+    height: f64,
+) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window(label) {
         window.show()?;
         window.unminimize()?;
-        return window.set_focus();
+        window.set_focus()?;
+        return Ok(());
     }
-    WebviewWindowBuilder::new(app, STATUS_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-        .title("Agent Sentinel Status")
-        .inner_size(320.0, 210.0)
+    WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+        .title(title)
+        .inner_size(width, height)
         .resizable(false)
         .always_on_top(true)
         .visible(true)
@@ -3475,7 +3581,7 @@ fn show_status(app: &AppHandle) -> tauri::Result<()> {
 
 fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     eprintln!("agent-sentinel: tray setup started");
-    let icon = match Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
+    let icon = match Image::from_bytes(include_bytes!("../icons/codex-tray.png")) {
         Ok(icon) => {
             eprintln!("agent-sentinel: tray icon loaded");
             icon
@@ -3487,8 +3593,9 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
     };
     let open = MenuItem::with_id(app, "open-prompt", "Open Prompt", true, None::<&str>)?;
     let status = MenuItem::with_id(app, "show-status", "Show Status", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &status, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &status, &settings, &quit])?;
     let builder = TrayIconBuilder::with_id("spike-tray")
         .icon(icon)
         .menu(&menu)
@@ -3497,7 +3604,24 @@ fn install_tray(app: &AppHandle) -> tauri::Result<()> {
             TrayAction::OpenPrompt => {
                 let _ = show_prompt(app);
             }
-            TrayAction::ShowStatus => { let _ = show_status(app); }
+            TrayAction::ShowStatus => {
+                let _ = show_utility_window(
+                    app,
+                    STATUS_WINDOW_LABEL,
+                    "Agent Sentinel Status",
+                    320.0,
+                    150.0,
+                );
+            }
+            TrayAction::Settings => {
+                let _ = show_utility_window(
+                    app,
+                    SETTINGS_WINDOW_LABEL,
+                    "Agent Sentinel Settings",
+                    440.0,
+                    540.0,
+                );
+            }
             TrayAction::Quit => app.exit(0),
             TrayAction::Ignore => {}
         });
@@ -3536,6 +3660,15 @@ fn main() {
                 .app_data_dir()
                 .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
             std::fs::create_dir_all(&data_dir)?;
+            let instance_guard = match acquire_single_instance(&data_dir) {
+                Ok(guard) => guard,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    eprintln!("agent-sentinel: another desktop instance is already running");
+                    app.handle().exit(0);
+                    return Ok(());
+                }
+                Err(error) => return Err(Box::new(error)),
+            };
             let database_path = data_dir.join("phase2.sqlite3");
             let worktree_root = data_dir.join("worktrees");
             let executable = resolve_fake_agent_path(
@@ -3547,11 +3680,11 @@ fn main() {
                     "Agent Sentinel fake-agent executable is unavailable",
                 )
             })?;
-            let repository = tauri::async_runtime::block_on(RunRepository::open(&format!(
-                "sqlite:{}",
-                database_path.display()
-            )))
-            .map_err(|_| {
+            let repository = tauri::async_runtime::block_on(open_desktop_repository(
+                &database_path,
+            ))
+            .map_err(|error| {
+                eprintln!("agent-sentinel: local database initialization failed: {error}");
                 Box::<dyn std::error::Error>::from(
                     "Agent Sentinel could not initialize its local database",
                 )
@@ -3593,15 +3726,15 @@ fn main() {
                     "Agent Sentinel fake-agent executable is unavailable",
                 )
             })?;
-            // This private opt-in is intentionally read only at startup.  No
-            // public command accepts an executable path; tests may point it at
-            // a deterministic fixture executable.
-            let codex = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
-                .map(PathBuf::from)
+            // An explicit path remains useful for deterministic tests.  In
+            // normal desktop use, resolve the user's installed `codex` from
+            // PATH; Sentinel never installs or modifies it.
+            let codex_path = discover_codex_executable();
+            let codex = codex_path
+                .clone()
                 .and_then(|path| CodexExecProgram::from_executable(path).ok());
-            let codex_app_program = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
-                .map(PathBuf::from)
-                .and_then(|path| CodexProgram::from_executable(path).ok());
+            let codex_app_program =
+                codex_path.and_then(|path| CodexProgram::from_executable(path).ok());
             let codex_exec_available = codex.is_some();
             let codex_usage = codex_usage::CodexUsageManager::new(
                 codex_app_program.clone(),
@@ -3667,6 +3800,15 @@ fn main() {
                 reconciliation_test_hooks: None,
                 #[cfg(test)]
                 b1_test_hooks: None,
+            });
+            app.manage(instance_guard);
+            // The tray itself is a usage consumer: start one managed read so
+            // its title can move from — to the real percentage without first
+            // opening the status window.
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = initial_codex_usage.rate_limits().await {
+                    eprintln!("agent-sentinel: Codex usage startup failed: {error}");
+                }
             });
             app.global_shortcut()
                 .on_shortcut(DEFAULT_GLOBAL_SHORTCUT, |app, _, event| {
@@ -3761,15 +3903,58 @@ mod bridge_tests {
 
     #[test]
     fn codex_tray_title_handles_initial_updated_and_unknown_snapshots() {
-        assert_eq!(codex_tray_title(None), "Codex · —");
+        assert_eq!(codex_tray_title(None), "—");
         assert_eq!(
             codex_tray_title(Some(&serde_json::json!({"primary":{"usedPercent":90}}))),
-            "Codex · 90%"
+            "90%"
         );
         assert_eq!(
             codex_tray_title(Some(&serde_json::json!({"primary":{"usedPercent":"bad"}}))),
-            "Codex · —"
+            "—"
         );
+    }
+
+    #[test]
+    fn desktop_instance_lock_rejects_a_second_owner() {
+        let directory = tempdir().unwrap();
+        let _first = acquire_single_instance(directory.path()).unwrap();
+        assert_eq!(
+            acquire_single_instance(directory.path())
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_local_database_is_preserved_before_fresh_startup() {
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("phase2.sqlite3");
+        let url = format!("sqlite://{}", database_path.display());
+        let repository = RunRepository::open(&url).await.unwrap();
+        drop(repository);
+        let pool = sqlx::SqlitePool::connect(&url).await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 11")
+            .bind(vec![0_u8; 48])
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        open_desktop_repository(&database_path).await.unwrap();
+
+        assert!(database_path.is_file());
+        assert!(std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .map(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("phase2.sqlite3.incompatible-")
+                })
+                .unwrap_or(false)
+        }));
     }
 
     const B1_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

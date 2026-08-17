@@ -7,6 +7,11 @@ describe("provider usage fixtures", () => {
       { id: "primary", usedPercent: 25, windowDurationMins: 300, resetsAt: "2026-08-06T12:00:00Z" }, { id: "secondary", usedPercent: 80, windowDurationMins: 10080, resetsAt: "2026-08-10T12:00:00Z" },
     ]);
   });
+  it("maps Codex epoch reset timestamps", () => {
+    expect(parseCodexRateLimits({ primary: { usedPercent: 90, resetsAt: 1786298259 } })).toEqual([
+      { id: "primary", usedPercent: 90, resetsAt: "2026-08-09T17:57:39.000Z" },
+    ]);
+  });
   it("keeps partial windows and rejects absent or malformed rate data", () => {
     expect(parseCodexRateLimits({ primary: { usedPercent: 10, resetsAt: "later" } })).toEqual([{ id: "primary", usedPercent: 10, resetsAt: "later" }]);
     expect(parseCodexRateLimits({ primary: { usedPercent: 101, resetsAt: "later" } })).toBeNull();

@@ -1,0 +1,22 @@
+[package]
+name = "sentinel-supervisor"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sentinel-core = { path = "../sentinel-core" }
+sentinel-worktree = { path = "../sentinel-worktree" }
+sentinel-codex = { path = "../sentinel-codex" }
+sentinel-claude = { path = "../sentinel-claude" }
+sentinel-review = { path = "../sentinel-review" }
+sentinel-validation = { path = "../sentinel-validation" }
+sentinel-git = { path = "../sentinel-git" }
+sentinel-provider-api = { path = "../sentinel-provider-api" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

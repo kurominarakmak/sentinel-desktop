@@ -2,11 +2,13 @@ use sentinel_agent_api::AgentKind;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
+    migrate::MigrateError,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
     Row, SqlitePool,
 };
 use std::{
     str::FromStr,
+    sync::{atomic::AtomicU64, Arc},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -648,6 +650,8 @@ pub enum CoreError {
     V3Conflict,
     #[error("corrupt v3 stored state")]
     CorruptV3State,
+    #[error("local database migrations are incompatible")]
+    IncompatibleMigrations,
     #[error(transparent)]
     Transition(#[from] TransitionError),
     #[error("storage error")]
@@ -981,6 +985,8 @@ fn validate_event(event: &NormalizedAgentEvent) -> Result<String, CoreError> {
 #[derive(Clone)]
 pub struct RunRepository {
     pool: SqlitePool,
+    v3_changes: tokio::sync::broadcast::Sender<u64>,
+    v3_change_sequence: Arc<AtomicU64>,
 }
 
 impl RunRepository {
@@ -999,8 +1005,18 @@ impl RunRepository {
         sqlx::migrate!("./migrations")
             .run(&pool)
             .await
-            .map_err(|_| CoreError::Storage)?;
-        Ok(Self { pool })
+            .map_err(|error| match error {
+                MigrateError::VersionMismatch(_) | MigrateError::VersionMissing(_) => {
+                    CoreError::IncompatibleMigrations
+                }
+                _ => CoreError::Storage,
+            })?;
+        let (v3_changes, _) = tokio::sync::broadcast::channel(256);
+        Ok(Self {
+            pool,
+            v3_changes,
+            v3_change_sequence: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub async fn sqlite_settings(&self) -> Result<SqliteSettings, CoreError> {
@@ -1028,7 +1044,17 @@ impl RunRepository {
     /// provider adapters receive projections from a supervisor, never this
     /// write-capable repository directly.
     pub fn v3(&self) -> v3::V3Repository {
-        v3::V3Repository::new(self.pool.clone())
+        v3::V3Repository::new(
+            self.pool.clone(),
+            v3::V3ChangeNotifier::new(self.v3_changes.clone(), self.v3_change_sequence.clone()),
+        )
+    }
+
+    /// Subscribes to process-local durable V3 mutations. A receiver is only a
+    /// wake-up signal: consumers must reload the authoritative projection from
+    /// SQLite and must not infer workflow state from the sequence number.
+    pub fn subscribe_v3_changes(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.v3_changes.subscribe()
     }
     pub async fn register_project(
         &self,
@@ -2041,6 +2067,29 @@ impl RunRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn open_identifies_previously_modified_migrations() {
+        let directory = tempdir().expect("temporary database");
+        let url = format!(
+            "sqlite://{}",
+            directory.path().join("state.sqlite").display()
+        );
+        let repository = RunRepository::open(&url).await.expect("open repository");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 11")
+            .bind(vec![0_u8; 48])
+            .execute(&repository.pool)
+            .await
+            .expect("replace migration checksum");
+        drop(repository);
+
+        assert!(matches!(
+            RunRepository::open(&url).await,
+            Err(CoreError::IncompatibleMigrations)
+        ));
+    }
+
     #[test]
     fn state_machine_accepts_phase_two_lifecycle() {
         assert_eq!(

@@ -23,6 +23,7 @@ sentinel-validation = { path = "../../../crates/sentinel-validation" }
 sentinel-review = { path = "../../../crates/sentinel-review" }
 tokio.workspace = true
 unicode-normalization.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

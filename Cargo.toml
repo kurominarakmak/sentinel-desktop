@@ -13,6 +13,7 @@ members = [
   "crates/sentinel-worktree",
   "crates/sentinel-validation",
   "crates/sentinel-review",
+  "crates/sentinel-supervisor",
   "apps/desktop/src-tauri",
   "apps/macos/bridge",
 ]

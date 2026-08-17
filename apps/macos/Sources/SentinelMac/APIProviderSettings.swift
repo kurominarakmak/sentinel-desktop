@@ -37,6 +37,16 @@ struct APIProviderSettingsItem: Codable, Equatable, Identifiable {
     var availableForSelection: Bool {
         enabled && (credentialState == "configured" || credentialState == "not_required")
     }
+
+    func supportsWorkflowRole(_ role: String) -> Bool {
+        guard availableForSelection else { return false }
+        switch role {
+        case "implementer": return capabilities.implementation
+        case "reviewer": return capabilities.readOnlyReview
+        case "repair": return capabilities.repair
+        default: return false
+        }
+    }
 }
 
 struct APIProviderSettingsSnapshot: Codable, Equatable {
@@ -68,13 +78,9 @@ struct APIProviderSettingsSection: View {
     @State private var customURL = ""
     @State private var customModel = ""
 
-    private var selectable: [APIProviderSettingsItem] {
-        snapshot.providers.filter(\.availableForSelection)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
-            Text("Coding model APIs")
+            Text("API keys, models, and workflow roles")
                 .font(.caption.weight(.semibold))
             Text("Keys are sent once to Rust and stored in macOS Keychain. Sentinel never returns their plaintext.")
                 .font(.caption2)
@@ -86,13 +92,13 @@ struct APIProviderSettingsSection: View {
                     .accessibilityLabel("Provider settings: \(message)")
             }
 
-            workflowSelectors
-
             ForEach(snapshot.providers.filter { $0.id != "codex" && $0.id != "claude_code" }) { provider in
                 Divider()
                 APIProviderRow(provider: provider, bridge: bridge)
             }
 
+            Divider()
+            workflowSelectors
             Divider()
             customProviderEditor
         }
@@ -124,7 +130,8 @@ struct APIProviderSettingsSection: View {
         selected: APIProviderSelection,
         role: String
     ) -> some View {
-        HStack {
+        let selectable = selectableProviders(for: role)
+        return HStack {
             Text(label)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -140,6 +147,12 @@ struct APIProviderSettingsSection: View {
             }
             .labelsHidden()
             .disabled(bridge.settingsMutationInFlight || selectable.isEmpty)
+        }
+    }
+
+    private func selectableProviders(for role: String) -> [APIProviderSettingsItem] {
+        snapshot.providers.filter { provider in
+            provider.supportsWorkflowRole(role)
         }
     }
 

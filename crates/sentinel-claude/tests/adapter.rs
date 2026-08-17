@@ -7,7 +7,7 @@ use sentinel_core::{
     },
     RunRepository,
 };
-use std::{path::PathBuf, process::Command, sync::Mutex};
+use std::{fs, path::PathBuf, process::Command, sync::Mutex};
 use tempfile::TempDir;
 
 static ENV: Mutex<()> = Mutex::new(());
@@ -69,6 +69,26 @@ async fn detects_installation_and_missing_program() {
     assert!(matches!(
         detect_installation("/definitely/missing/claude").await,
         ClaudeInstallation::Missing
+    ));
+}
+
+#[tokio::test]
+async fn refuses_an_executable_replaced_after_configuration() {
+    let (directory, repository, task) = fixture().await;
+    let executable = directory.path().join("claude-copy");
+    fs::copy(fake(), &executable).unwrap();
+    let program = ClaudeProgram::from_executable(&executable).unwrap();
+    fs::write(&executable, b"replaced after validation").unwrap();
+    assert!(matches!(
+        ClaudeProcess::start(
+            program,
+            repository,
+            task.id,
+            directory.path(),
+            "safe prompt"
+        )
+        .await,
+        Err(sentinel_claude::ClaudeError::MissingExecutable)
     ));
 }
 

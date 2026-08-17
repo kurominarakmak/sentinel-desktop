@@ -188,6 +188,22 @@ fn main() {
                     json!({"thread":{}})
                 }
                 "thread/start" | "thread/resume" => json!({"thread":{"id":"thread-test"}}),
+                "thread/read" if scenario == "missing-thread" => {
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32001,"message":"thread not found"}})
+                    );
+                    let _ = output.flush();
+                    continue;
+                }
+                "thread/read" if scenario == "inactive-thread" => {
+                    json!({"thread":{"id":"thread-test","status":{"type":"idle"},"turns":[{"id":"turn-test","status":"completed"}]}})
+                }
+                "thread/read" => {
+                    json!({"thread":{"id":"thread-test","status":{"type":"active"},"turns":[{"id":"turn-test","status":"inProgress"}]}})
+                }
+                "thread/list" if scenario == "missing-thread" => json!({"data":[]}),
+                "thread/list" => json!({"data":[{"id":"thread-test"}]}),
                 "turn/start" => json!({"turn":{"id":"turn-test"}}),
                 "turn/interrupt" => json!({}),
                 _ => json!({}),

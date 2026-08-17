@@ -4,27 +4,29 @@
 //! snapshots and forwards the already-existing final-approval supervisor call.
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
-use sentinel_codex::{CodexAppServer, CodexProgram, CodexTaskStarter, StartedCodexTask};
+use sentinel_claude::ClaudeProgram;
+use sentinel_codex::{CodexAppServer, CodexProgram};
 use sentinel_core::{
-    v3::{ApprovalId, CreateTask, TaskId},
+    v3::{ApprovalId, CreateTask, SupervisorRequestReservation, TaskId},
     CoreError, RunRepository,
 };
-use sentinel_git::inspect_repository;
+use sentinel_git::{inspect_repository, RepositoryState};
 use sentinel_provider_api::{
     openai_compatible::CustomProviderSpec,
     settings::{ProviderSettingsSnapshot, ProviderSettingsStore},
-    MacOsKeychainCredentialStore, ProviderId, SecretString, WorkflowProviderConfiguration,
+    CredentialState, MacOsKeychainCredentialStore, ProviderId, ProviderRole, SecretString,
+    WorkflowProviderConfiguration,
 };
-use sentinel_review::FinalApprovalSupervisor;
+use sentinel_supervisor::{SentinelSupervisor, SupervisorPrograms};
 use sentinel_validation::load_repository_profiles;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Deserialize)]
@@ -51,14 +53,13 @@ enum Request {
         task_id: String,
         approval_id: Option<String>,
     },
+    SetRepository {
+        request_id: String,
+        path: String,
+    },
     ProviderSettingsMutation {
         request_id: String,
         mutation: ProviderSettingsMutation,
-    },
-    Supervisor {
-        command: String,
-        approval_id: Option<String>,
-        approve: Option<bool>,
     },
 }
 
@@ -89,6 +90,13 @@ enum ProviderSettingsMutation {
     RemoveCustom {
         provider_id: ProviderId,
     },
+}
+
+enum BridgeInput {
+    Request(Request),
+    WorkflowChanged,
+    ProviderStatusChanged,
+    Shutdown,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +202,46 @@ struct SettingsDto {
     provider_settings: ProviderSettingsSnapshot,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeConfig {
+    #[serde(default)]
+    version: u64,
+    repository_root: Option<PathBuf>,
+}
+
+fn config_path(database_path: &Path) -> PathBuf {
+    database_path.with_file_name("native-config.json")
+}
+
+fn load_config(path: &Path) -> NativeConfig {
+    std::fs::read(path)
+        .ok()
+        .filter(|bytes| bytes.len() <= 16 * 1024)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(path: &Path, config: &NativeConfig) -> Result<(), ()> {
+    let bytes = serde_json::to_vec(config).map_err(|_| ())?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| ())?;
+    }
+    file.write_all(&bytes).map_err(|_| ())?;
+    file.sync_all().map_err(|_| ())?;
+    drop(file);
+    std::fs::rename(temporary, path).map_err(|_| ())
+}
+
 /// A native-shell-only account usage reader. Its provider protocol events live
 /// in a separate database so usage polling can never become an active V3 task
 /// or otherwise affect the workflow repository presented to Swift.
@@ -202,25 +250,39 @@ struct CodexUsageCollector {
     repository: RunRepository,
     cwd: Option<PathBuf>,
     server: Option<CodexAppServer>,
+    changes: mpsc::Sender<BridgeInput>,
 }
 
 impl CodexUsageCollector {
-    fn new(program: Option<CodexProgram>, repository: RunRepository, cwd: Option<PathBuf>) -> Self {
+    fn new(
+        program: Option<CodexProgram>,
+        repository: RunRepository,
+        cwd: Option<PathBuf>,
+        changes: mpsc::Sender<BridgeInput>,
+    ) -> Self {
         Self {
             program,
             repository,
             cwd,
             server: None,
+            changes,
         }
     }
 
-    async fn rate_limits(&mut self) -> Option<Value> {
+    async fn rate_limits(&mut self, refresh: bool) -> Option<Value> {
         if self.server.as_ref().is_some_and(CodexAppServer::is_alive) {
-            return self
-                .server
-                .as_ref()
-                .and_then(CodexAppServer::latest_rate_limits)
-                .map(|limits| limits.0);
+            let server = self.server.as_ref()?;
+            return if refresh {
+                server
+                    .read_rate_limits()
+                    .await
+                    .ok()
+                    .flatten()
+                    .or_else(|| server.latest_rate_limits())
+            } else {
+                server.latest_rate_limits()
+            }
+            .map(|limits| limits.0);
         }
         self.server = None;
         let (Some(program), Some(cwd)) = (self.program.clone(), self.cwd.as_deref()) else {
@@ -242,6 +304,15 @@ impl CodexUsageCollector {
         let server = CodexAppServer::start(program, self.repository.clone(), task.id, cwd)
             .await
             .ok()?;
+        let mut updates = server.subscribe_rate_limits();
+        let changes = self.changes.clone();
+        tokio::spawn(async move {
+            while updates.changed().await.is_ok() {
+                if changes.send(BridgeInput::ProviderStatusChanged).is_err() {
+                    break;
+                }
+            }
+        });
         let latest = server.latest_rate_limits().map(|limits| limits.0);
         self.server = Some(server);
         latest
@@ -253,14 +324,6 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-fn usage_database_path(database_path: &Path) -> PathBuf {
-    let name = database_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("sentinel-native");
-    database_path.with_file_name(format!("{name}-codex-usage.sqlite3"))
 }
 
 fn task_dto(task: sentinel_core::v3::Task) -> TaskDto {
@@ -277,10 +340,17 @@ fn task_dto(task: sentinel_core::v3::Task) -> TaskDto {
     }
 }
 
-async fn active_task(repository: &RunRepository) -> Result<Option<TaskDto>, CoreError> {
-    let mut tasks = repository.v3().list_tasks().await?;
-    tasks.sort_by_key(|task| (task.updated_at_ms, task.version));
-    Ok(tasks.pop().map(task_dto))
+async fn active_task(
+    supervisor: Option<&SentinelSupervisor>,
+) -> Result<Option<TaskDto>, CoreError> {
+    match supervisor {
+        Some(supervisor) => supervisor
+            .active_task()
+            .await
+            .map(|task| task.map(task_dto))
+            .map_err(|_| CoreError::Storage),
+        None => Ok(None),
+    }
 }
 
 fn attention_display_state(task: &sentinel_core::v3::Task) -> &'static str {
@@ -308,26 +378,24 @@ fn provider_identity(provider: String) -> String {
 }
 
 async fn attention_state(
-    repository: &RunRepository,
-    owned_tasks: &HashMap<TaskId, StartedCodexTask>,
+    supervisor: Option<&SentinelSupervisor>,
 ) -> Result<Option<AttentionDto>, CoreError> {
-    let Some(task) = active_task_record(repository).await? else {
+    let Some(supervisor) = supervisor else {
         return Ok(None);
     };
+    let Some(task) = supervisor
+        .active_task()
+        .await
+        .map_err(|_| CoreError::Storage)?
+    else {
+        return Ok(None);
+    };
+    let repository = supervisor.repository();
     let id = task.id.clone();
     let events = repository.v3().list_events(&id).await?;
     let sessions = repository.v3().list_sessions_for_task(&id).await?;
     let validations = repository.v3().list_validation_results(&id).await?;
     let findings = repository.v3().list_review_findings(&id).await?;
-    let approvals = repository.v3().list_approvals_for_task(&id).await?;
-    let approval_id = approvals
-        .iter()
-        .rev()
-        .find(|approval| {
-            approval.action_kind == "v3_final_git_action"
-                && approval.lifecycle == sentinel_core::v3::ApprovalLifecycle::Pending
-        })
-        .map(|approval| approval.id.to_string());
     let latest_validation = validations
         .last()
         .map(|item| format!("{:?}", item.lifecycle).to_lowercase());
@@ -341,9 +409,10 @@ async fn attention_state(
                 )
         })
         .count();
-    let can_stop = !task.lifecycle.terminal()
-        && task.recovery_condition == sentinel_core::v3::RecoveryCondition::None
-        && owned_tasks.contains_key(&id);
+    let actions = supervisor
+        .available_actions(&task)
+        .await
+        .map_err(|_| CoreError::Storage)?;
     Ok(Some(AttentionDto {
         display_state: attention_display_state(&task).into(),
         provider: sessions
@@ -356,21 +425,25 @@ async fn attention_state(
         review: (blockers > 0)
             .then(|| format!("{blockers} blocker{}", if blockers == 1 { "" } else { "s" })),
         actions: AttentionActionsDto {
-            stop: can_stop,
-            approve: approval_id.is_some(),
-            reject: approval_id.is_some(),
-            approval_id,
+            stop: actions.stop,
+            approve: actions.approve,
+            reject: actions.reject,
+            approval_id: actions.approval_id.map(|approval| approval.to_string()),
         },
         task: task_dto(task),
     }))
 }
 
 async fn active_task_record(
-    repository: &RunRepository,
+    supervisor: Option<&SentinelSupervisor>,
 ) -> Result<Option<sentinel_core::v3::Task>, CoreError> {
-    let mut tasks = repository.v3().list_tasks().await?;
-    tasks.sort_by_key(|task| (task.updated_at_ms, task.version));
-    Ok(tasks.pop())
+    match supervisor {
+        Some(supervisor) => supervisor
+            .active_task()
+            .await
+            .map_err(|_| CoreError::Storage),
+        None => Ok(None),
+    }
 }
 
 fn installation_status(status: InstallationStatus) -> String {
@@ -383,9 +456,11 @@ fn installation_status(status: InstallationStatus) -> String {
 
 async fn status_snapshot(
     repository: &RunRepository,
+    supervisor: Option<&SentinelSupervisor>,
     usage: &mut CodexUsageCollector,
+    refresh_usage: bool,
 ) -> Result<StatusDto, CoreError> {
-    let task = active_task_record(repository).await?;
+    let task = active_task_record(supervisor).await?;
     let (version, recovery_required, sentinel) = match task.as_ref() {
         Some(task) => (
             task.version,
@@ -430,7 +505,7 @@ async fn status_snapshot(
             installation: installation_status(detect_installation(AgentKind::Codex)),
             runtime: codex_runtime,
             usage: "Codex App Server account/rateLimits/read".into(),
-            rate_limits: usage.rate_limits().await,
+            rate_limits: usage.rate_limits(refresh_usage).await,
         },
         claude: ProviderStatusDto {
             name: "Claude Code".into(),
@@ -443,18 +518,12 @@ async fn status_snapshot(
 }
 
 async fn settings_snapshot(
-    repository: &RunRepository,
+    supervisor: Option<&SentinelSupervisor>,
     root: Option<&Path>,
+    config_version: u64,
     provider_store: &ProviderSettingsStore,
 ) -> Result<SettingsDto, CoreError> {
-    let task_version = active_task_record(repository)
-        .await?
-        .map(|task| task.version)
-        .unwrap_or(0);
-    let provider_settings = provider_store.snapshot();
-    let version = task_version
-        .saturating_mul(1_000_000)
-        .saturating_add(provider_settings.version);
+    let _ = active_task_record(supervisor).await?;
     let (validation_profiles, validation_error) = match root {
         Some(root) => match load_repository_profiles(root) {
             Ok(profiles) => (
@@ -492,8 +561,11 @@ async fn settings_snapshot(
         .map(PathBuf::from)
         .filter(|path| path.is_file())
         .map(|path| path.display().to_string());
+    let provider_settings = provider_store.snapshot();
     Ok(SettingsDto {
-        version,
+        version: config_version
+            .saturating_mul(1_000_000)
+            .saturating_add(provider_settings.version),
         global_shortcut: "Command+Shift+Space".into(),
         repository: root.map(|path| path.display().to_string()),
         default_provider: "codex".into(),
@@ -557,8 +629,8 @@ fn apply_provider_settings_mutation(
 
 async fn task_detail(
     repository: &RunRepository,
+    supervisor: Option<&SentinelSupervisor>,
     task_id: String,
-    owned_tasks: &HashMap<TaskId, StartedCodexTask>,
 ) -> Result<Value, CoreError> {
     let task_id = sentinel_core::v3::TaskId(task_id);
     let task = repository.v3().get_task(&task_id).await?;
@@ -574,7 +646,7 @@ async fn task_detail(
     let repair_rounds = repository.v3().list_repair_rounds(&task_id).await?;
     let sessions = repository.v3().list_sessions_for_task(&task_id).await?;
     let artifacts = repository.v3().list_artifacts(&task_id).await?;
-    let detail_actions = attention_state(repository, owned_tasks)
+    let detail_actions = attention_state(supervisor)
         .await?
         .filter(|state| state.task.id == task_id.0)
         .map(|state| state.actions)
@@ -631,69 +703,142 @@ async fn futures_join_validations(
 }
 
 fn codex_program() -> Option<CodexProgram> {
-    let path = std::env::var_os("AGENT_SENTINEL_CODEX_EXECUTABLE")
+    executable_path("AGENT_SENTINEL_CODEX_EXECUTABLE", "codex")
+        .and_then(|path| CodexProgram::from_executable(path).ok())
+}
+
+fn claude_program() -> Option<ClaudeProgram> {
+    executable_path("AGENT_SENTINEL_CLAUDE_EXECUTABLE", "claude")
+        .and_then(|path| ClaudeProgram::from_executable(path).ok())
+}
+
+fn executable_path(override_name: &str, executable_name: &str) -> Option<PathBuf> {
+    std::env::var_os(override_name)
         .map(PathBuf::from)
         .filter(|candidate| candidate.is_file())
         .or_else(|| {
             std::env::var_os("PATH").and_then(|path| {
                 std::env::split_paths(&path)
-                    .map(|directory| directory.join("codex"))
+                    .map(|directory| directory.join(executable_name))
                     .find(|candidate| candidate.is_file())
             })
         })
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .map(|home| home.join(".local/bin/codex"))
+                .map(|home| home.join(".local/bin").join(executable_name))
                 .filter(|candidate| candidate.is_file())
-        });
-    path.and_then(|path| CodexProgram::from_executable(path).ok())
+        })
 }
 
-fn repository_root() -> Option<PathBuf> {
+fn repository_root(config: &NativeConfig) -> Option<PathBuf> {
     std::env::var_os("SENTINEL_REPOSITORY_ROOT")
         .map(PathBuf::from)
+        .or_else(|| config.repository_root.clone())
         .or_else(|| std::env::current_dir().ok())
         .filter(|path| path.is_dir())
 }
 
-async fn start_task(
+fn build_supervisor(
+    runtime: &tokio::runtime::Runtime,
     repository: &RunRepository,
-    program: Option<CodexProgram>,
     root: &Path,
-    provider: String,
-    summary: String,
-    prompt: String,
-    owned_tasks: &mut HashMap<TaskId, StartedCodexTask>,
-) -> Result<TaskDto, &'static str> {
-    if provider != "codex" || prompt.trim().is_empty() || summary.trim().is_empty() {
-        return Err("task submission was rejected");
+    worktree_root: &Path,
+    programs: &SupervisorPrograms,
+    provider_settings: &ProviderSettingsStore,
+) -> Option<SentinelSupervisor> {
+    let inspection = runtime.block_on(inspect_repository(root)).ok()?;
+    if !inspection.is_primary || !matches!(inspection.state, RepositoryState::Valid) {
+        return None;
     }
-    if inspect_repository(root).await.is_err() {
-        return Err("repository is unavailable or invalid");
+    let registry = provider_settings
+        .build_registry(programs.codex.is_some(), programs.claude.is_some())
+        .ok()?;
+    let workflow = provider_settings.snapshot().workflow;
+    let mut supervisor = SentinelSupervisor::with_provider_runtime(
+        repository.clone(),
+        &inspection.primary_root,
+        worktree_root,
+        programs.clone(),
+        Arc::new(registry),
+        workflow,
+    )
+    .ok()?;
+    runtime
+        .block_on(supervisor.enter_recovery_after_restart())
+        .ok()?;
+    Some(supervisor)
+}
+
+fn quick_prompt_providers(
+    settings: &ProviderSettingsStore,
+    codex_available: bool,
+    claude_available: bool,
+) -> Vec<ProviderDto> {
+    let snapshot = settings.snapshot();
+    let registry = settings
+        .build_registry(codex_available, claude_available)
+        .ok();
+    let configured_available = registry.as_ref().is_some_and(|registry| {
+        registry
+            .validate_selection(&snapshot.workflow.implementer, ProviderRole::Implementer)
+            .is_ok()
+    });
+    let configured_label = snapshot
+        .providers
+        .iter()
+        .find(|provider| provider.id == snapshot.workflow.implementer.provider_id)
+        .map(|provider| format!("Configured · {}", provider.display_name))
+        .unwrap_or_else(|| "Configured provider".into());
+    let mut result = vec![ProviderDto {
+        id: "configured".into(),
+        label: configured_label,
+        available: configured_available,
+    }];
+    result.extend(snapshot.providers.into_iter().filter_map(|provider| {
+        if !provider.capabilities.implementation {
+            return None;
+        }
+        let transport_available = match provider.id.as_str() {
+            "codex" => codex_available,
+            "claude_code" => claude_available,
+            _ => matches!(provider.credential_state, CredentialState::Configured),
+        };
+        Some(ProviderDto {
+            id: provider.id.to_string(),
+            label: provider.display_name,
+            available: provider.enabled && transport_available,
+        })
+    }));
+    result
+}
+
+fn parse_provider_directive(prompt: &str, provider_ids: &[String]) -> (Option<String>, String) {
+    let trimmed = prompt.trim_start();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or_default();
+    let remainder = parts.next().unwrap_or_default();
+    let Some(raw) = command.strip_prefix('/') else {
+        return (None, prompt.to_owned());
+    };
+    let provider = match raw {
+        "claude" | "claude-code" => "claude_code",
+        value => value,
+    };
+    if provider_ids.iter().any(|candidate| candidate == provider) {
+        (Some(provider.to_owned()), remainder.trim_start().to_owned())
+    } else {
+        (None, prompt.to_owned())
     }
-    let starter = CodexTaskStarter::new(program, repository.clone());
-    let mut started = starter
-        .start_task(summary, root)
-        .await
-        .map_err(|_| "Codex is unavailable")?;
-    started
-        .start_turn(&prompt)
-        .await
-        .map_err(|_| "Codex rejected the task prompt")?;
-    let task = task_dto(started.task().clone());
-    owned_tasks.insert(TaskId(task.id.clone()), started);
-    Ok(task)
 }
 
 async fn perform_attention_action(
-    repository: &RunRepository,
-    owned_tasks: &mut HashMap<TaskId, StartedCodexTask>,
+    supervisor: &mut SentinelSupervisor,
     action: String,
     task_id: String,
     approval_id: Option<String>,
 ) -> Result<(), &'static str> {
-    let state = attention_state(repository, owned_tasks)
+    let state = attention_state(Some(supervisor))
         .await
         .map_err(|_| "could not read task state")?
         .ok_or("there is no active task")?;
@@ -701,37 +846,27 @@ async fn perform_attention_action(
         return Err("task is no longer active");
     }
     match (action.as_str(), approval_id) {
-        ("stop", None) if state.actions.stop => owned_tasks
-            .get_mut(&TaskId(task_id))
-            .ok_or("task session is unavailable")?
-            .cancel()
+        ("stop", None) if state.actions.stop => supervisor
+            .stop(&TaskId(task_id))
             .await
             .map_err(|_| "stop was rejected by the Rust supervisor"),
         ("approve", Some(approval_id))
             if state.actions.approve
                 && state.actions.approval_id.as_deref() == Some(&approval_id) =>
         {
-            FinalApprovalSupervisor::require_human_approval(
-                repository.clone(),
-                &ApprovalId(approval_id),
-                true,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|_| "approval was rejected by the Rust supervisor")
+            supervisor
+                .decide_final_approval(&TaskId(task_id), &ApprovalId(approval_id), true)
+                .await
+                .map_err(|_| "approval was rejected by the Rust supervisor")
         }
         ("reject", Some(approval_id))
             if state.actions.reject
                 && state.actions.approval_id.as_deref() == Some(&approval_id) =>
         {
-            FinalApprovalSupervisor::require_human_approval(
-                repository.clone(),
-                &ApprovalId(approval_id),
-                false,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|_| "rejection was rejected by the Rust supervisor")
+            supervisor
+                .decide_final_approval(&TaskId(task_id), &ApprovalId(approval_id), false)
+                .await
+                .map_err(|_| "rejection was rejected by the Rust supervisor")
         }
         _ => Err("action is not authorized for the current task"),
     }
@@ -743,6 +878,45 @@ fn response(value: Value) {
     let _ = stdout.flush();
 }
 
+fn request_fingerprint(value: &Value) -> String {
+    let encoded = serde_json::to_vec(value).unwrap_or_default();
+    format!("sha256:{:x}", Sha256::digest(encoded))
+}
+
+fn reserve_mutation(
+    runtime: &tokio::runtime::Runtime,
+    repository: &RunRepository,
+    request_id: &str,
+    request_kind: &str,
+    fingerprint: &str,
+) -> Result<SupervisorRequestReservation, ()> {
+    runtime
+        .block_on(repository.v3().reserve_supervisor_request(
+            request_id,
+            request_kind,
+            fingerprint,
+            now_ms(),
+        ))
+        .map_err(|_| ())
+}
+
+fn complete_mutation(
+    runtime: &tokio::runtime::Runtime,
+    repository: &RunRepository,
+    request_id: &str,
+    payload: &Value,
+) -> bool {
+    serde_json::to_string(payload).is_ok_and(|encoded| {
+        runtime
+            .block_on(
+                repository
+                    .v3()
+                    .complete_supervisor_request(request_id, &encoded, now_ms()),
+            )
+            .is_ok()
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_path = PathBuf::from(
         std::env::args()
@@ -750,24 +924,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("database path argument is required")?,
     );
     let database_url = format!("sqlite://{}", database_path.display());
-    let usage_database_url = format!("sqlite://{}", usage_database_path(&database_path).display());
     let runtime = tokio::runtime::Runtime::new()?;
     let repository = runtime.block_on(RunRepository::open(&database_url))?;
+    let native_config_path = config_path(&database_path);
+    let provider_settings_path = database_path.with_file_name("api-providers.json");
     let provider_settings = ProviderSettingsStore::load(
-        database_path.with_file_name("api-providers.json"),
+        &provider_settings_path,
         Arc::new(MacOsKeychainCredentialStore),
     )?;
-    let root = repository_root();
+    let mut config = load_config(&native_config_path);
+    let mut root = repository_root(&config);
     let program = codex_program();
-    let usage_repository = runtime.block_on(RunRepository::open(&usage_database_url))?;
-    let mut usage = CodexUsageCollector::new(program.clone(), usage_repository, root.clone());
+    let claude = claude_program();
+    let programs = SupervisorPrograms {
+        codex: program.clone(),
+        claude: claude.clone(),
+    };
+    let worktree_root = database_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("task-worktrees");
+    let mut supervisor = root.as_deref().and_then(|root| {
+        build_supervisor(
+            &runtime,
+            &repository,
+            root,
+            &worktree_root,
+            &programs,
+            &provider_settings,
+        )
+    });
+    root = supervisor
+        .as_ref()
+        .map(|supervisor| supervisor.primary_root().to_owned());
     let (sender, receiver) = mpsc::channel();
+    let _usage_directory = tempfile::Builder::new()
+        .prefix("agent-sentinel-usage-")
+        .tempdir()?;
+    let usage_database_url = format!(
+        "sqlite://{}",
+        _usage_directory.path().join("usage.sqlite3").display()
+    );
+    let usage_repository = runtime.block_on(RunRepository::open(&usage_database_url))?;
+    let mut usage = CodexUsageCollector::new(
+        program.clone(),
+        usage_repository.clone(),
+        root.clone()
+            .or_else(|| database_path.parent().map(Path::to_path_buf)),
+        sender.clone(),
+    );
+    let request_sender = sender.clone();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines().map_while(Result::ok) {
             if let Ok(request) = serde_json::from_str::<Request>(&line) {
-                let _ = sender.send(request);
+                let _ = request_sender.send(BridgeInput::Request(request));
             } else {
                 response(json!({"kind":"error","message":"invalid native bridge request"}));
+            }
+        }
+        let _ = request_sender.send(BridgeInput::Shutdown);
+    });
+    let mut workflow_changes = repository.subscribe_v3_changes();
+    let workflow_sender = sender.clone();
+    runtime.spawn(async move {
+        loop {
+            match workflow_changes.recv().await {
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if workflow_sender.send(BridgeInput::WorkflowChanged).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -775,115 +1002,194 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut subscribed = false;
     let mut last_snapshot = None;
     let mut last_status = None;
-    let mut owned_tasks = HashMap::new();
-    let mut accepted_submissions = HashMap::new();
-    let mut completed_actions: HashMap<String, Value> = HashMap::new();
-    let mut completed_provider_mutations: HashMap<String, (String, Value)> = HashMap::new();
     loop {
-        match receiver.recv_timeout(Duration::from_millis(400)) {
-            Ok(Request::Capabilities) => response(json!({
+        match receiver.recv() {
+            Ok(BridgeInput::Request(Request::Capabilities)) => response(json!({
                 "kind":"capabilities",
-                "repository":root.as_ref().map(|path| path.display().to_string()),
-                "providers":[
-                    ProviderDto { id:"codex".into(), label:"Codex".into(), available:program.is_some() },
-                    ProviderDto { id:"claude_code".into(), label:"Claude Code".into(), available:false }
-                ]
+                "repository":root.as_ref().map(|root| root.display().to_string()),
+                "providers":quick_prompt_providers(&provider_settings, program.is_some(), claude.is_some())
             })),
-            Ok(Request::ActiveTask) => match runtime.block_on(active_task(&repository)) {
+            Ok(BridgeInput::Request(Request::ActiveTask)) => match runtime
+                .block_on(active_task(supervisor.as_ref()))
+            {
                 Ok(task) => response(json!({"kind":"active_task","task":task})),
                 Err(_) => response(json!({"kind":"error","message":"could not read active task"})),
             },
-            Ok(Request::AttentionState) => {
-                match runtime.block_on(attention_state(&repository, &owned_tasks)) {
+            Ok(BridgeInput::Request(Request::AttentionState)) => {
+                match runtime.block_on(attention_state(supervisor.as_ref())) {
                     Ok(state) => response(json!({"kind":"attention_state","attention":state})),
                     Err(_) => {
                         response(json!({"kind":"error","message":"could not read attention state"}))
                     }
                 }
             }
-            Ok(Request::Status) => match runtime.block_on(status_snapshot(&repository, &mut usage))
-            {
+            Ok(BridgeInput::Request(Request::Status)) => match runtime.block_on(status_snapshot(
+                &repository,
+                supervisor.as_ref(),
+                &mut usage,
+                true,
+            )) {
                 Ok(status) => response(json!({"kind":"status","status":status})),
                 Err(_) => {
                     response(json!({"kind":"error","message":"could not read provider status"}))
                 }
             },
-            Ok(Request::Settings) => {
+            Ok(BridgeInput::Request(Request::Settings)) => {
                 match runtime.block_on(settings_snapshot(
-                    &repository,
+                    supervisor.as_ref(),
                     root.as_deref(),
+                    config.version,
                     &provider_settings,
                 )) {
                     Ok(settings) => response(json!({"kind":"settings","settings":settings})),
                     Err(_) => response(json!({"kind":"error","message":"could not read settings"})),
                 }
             }
-            Ok(Request::TaskDetail { task_id }) => {
-                match runtime.block_on(task_detail(&repository, task_id, &owned_tasks)) {
+            Ok(BridgeInput::Request(Request::TaskDetail { task_id })) => {
+                match runtime.block_on(task_detail(&repository, supervisor.as_ref(), task_id)) {
                     Ok(detail) => response(json!({"kind":"task_detail","detail":detail})),
                     Err(_) => {
                         response(json!({"kind":"error","message":"could not read task detail"}))
                     }
                 }
             }
-            Ok(Request::Subscribe) => {
+            Ok(BridgeInput::Request(Request::Subscribe)) => {
                 subscribed = true;
                 last_snapshot = None;
+                last_status = None;
                 response(json!({"kind":"subscribed"}));
             }
-            Ok(Request::StartTask {
+            Ok(BridgeInput::Request(Request::StartTask {
                 request_id,
                 provider,
                 summary,
                 prompt,
-            }) => {
-                if let Some(task) = accepted_submissions.get(&request_id) {
-                    response(
-                        json!({"kind":"task_start_result","requestId":request_id,"accepted":true,"task":task}),
-                    );
-                    continue;
-                }
-                let result = match root.as_deref() {
-                    Some(root) => runtime.block_on(start_task(
-                        &repository,
-                        program.clone(),
-                        root,
-                        provider,
-                        summary,
-                        prompt,
-                        &mut owned_tasks,
-                    )),
-                    None => Err("repository is unavailable or invalid"),
-                };
-                match result {
-                    Ok(task) => {
-                        accepted_submissions.insert(request_id.clone(), task);
-                        response(
-                            json!({"kind":"task_start_result","requestId":request_id,"accepted":true,"task":accepted_submissions.get(&request_id)}),
-                        );
+            })) => {
+                let (directive, prompt) = parse_provider_directive(
+                    &prompt,
+                    &provider_settings
+                        .snapshot()
+                        .providers
+                        .iter()
+                        .map(|item| item.id.to_string())
+                        .collect::<Vec<_>>(),
+                );
+                let provider = directive.unwrap_or(provider);
+                let fingerprint = request_fingerprint(
+                    &json!({"provider":provider,"summary":summary,"prompt":prompt}),
+                );
+                match reserve_mutation(
+                    &runtime,
+                    &repository,
+                    &request_id,
+                    "start_task",
+                    &fingerprint,
+                ) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(
+                            |_| json!({"kind":"error","message":"stored task response is invalid"}),
+                        ));
+                        continue;
                     }
-                    Err(message) => response(
-                        json!({"kind":"task_start_result","requestId":request_id,"accepted":false,"message":message}),
-                    ),
+                    Ok(SupervisorRequestReservation::Pending) => {
+                        response(
+                            json!({"kind":"task_start_result","requestId":request_id,"accepted":false,"message":"the prior task request has an unproven outcome; durable state must be reconciled"}),
+                        );
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::New) => {}
+                    Err(()) => {
+                        response(
+                            json!({"kind":"task_start_result","requestId":request_id,"accepted":false,"message":"the request ID conflicts with an existing durable intent"}),
+                        );
+                        continue;
+                    }
+                }
+                let result = supervisor
+                    .as_mut()
+                    .ok_or("repository is unavailable or invalid")
+                    .and_then(|supervisor| {
+                        runtime
+                            .block_on(supervisor.start_configured_task(
+                                Some(&provider),
+                                summary,
+                                prompt,
+                            ))
+                            .map(task_dto)
+                            .map_err(|error| match error {
+                                sentinel_supervisor::SupervisorError::RecoveryRequired => {
+                                    "the active task requires recovery"
+                                }
+                                sentinel_supervisor::SupervisorError::Ownership => {
+                                    "repository or worktree ownership could not be proven"
+                                }
+                                sentinel_supervisor::SupervisorError::ProviderUnavailable => {
+                                    "selected provider is unavailable"
+                                }
+                                _ => "task submission was rejected by the Rust supervisor",
+                            })
+                    });
+                let payload = match result {
+                    Ok(task) => {
+                        json!({"kind":"task_start_result","requestId":request_id,"accepted":true,"task":task})
+                    }
+                    Err(message) => {
+                        json!({"kind":"task_start_result","requestId":request_id,"accepted":false,"message":message})
+                    }
+                };
+                if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                    response(payload);
+                } else {
+                    response(
+                        json!({"kind":"error","message":"task response could not be durably confirmed"}),
+                    );
                 }
             }
-            Ok(Request::AttentionAction {
+            Ok(BridgeInput::Request(Request::AttentionAction {
                 request_id,
                 action,
                 task_id,
                 approval_id,
-            }) => {
-                if let Some(result) = completed_actions.get(&request_id) {
-                    response(result.clone());
-                    continue;
-                }
-                let result = runtime.block_on(perform_attention_action(
+            })) => {
+                let fingerprint = request_fingerprint(
+                    &json!({"action":action,"task_id":task_id,"approval_id":approval_id}),
+                );
+                match reserve_mutation(
+                    &runtime,
                     &repository,
-                    &mut owned_tasks,
-                    action,
-                    task_id,
-                    approval_id,
-                ));
+                    &request_id,
+                    "attention_action",
+                    &fingerprint,
+                ) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(|_| {
+                            json!({"kind":"error","message":"stored action response is invalid"})
+                        }));
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::Pending) => {
+                        response(
+                            json!({"kind":"attention_action_result","requestId":request_id,"accepted":false,"message":"the prior action has an unproven outcome and will not be replayed"}),
+                        );
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::New) => {}
+                    Err(()) => {
+                        response(
+                            json!({"kind":"attention_action_result","requestId":request_id,"accepted":false,"message":"the request ID conflicts with an existing durable intent"}),
+                        );
+                        continue;
+                    }
+                }
+                let result = match supervisor.as_mut() {
+                    Some(supervisor) => runtime.block_on(perform_attention_action(
+                        supervisor,
+                        action,
+                        task_id,
+                        approval_id,
+                    )),
+                    None => Err("repository is unavailable or invalid"),
+                };
                 let payload = match result {
                     Ok(()) => {
                         json!({"kind":"attention_action_result","requestId":request_id,"accepted":true})
@@ -892,78 +1198,218 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         json!({"kind":"attention_action_result","requestId":request_id,"accepted":false,"message":message})
                     }
                 };
-                completed_actions.insert(request_id, payload.clone());
-                response(payload);
+                if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                    response(payload);
+                } else {
+                    response(
+                        json!({"kind":"error","message":"action response could not be durably confirmed"}),
+                    );
+                }
             }
-            Ok(Request::ProviderSettingsMutation {
+            Ok(BridgeInput::Request(Request::SetRepository { request_id, path })) => {
+                let fingerprint = request_fingerprint(&json!({"path":path}));
+                match reserve_mutation(
+                    &runtime,
+                    &repository,
+                    &request_id,
+                    "set_repository",
+                    &fingerprint,
+                ) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(|_| {
+                            json!({"kind":"error","message":"stored settings response is invalid"})
+                        }));
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::Pending) => {
+                        response(
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"the prior settings request has an unproven outcome and will not be replayed"}),
+                        );
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::New) => {}
+                    Err(()) => {
+                        response(
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"the request ID conflicts with an existing durable intent"}),
+                        );
+                        continue;
+                    }
+                }
+                let requested = PathBuf::from(&path);
+                let active_blocks_change = supervisor.as_ref().is_some_and(|current| {
+                    runtime
+                        .block_on(current.active_task())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|task| !task.lifecycle.terminal())
+                });
+                let next = if path.is_empty() || path.len() > 4096 || path.contains('\0') {
+                    Err("repository path is invalid")
+                } else if active_blocks_change
+                    && root.as_deref() != requested.canonicalize().ok().as_deref()
+                {
+                    Err("an active task prevents changing repositories")
+                } else {
+                    build_supervisor(
+                        &runtime,
+                        &repository,
+                        &requested,
+                        &worktree_root,
+                        &programs,
+                        &provider_settings,
+                    )
+                    .ok_or("repository is unavailable or not a primary checkout")
+                };
+                match next {
+                    Ok(next) => {
+                        let confirmed = next.primary_root().to_owned();
+                        config.repository_root = Some(confirmed.clone());
+                        config.version = config.version.saturating_add(1);
+                        if save_config(&native_config_path, &config).is_err() {
+                            let payload = json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"repository setting could not be persisted"});
+                            if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                                response(payload);
+                            } else {
+                                response(
+                                    json!({"kind":"error","message":"settings response could not be durably confirmed"}),
+                                );
+                            }
+                            continue;
+                        }
+                        root = Some(confirmed);
+                        supervisor = Some(next);
+                        let payload = match runtime.block_on(settings_snapshot(
+                            supervisor.as_ref(),
+                            root.as_deref(),
+                            config.version,
+                            &provider_settings,
+                        )) {
+                            Ok(settings) => {
+                                json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":true,"settings":settings})
+                            }
+                            Err(_) => {
+                                json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"confirmed settings could not be loaded"})
+                            }
+                        };
+                        if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                            response(payload);
+                        } else {
+                            response(
+                                json!({"kind":"error","message":"settings response could not be durably confirmed"}),
+                            );
+                        }
+                    }
+                    Err(message) => {
+                        let payload = json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":message});
+                        if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                            response(payload);
+                        } else {
+                            response(
+                                json!({"kind":"error","message":"settings response could not be durably confirmed"}),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(BridgeInput::Request(Request::ProviderSettingsMutation {
                 request_id,
                 mutation,
-            }) => {
-                let fingerprint = serde_json::to_string(&mutation).unwrap_or_default();
-                if let Some((previous_fingerprint, result)) =
-                    completed_provider_mutations.get(&request_id)
-                {
-                    if previous_fingerprint == &fingerprint {
-                        response(result.clone());
-                    } else {
-                        response(
-                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"the request ID conflicts with an existing provider settings intent"}),
-                        );
+            })) => {
+                let fingerprint =
+                    request_fingerprint(&serde_json::to_value(&mutation).unwrap_or(Value::Null));
+                match reserve_mutation(
+                    &runtime,
+                    &repository,
+                    &request_id,
+                    "provider_settings_mutation",
+                    &fingerprint,
+                ) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(|_| {
+                            json!({"kind":"error","message":"stored provider settings response is invalid"})
+                        }));
+                        continue;
                     }
-                    continue;
+                    Ok(SupervisorRequestReservation::Pending) => {
+                        response(
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"the prior provider settings request has an unproven outcome and will not be replayed"}),
+                        );
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::New) => {}
+                    Err(()) => {
+                        response(
+                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"the request ID conflicts with an existing durable intent"}),
+                        );
+                        continue;
+                    }
                 }
                 let payload = match apply_provider_settings_mutation(&provider_settings, mutation) {
-                    Ok(()) => match runtime.block_on(settings_snapshot(
-                        &repository,
-                        root.as_deref(),
-                        &provider_settings,
-                    )) {
-                        Ok(settings) => {
-                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":true,"settings":settings})
+                    Ok(()) => {
+                        let runtime_update = supervisor
+                            .as_mut()
+                            .map(|supervisor| {
+                                provider_settings
+                                    .build_registry(program.is_some(), claude.is_some())
+                                    .map_err(|_| "provider registry could not be rebuilt")
+                                    .and_then(|registry| {
+                                        supervisor
+                                            .update_provider_runtime(
+                                                Arc::new(registry),
+                                                provider_settings.snapshot().workflow,
+                                            )
+                                            .map_err(|_| "provider routing could not be applied")
+                                    })
+                            })
+                            .transpose();
+                        match runtime_update {
+                            Err(message) => {
+                                json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":message})
+                            }
+                            Ok(_) => match runtime.block_on(settings_snapshot(
+                                supervisor.as_ref(),
+                                root.as_deref(),
+                                config.version,
+                                &provider_settings,
+                            )) {
+                                Ok(settings) => {
+                                    json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":true,"settings":settings})
+                                }
+                                Err(_) => {
+                                    json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"confirmed provider settings could not be loaded"})
+                                }
+                            },
                         }
-                        Err(_) => {
-                            json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":"confirmed provider settings could not be loaded"})
-                        }
-                    },
+                    }
                     Err(message) => {
                         json!({"kind":"settings_mutation_result","requestId":request_id,"accepted":false,"message":message})
                     }
                 };
-                completed_provider_mutations.insert(request_id, (fingerprint, payload.clone()));
-                response(payload);
-            }
-            Ok(Request::Supervisor {
-                command,
-                approval_id,
-                approve,
-            }) => {
-                let result = match (command.as_str(), approval_id, approve) {
-                    ("decide_final_approval", Some(approval_id), Some(approve)) => runtime
-                        .block_on(FinalApprovalSupervisor::require_human_approval(
-                            repository.clone(),
-                            &ApprovalId(approval_id),
-                            approve,
-                        ))
-                        .map_err(|_| ()),
-                    _ => Err(()),
-                };
-                response(if result.is_ok() {
-                    json!({"kind":"supervisor_result","ok":true})
+                if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                    response(payload);
                 } else {
-                    json!({"kind":"supervisor_result","ok":false,"message":"command was rejected by the Rust supervisor"})
-                });
+                    response(
+                        json!({"kind":"error","message":"provider settings response could not be durably confirmed"}),
+                    );
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) if subscribed => {
-                match runtime.block_on(attention_state(&repository, &owned_tasks)) {
+            Ok(BridgeInput::WorkflowChanged) if subscribed => {
+                if let Some(supervisor) = supervisor.as_mut() {
+                    let _ = runtime.block_on(supervisor.reconcile_progress());
+                }
+                match runtime.block_on(attention_state(supervisor.as_ref())) {
                     Ok(attention) => {
                         let snapshot = serde_json::to_string(&attention).unwrap_or_default();
                         if last_snapshot.as_ref() != Some(&snapshot) {
                             last_snapshot = Some(snapshot);
                             response(json!({"kind":"attention_update","attention":attention}));
                         }
-                        if let Ok(status) =
-                            runtime.block_on(status_snapshot(&repository, &mut usage))
-                        {
+                        if let Ok(status) = runtime.block_on(status_snapshot(
+                            &repository,
+                            supervisor.as_ref(),
+                            &mut usage,
+                            false,
+                        )) {
                             let snapshot = serde_json::to_string(&status).unwrap_or_default();
                             if last_status.as_ref() != Some(&snapshot) {
                                 last_status = Some(snapshot);
@@ -976,8 +1422,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(BridgeInput::ProviderStatusChanged) if subscribed => {
+                if let Ok(status) = runtime.block_on(status_snapshot(
+                    &repository,
+                    supervisor.as_ref(),
+                    &mut usage,
+                    false,
+                )) {
+                    let snapshot = serde_json::to_string(&status).unwrap_or_default();
+                    if last_status.as_ref() != Some(&snapshot) {
+                        last_status = Some(snapshot);
+                        response(json!({"kind":"status_update","status":status}));
+                    }
+                }
+            }
+            Ok(BridgeInput::WorkflowChanged | BridgeInput::ProviderStatusChanged) => {}
+            Ok(BridgeInput::Shutdown) => break,
+            Err(_) => break,
         }
     }
     Ok(())
@@ -987,6 +1448,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use sentinel_provider_api::{CredentialStore, MemoryCredentialStore};
+    use std::{fs, sync::Arc};
 
     #[test]
     fn bridge_requests_are_narrow_and_typed() {
@@ -1011,6 +1473,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_slash_directive_selects_configured_worker_and_strips_only_the_directive() {
+        let providers = vec![
+            "codex".to_owned(),
+            "claude_code".to_owned(),
+            "kimi".to_owned(),
+            "glm".to_owned(),
+        ];
+        assert_eq!(
+            parse_provider_directive("/kimi implement this", &providers),
+            (Some("kimi".into()), "implement this".into())
+        );
+        assert_eq!(
+            parse_provider_directive("/claude review this", &providers),
+            (Some("claude_code".into()), "review this".into())
+        );
+        assert_eq!(
+            parse_provider_directive("/unknown remains task text", &providers),
+            (None, "/unknown remains task text".into())
+        );
+    }
+
+    #[test]
     fn attention_actions_are_typed_and_do_not_accept_arbitrary_commands() {
         assert!(matches!(
             serde_json::from_str::<Request>(
@@ -1025,7 +1509,29 @@ mod tests {
     }
 
     #[test]
-    fn provider_settings_requests_never_return_plaintext_keys() {
+    fn repository_setting_is_typed_and_persisted_without_secret_fields() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"set_repository","request_id":"setting-1","path":"/repo"}"#
+            ),
+            Ok(Request::SetRepository { .. })
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-config.json");
+        let config = NativeConfig {
+            version: 4,
+            repository_root: Some(PathBuf::from("/repo")),
+        };
+        save_config(&path, &config).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("/repo"));
+        assert!(!persisted.to_ascii_lowercase().contains("token"));
+        assert_eq!(load_config(&path).version, 4);
+        assert_eq!(load_config(&path).repository_root, config.repository_root);
+    }
+
+    #[test]
+    fn provider_settings_requests_are_typed_and_never_return_plaintext_keys() {
         let request = serde_json::from_str::<Request>(
             r#"{"kind":"provider_settings_mutation","request_id":"provider-1","mutation":{"action":"set_credential","provider_id":"glm","api_key":"super-secret-api-key"}}"#,
         )
@@ -1040,6 +1546,7 @@ mod tests {
         let Request::ProviderSettingsMutation { mutation, .. } = request else {
             panic!("expected provider settings mutation");
         };
+
         apply_provider_settings_mutation(&store, mutation).unwrap();
         let snapshot = serde_json::to_string(&store.snapshot()).unwrap();
         assert!(snapshot.contains("configured"));
@@ -1056,7 +1563,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_provider_mutations_fail_closed() {
+    fn invalid_provider_mutations_fail_closed_without_changing_confirmed_state() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProviderSettingsStore::load(
             directory.path().join("api-providers.json"),
@@ -1064,28 +1571,69 @@ mod tests {
         )
         .unwrap();
         let before = store.snapshot();
-        assert!(apply_provider_settings_mutation(
-            &store,
-            ProviderSettingsMutation::SetModel {
-                provider_id: ProviderId::new("missing").unwrap(),
-                model_id: "model".into(),
-            },
-        )
-        .is_err());
+        let mutation = ProviderSettingsMutation::SetModel {
+            provider_id: ProviderId::new("missing").unwrap(),
+            model_id: "model".into(),
+        };
+        assert!(apply_provider_settings_mutation(&store, mutation).is_err());
         assert_eq!(store.snapshot(), before);
+
         assert!(serde_json::from_str::<Request>(
             r#"{"kind":"provider_settings_mutation","request_id":"provider-2","mutation":{"action":"run_executable","path":"/tmp/script"}}"#,
         )
         .is_err());
     }
 
-    #[test]
-    fn native_usage_database_is_isolated_from_workflow_state() {
-        let workflow = PathBuf::from("/tmp/phase2.sqlite3");
-        assert_eq!(
-            usage_database_path(&workflow),
-            PathBuf::from("/tmp/phase2-codex-usage.sqlite3")
+    #[tokio::test]
+    async fn live_codex_usage_refresh_replaces_the_previous_percentage() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-codex.py");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/python3
+import json, sys
+used = 23
+for raw in sys.stdin:
+    request = json.loads(raw)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion":"1"}
+    elif method == "account/rateLimits/read":
+        used += 1
+        result = {"rateLimits":{"primary":{"usedPercent":used,"resetsAt":1999999999}}}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let repository = RunRepository::open(&format!(
+            "sqlite://{}",
+            directory.path().join("usage.sqlite3").display()
+        ))
+        .await
+        .unwrap();
+        let (changes, _receiver) = mpsc::channel();
+        let mut collector = CodexUsageCollector::new(
+            CodexProgram::from_executable(executable).ok(),
+            repository,
+            Some(directory.path().to_path_buf()),
+            changes,
         );
-        assert_ne!(usage_database_path(&workflow), workflow);
+        assert_eq!(
+            collector.rate_limits(true).await.unwrap()["primary"]["usedPercent"],
+            24
+        );
+        assert_eq!(
+            collector.rate_limits(true).await.unwrap()["primary"]["usedPercent"],
+            25
+        );
     }
 }

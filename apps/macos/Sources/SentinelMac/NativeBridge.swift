@@ -1,5 +1,9 @@
 import Foundation
 
+extension Notification.Name {
+    static let sentinelAttentionActionAccepted = Notification.Name("sentinelAttentionActionAccepted")
+}
+
 struct NativeTask: Codable, Equatable {
     let id: String
     let summary: String
@@ -249,6 +253,22 @@ struct AttentionActionGate {
     }
 }
 
+struct SettingsMutationGate {
+    private(set) var pendingRequestID: String?
+
+    mutating func begin(requestID: String) -> Bool {
+        guard pendingRequestID == nil else { return false }
+        pendingRequestID = requestID
+        return true
+    }
+
+    mutating func complete(requestID: String) -> Bool {
+        guard pendingRequestID == requestID else { return false }
+        pendingRequestID = nil
+        return true
+    }
+}
+
 struct AttentionUpdateGate {
     private(set) var current: NativeAttention?
 
@@ -276,7 +296,11 @@ struct DetailUpdateGate {
 struct StatusUpdateGate {
     private(set) var current: NativeStatus?
     mutating func apply(_ update: NativeStatus) -> Bool {
-        guard update.version >= (current?.version ?? 0) else { return false }
+        if let existing = current,
+           update.version < existing.version,
+           update.activeTask == nil || existing.activeTask?.id == update.activeTask?.id {
+            return false
+        }
         current = update
         return true
     }
@@ -287,22 +311,6 @@ struct SettingsUpdateGate {
     mutating func apply(_ update: NativeSettings) -> Bool {
         guard update.version >= (current?.version ?? 0) else { return false }
         current = update
-        return true
-    }
-}
-
-struct SettingsMutationGate {
-    private(set) var pendingRequestID: String?
-
-    mutating func begin(requestID: String) -> Bool {
-        guard pendingRequestID == nil else { return false }
-        pendingRequestID = requestID
-        return true
-    }
-
-    mutating func complete(requestID: String) -> Bool {
-        guard pendingRequestID == requestID else { return false }
-        pendingRequestID = nil
         return true
     }
 }
@@ -321,10 +329,9 @@ enum BridgeMessage: Decodable, Equatable {
     case settings(NativeSettings)
     case settingsMutationResult(requestID: String, accepted: Bool, settings: NativeSettings?, message: String?)
     case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
-    case supervisorResult(Bool)
     case unavailable(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, task, ok, message, repository, providers, requestId, accepted, attention, detail, status, settings }
+    private enum CodingKeys: String, CodingKey { case kind, task, message, repository, providers, requestId, accepted, attention, detail, status, settings }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -342,7 +349,6 @@ enum BridgeMessage: Decodable, Equatable {
         case "settings": self = .settings(try values.decode(NativeSettings.self, forKey: .settings))
         case "settings_mutation_result": self = .settingsMutationResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), settings: try values.decodeIfPresent(NativeSettings.self, forKey: .settings), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "task_start_result": self = .taskStartResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), task: try values.decodeIfPresent(NativeTask.self, forKey: .task), message: try values.decodeIfPresent(String.self, forKey: .message))
-        case "supervisor_result": self = .supervisorResult(try values.decode(Bool.self, forKey: .ok))
         default: self = .unavailable(try values.decodeIfPresent(String.self, forKey: .message) ?? "Native bridge unavailable")
         }
     }
@@ -370,6 +376,7 @@ final class NativeBridge: ObservableObject {
     private var output: FileHandle?
     private var connectionState = BridgeConnectionState()
     private var reconnectScheduled = false
+    private var stopped = false
     private var outputBuffer = BridgeLineBuffer()
     private var submissionGate = TaskSubmissionGate()
     private var attentionActionGate = AttentionActionGate()
@@ -380,14 +387,17 @@ final class NativeBridge: ObservableObject {
     private var settingsMutationGate = SettingsMutationGate()
     private var settingsMutationSuccessMessage = "Settings updated."
     private var activeTaskUpdateGate = TaskUpdateGate()
+    private var codexUsageRetryGate = CodexUsageRetryGate()
+    private var restoreFocusAfterAttentionAction = false
 
     func start() {
-        guard process == nil else { return }
+        guard !stopped, process == nil else { return }
         guard let executable = bridgeExecutable() else {
             availabilityMessage = "Native bridge is not bundled yet. Build sentinel-native-bridge for development."
             return
         }
         let generation = connectionState.began()
+        codexUsageRetryGate.reset()
         let process = Process()
         process.executableURL = executable
         process.arguments = [appDataDirectory().appending(path: "phase2.sqlite3").path()]
@@ -419,11 +429,22 @@ final class NativeBridge: ObservableObject {
         }
     }
 
-    func decideFinalApproval(id: String, approve: Bool) {
-        send(["kind": "supervisor", "command": "decide_final_approval", "approval_id": id, "approve": approve])
+    func stop() {
+        stopped = true
+        reconnectScheduled = false
+        _ = connectionState.began()
+        output?.readabilityHandler = nil
+        input?.closeFile()
+        input = nil
+        output = nil
+        if process?.isRunning == true {
+            process?.terminate()
+        }
+        process = nil
+        bridgeConnected = false
     }
 
-    func requestAttentionAction(_ action: String) {
+    func requestAttentionAction(_ action: String, restoreFocusAfterAcceptance: Bool = false) {
         let task = attention?.task ?? taskDetail?.task
         let actions = attention?.actions ?? taskDetail?.actions
         guard let task else {
@@ -437,6 +458,7 @@ final class NativeBridge: ObservableObject {
         }
         attentionActionInFlight = true
         attentionActionMessage = nil
+        restoreFocusAfterAttentionAction = restoreFocusAfterAcceptance
         var request: [String: Any] = ["kind": "attention_action", "request_id": requestID, "action": action, "task_id": task.id]
         if (action == "approve" || action == "reject"), let approvalID = actions?.approvalID {
             request["approval_id"] = approvalID
@@ -444,6 +466,7 @@ final class NativeBridge: ObservableObject {
         guard send(request) else {
             _ = attentionActionGate.complete(requestID: requestID)
             attentionActionInFlight = false
+            restoreFocusAfterAttentionAction = false
             attentionActionMessage = "Native bridge is unavailable."
             return
         }
@@ -456,6 +479,23 @@ final class NativeBridge: ObservableObject {
 
     func loadStatus() { _ = send(["kind": "status"]) }
     func loadSettings() { _ = send(["kind": "settings"]) }
+
+    func setRepository(_ path: String) {
+        let requestID = UUID().uuidString.lowercased()
+        guard settingsMutationGate.begin(requestID: requestID) else {
+            settingsMutationMessage = "A settings change is already in progress."
+            return
+        }
+        settingsMutationInFlight = true
+        settingsMutationSuccessMessage = "Repository updated."
+        settingsMutationMessage = nil
+        guard send(["kind": "set_repository", "request_id": requestID, "path": path]) else {
+            _ = settingsMutationGate.complete(requestID: requestID)
+            settingsMutationInFlight = false
+            settingsMutationMessage = "Native bridge is unavailable."
+            return
+        }
+    }
 
     func setAPIProviderEnabled(_ providerID: String, enabled: Bool) {
         mutateProviderSettings(
@@ -565,6 +605,7 @@ final class NativeBridge: ObservableObject {
         case .status(let status), .statusUpdate(let status):
             guard statusUpdateGate.apply(status) else { return }
             self.status = statusUpdateGate.current
+            scheduleCodexUsageRetryIfNeeded(status, generation: generation)
         case .settings(let settings):
             guard settingsUpdateGate.apply(settings) else { return }
             self.settings = settingsUpdateGate.current
@@ -575,13 +616,21 @@ final class NativeBridge: ObservableObject {
                 self.settings = settingsUpdateGate.current
                 repositoryContext = settings.repository
                 settingsMutationMessage = settingsMutationSuccessMessage
+                _ = send(["kind": "capabilities"])
             } else {
-                settingsMutationMessage = message ?? "Provider setting was rejected."
+                settingsMutationMessage = message ?? "Repository setting was rejected."
             }
         case .attentionActionResult(let requestID, let accepted, let message):
             guard attentionActionGate.complete(requestID: requestID) else { return }
             attentionActionInFlight = false
             attentionActionMessage = accepted ? "Action accepted." : (message ?? "Action was rejected.")
+            if accepted {
+                NotificationCenter.default.post(
+                    name: .sentinelAttentionActionAccepted,
+                    object: restoreFocusAfterAttentionAction
+                )
+            }
+            restoreFocusAfterAttentionAction = false
         case .capabilities(let repository, let providers):
             repositoryContext = repository
             self.providers = providers
@@ -594,7 +643,7 @@ final class NativeBridge: ObservableObject {
                 taskSubmission = .rejected(message ?? "Task submission was rejected.")
             }
         case .unavailable(let message): availabilityMessage = String(message.prefix(240))
-        case .subscribed, .supervisorResult: break
+        case .subscribed: break
         }
     }
 
@@ -647,6 +696,7 @@ final class NativeBridge: ObservableObject {
             attentionActionInFlight = false
             attentionActionMessage = "Native bridge disconnected before the action was confirmed."
         }
+        restoreFocusAfterAttentionAction = false
         if settingsMutationInFlight {
             settingsMutationInFlight = false
             settingsMutationMessage = "Native bridge disconnected before the setting was confirmed."
@@ -658,12 +708,12 @@ final class NativeBridge: ObservableObject {
     }
 
     private func scheduleReconnect() {
-        guard !reconnectScheduled, bridgeExecutable() != nil else { return }
+        guard !stopped, !reconnectScheduled, bridgeExecutable() != nil else { return }
         reconnectScheduled = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             guard let self else { return }
             self.reconnectScheduled = false
-            self.start()
+            if !self.stopped { self.start() }
         }
     }
 
@@ -673,6 +723,21 @@ final class NativeBridge: ObservableObject {
         statusUpdateGate = StatusUpdateGate()
         settingsUpdateGate = SettingsUpdateGate()
         activeTaskUpdateGate = TaskUpdateGate()
+        codexUsageRetryGate.reset()
+    }
+
+    private func scheduleCodexUsageRetryIfNeeded(_ status: NativeStatus, generation: UInt64) {
+        let verified = status.codex.rateLimits?["primary"].map {
+            (0...100).contains($0.usedPercent)
+        } == true
+        guard codexUsageRetryGate.observe(hasVerifiedUsage: verified) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.connectionState.accepts(generation), self.bridgeConnected else {
+                return
+            }
+            self.codexUsageRetryGate.fired()
+            self.loadStatus()
+        }
     }
 
     private func refreshSnapshots(generation: UInt64) {

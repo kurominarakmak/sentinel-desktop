@@ -10,12 +10,16 @@ type Json = Record<string, unknown>;
 
 const object = (value: unknown): Json | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Json : null;
 const percent = (value: unknown): number | null => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
-const text = (value: unknown): string | null => typeof value === "string" && value.trim() ? value : null;
+const resetTime = (value: unknown): string | null => {
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return new Date(value * 1000).toISOString();
+  return null;
+};
 
 function window(id: UsageWindow["id"], value: unknown): UsageWindow | null {
   const entry = object(value); if (!entry) return null;
   const usedPercent = percent(entry.usedPercent ?? entry.used_percentage);
-  const resetsAt = text(entry.resetsAt ?? entry.resets_at);
+  const resetsAt = resetTime(entry.resetsAt ?? entry.resets_at);
   if (usedPercent === null || !resetsAt) return null;
   const duration = entry.windowDurationMins ?? entry.window_duration_mins;
   return { id, usedPercent, resetsAt, ...(typeof duration === "number" && duration > 0 ? { windowDurationMins: duration } : {}) };

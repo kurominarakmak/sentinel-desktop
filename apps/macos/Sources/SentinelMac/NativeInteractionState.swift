@@ -104,3 +104,29 @@ enum CodexTrayTitle {
         return String(format: "%.0f%%", usedPercent)
     }
 }
+
+struct CodexUsageRetryGate {
+    private(set) var remainingAttempts = 3
+    private(set) var scheduled = false
+
+    mutating func observe(hasVerifiedUsage: Bool) -> Bool {
+        if hasVerifiedUsage {
+            remainingAttempts = 0
+            scheduled = false
+            return false
+        }
+        guard remainingAttempts > 0, !scheduled else { return false }
+        remainingAttempts -= 1
+        scheduled = true
+        return true
+    }
+
+    mutating func fired() {
+        scheduled = false
+    }
+
+    mutating func reset() {
+        remainingAttempts = 3
+        scheduled = false
+    }
+}

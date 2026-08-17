@@ -10,7 +10,9 @@ use sentinel_core::{
     CoreError, RunRepository,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -43,18 +45,45 @@ pub enum ClaudeInstallation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaudeProgram {
     executable: PathBuf,
+    digest: [u8; 32],
 }
 impl ClaudeProgram {
     pub fn from_executable(executable: impl Into<PathBuf>) -> Result<Self, ClaudeError> {
-        let executable = executable.into();
-        executable
-            .is_file()
-            .then_some(Self { executable })
-            .ok_or(ClaudeError::MissingExecutable)
+        let executable = executable
+            .into()
+            .canonicalize()
+            .map_err(|_| ClaudeError::MissingExecutable)?;
+        let digest = executable_digest(&executable).ok_or(ClaudeError::MissingExecutable)?;
+        Ok(Self { executable, digest })
     }
     pub fn executable(&self) -> &Path {
         &self.executable
     }
+    fn verified_executable(&self) -> Result<&Path, ClaudeError> {
+        let canonical = self
+            .executable
+            .canonicalize()
+            .map_err(|_| ClaudeError::MissingExecutable)?;
+        if canonical != self.executable || executable_digest(&canonical) != Some(self.digest) {
+            return Err(ClaudeError::MissingExecutable);
+        }
+        Ok(&self.executable)
+    }
+}
+
+fn executable_digest(path: &Path) -> Option<[u8; 32]> {
+    std::fs::metadata(path).ok()?.is_file().then_some(())?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Some(hasher.finalize().into())
 }
 pub async fn detect_installation(executable: impl Into<PathBuf>) -> ClaudeInstallation {
     let executable = executable.into();
@@ -130,7 +159,17 @@ impl ClaudeProcess {
         cwd: &Path,
         prompt: &str,
     ) -> Result<(Self, ClaudeSession), ClaudeError> {
-        Self::spawn(program, repository, task_id, cwd, prompt, None).await
+        Self::spawn(program, repository, task_id, cwd, prompt, None, false).await
+    }
+    /// Runs Claude as a reviewer with tools disabled in an isolated cwd.
+    pub async fn start_read_only(
+        program: ClaudeProgram,
+        repository: RunRepository,
+        task_id: TaskId,
+        cwd: &Path,
+        prompt: &str,
+    ) -> Result<(Self, ClaudeSession), ClaudeError> {
+        Self::spawn(program, repository, task_id, cwd, prompt, None, true).await
     }
     pub async fn resume(
         program: ClaudeProgram,
@@ -148,6 +187,7 @@ impl ClaudeProcess {
             cwd,
             prompt,
             Some(provider_session_id),
+            false,
         )
         .await
     }
@@ -158,6 +198,7 @@ impl ClaudeProcess {
         cwd: &Path,
         prompt: &str,
         resume: Option<&str>,
+        read_only: bool,
     ) -> Result<(Self, ClaudeSession), ClaudeError> {
         if !cwd.is_dir() || prompt.trim().is_empty() || prompt.len() > 8000 || prompt.contains('\0')
         {
@@ -171,7 +212,7 @@ impl ClaudeProcess {
             .last()
             .map(|event| event.sequence_number)
             .unwrap_or(0);
-        let mut command = Command::new(program.executable());
+        let mut command = Command::new(program.verified_executable()?);
         command
             .arg("--print")
             .arg("--output-format")
@@ -179,6 +220,9 @@ impl ClaudeProcess {
             .arg("--verbose");
         if let Some(id) = resume {
             command.arg("--resume").arg(id);
+        }
+        if read_only {
+            command.arg("--tools").arg("");
         }
         command
             .arg(prompt)

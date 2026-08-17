@@ -6,7 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [.executable(name: "SentinelMac", targets: ["SentinelMac"])],
     targets: [
-        .executableTarget(name: "SentinelMac"),
+        .executableTarget(name: "SentinelMac", exclude: ["Resources"]),
         .testTarget(name: "SentinelMacTests", dependencies: ["SentinelMac"]),
     ]
 )

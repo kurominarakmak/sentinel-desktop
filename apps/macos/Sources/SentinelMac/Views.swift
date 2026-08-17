@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 extension Notification.Name {
@@ -8,7 +9,7 @@ struct QuickPromptView: View {
     @ObservedObject var bridge: NativeBridge
     let accepted: () -> Void
     @State private var prompt = ""
-    @State private var provider = "codex"
+    @State private var provider = "configured"
     @FocusState private var promptFocused: Bool
 
     private var sending: Bool {
@@ -35,13 +36,19 @@ struct QuickPromptView: View {
                     Text("Repository unavailable").font(.caption).foregroundStyle(.orange)
                 }
                 HStack(spacing: SentinelTokens.compactSpacing) {
-                    ForEach(bridge.providers) { capability in
-                        Button(capability.label) { provider = capability.id }
-                            .buttonStyle(.bordered)
-                            .tint(provider == capability.id ? SentinelTokens.accent : .secondary)
-                            .disabled(!capability.available || sending)
-                            .accessibilityLabel("Use \(capability.label)")
+                    Text("Implement with")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("Implementer", selection: $provider) {
+                        ForEach(bridge.providers) { capability in
+                            Text(capability.label)
+                                .tag(capability.id)
+                                .disabled(!capability.available)
+                        }
                     }
+                    .labelsHidden()
+                    .disabled(sending)
+                    .accessibilityLabel("Implementation provider")
                 }
                 TextField("Describe a task…", text: $prompt, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
@@ -49,12 +56,15 @@ struct QuickPromptView: View {
                     .focused($promptFocused)
                     .onSubmit(send)
                 HStack {
-                    Text("⌘↩ to send · Esc to hide").font(.caption).foregroundStyle(.secondary)
+                    Text("⌘↩ send · /codex /claude /kimi /glm /gemini · Esc hide")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                     Spacer()
                     Button(sending ? "Sending…" : "Send", action: send)
                         .keyboardShortcut(.return, modifiers: .command)
                         .sentinelPrimaryButtonStyle()
-                        .disabled(sending || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bridge.providers.first(where: { $0.id == provider })?.available != true)
+                        .disabled(sending || bridge.repositoryContext == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bridge.providers.first(where: { $0.id == provider })?.available != true)
                 }
                 if let feedback {
                     if sending {
@@ -68,6 +78,12 @@ struct QuickPromptView: View {
         .frame(width: SentinelTokens.panelWidth)
         .onAppear { promptFocused = true }
         .onReceive(NotificationCenter.default.publisher(for: .sentinelQuickPromptShown)) { _ in promptFocused = true }
+        .onChange(of: bridge.providers) { _, providers in
+            if !providers.contains(where: { $0.id == provider && $0.available }),
+               let replacement = providers.first(where: \.available) {
+                provider = replacement.id
+            }
+        }
         .onChange(of: bridge.taskSubmission) { _, state in
             if case .accepted = state {
                 prompt = ""
@@ -130,9 +146,9 @@ struct AttentionWidgetView: View {
     @ViewBuilder
     private func actions(_ actions: AttentionActions) -> some View {
         HStack(spacing: SentinelTokens.compactSpacing) {
-            if actions.stop { Button("Stop") { bridge.requestAttentionAction("stop") }.disabled(bridge.attentionActionInFlight) }
-            if actions.approve { Button("Approve") { bridge.requestAttentionAction("approve") }.disabled(bridge.attentionActionInFlight) }
-            if actions.reject { Button("Reject") { bridge.requestAttentionAction("reject") }.disabled(bridge.attentionActionInFlight) }
+            if actions.stop { Button("Stop") { bridge.requestAttentionAction("stop", restoreFocusAfterAcceptance: true) }.disabled(bridge.attentionActionInFlight) }
+            if actions.approve { Button("Approve") { bridge.requestAttentionAction("approve", restoreFocusAfterAcceptance: true) }.disabled(bridge.attentionActionInFlight) }
+            if actions.reject { Button("Reject") { bridge.requestAttentionAction("reject", restoreFocusAfterAcceptance: true) }.disabled(bridge.attentionActionInFlight) }
             Spacer()
             Button("Open Task Detail", action: openDetail)
                 .keyboardShortcut(.return)
@@ -399,6 +415,7 @@ struct SettingsView: View {
             .padding()
         }
         .frame(minWidth: 460, idealWidth: 520, minHeight: 400, idealHeight: 470)
+        .scrollIndicators(.visible)
         .onAppear { bridge.loadSettings() }
         .onDisappear { shortcutController.cancelRecording() }
     }
@@ -408,6 +425,18 @@ struct SettingsView: View {
             shortcutSettings()
             settingRow("Default provider", settings.defaultProvider.capitalized)
             settingRow("Repository", settings.repository ?? "No repository context")
+            HStack {
+                Button("Choose Repository…", action: chooseRepository)
+                    .disabled(bridge.settingsMutationInFlight)
+                if bridge.settingsMutationInFlight { ProgressView().controlSize(.small) }
+                Spacer()
+            }
+            if let message = bridge.settingsMutationMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(message == "Repository updated." ? Color.secondary : Color.red)
+                    .lineLimit(2)
+            }
         }
     }
 
@@ -448,15 +477,28 @@ struct SettingsView: View {
         }
     }
 
+    private func chooseRepository() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a Git Repository"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        bridge.setRepository(url.path)
+    }
+
     private func providers(_ settings: NativeSettings) -> some View {
         settingsSection("Providers") {
+            if let apiProviders = settings.providerSettings {
+                APIProviderSettingsSection(snapshot: apiProviders, bridge: bridge)
+                Divider()
+            }
+            Text("CLI-owned providers")
+                .font(.caption.weight(.semibold))
             provider(settings.codex)
             Divider()
             provider(settings.claude)
-            if let apiProviders = settings.providerSettings {
-                Divider()
-                APIProviderSettingsSection(snapshot: apiProviders, bridge: bridge)
-            }
         }
     }
 

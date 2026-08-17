@@ -178,6 +178,30 @@ fn message_value(message: &ProviderMessage) -> Value {
     if let Some(tool_call_id) = &message.tool_call_id {
         value.insert("tool_call_id".into(), Value::String(tool_call_id.clone()));
     }
+    if let Some(name) = &message.name {
+        value.insert("name".into(), Value::String(name.clone()));
+    }
+    if !message.tool_calls.is_empty() {
+        value.insert(
+            "tool_calls".into(),
+            Value::Array(
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id":call.id,
+                            "type":"function",
+                            "function":{
+                                "name":call.name,
+                                "arguments":serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
+                            }
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
     Value::Object(value)
 }
 

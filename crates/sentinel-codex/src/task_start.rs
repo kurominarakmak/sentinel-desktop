@@ -1,6 +1,8 @@
 //! Shared Codex V3 task-start supervisor used by desktop presentation shells.
 
-use crate::{CodexAppServer, CodexError, CodexProgram, CodexSession, CodexTurn};
+use crate::{
+    CodexAppServer, CodexError, CodexProgram, CodexSession, CodexThreadState, CodexTurn, PROVIDER,
+};
 use sentinel_core::{
     v3::{CreateTask, SessionLifecycle, Task, TaskLifecycle},
     RunRepository,
@@ -82,6 +84,13 @@ pub struct CodexTaskStarter {
     repository: RunRepository,
 }
 
+pub enum CodexTaskReconciliation {
+    Resumed(StartedCodexTask),
+    Inactive,
+    Missing,
+    Ambiguous,
+}
+
 impl CodexTaskStarter {
     pub fn new(program: Option<CodexProgram>, repository: RunRepository) -> Self {
         Self {
@@ -120,6 +129,23 @@ impl CodexTaskStarter {
             .transition_task(&task, TaskLifecycle::Preparing, now_ms())
             .await
             .map_err(|_| CodexError::Storage)?;
+        self.start_prepared_task(task, cwd).await
+    }
+
+    /// Starts a provider thread for an already prepared Sentinel task.
+    ///
+    /// The workflow supervisor uses this entry point only after it has created
+    /// and reconciled the task's owned worktree. Keeping task creation separate
+    /// from provider startup prevents presentation bridges from accidentally
+    /// starting Codex in the primary checkout.
+    pub async fn start_prepared_task(
+        &self,
+        task: Task,
+        cwd: &Path,
+    ) -> Result<StartedCodexTask, CodexError> {
+        if task.lifecycle != TaskLifecycle::Preparing || !cwd.is_dir() {
+            return Err(CodexError::InvalidInput);
+        }
         let program = self.program.clone().ok_or(CodexError::MissingExecutable)?;
         let server =
             CodexAppServer::start(program, self.repository.clone(), task.id.clone(), cwd).await?;
@@ -164,6 +190,100 @@ impl CodexTaskStarter {
             turn: None,
             repository: self.repository.clone(),
         })
+    }
+
+    /// Reconciles exactly one persisted Sentinel-owned Codex thread after a
+    /// restart. It never creates a replacement thread. Only provider-inspected
+    /// active state can move the durable task out of recovery.
+    pub async fn reconcile_recovering_task(
+        &self,
+        task: Task,
+        cwd: &Path,
+    ) -> Result<CodexTaskReconciliation, CodexError> {
+        if task.lifecycle != TaskLifecycle::Recovering || !cwd.is_dir() {
+            return Err(CodexError::InvalidInput);
+        }
+        let durable = self
+            .repository
+            .v3()
+            .list_sessions_for_task(&task.id)
+            .await
+            .map_err(|_| CodexError::Storage)?
+            .into_iter()
+            .filter(|session| session.provider == PROVIDER)
+            .collect::<Vec<_>>();
+        if durable.len() != 1 {
+            return Ok(CodexTaskReconciliation::Missing);
+        }
+        let program = self.program.clone().ok_or(CodexError::MissingExecutable)?;
+        let mut server =
+            CodexAppServer::start(program, self.repository.clone(), task.id.clone(), cwd).await?;
+        let provider_ref = durable[0].provider_session_ref.clone();
+        match server.inspect_thread(&provider_ref).await? {
+            CodexThreadState::Inactive => {
+                let _ = server.shutdown().await;
+                Ok(CodexTaskReconciliation::Inactive)
+            }
+            CodexThreadState::Missing => {
+                let _ = server.shutdown().await;
+                Ok(CodexTaskReconciliation::Missing)
+            }
+            CodexThreadState::Ambiguous => {
+                let _ = server.shutdown().await;
+                Ok(CodexTaskReconciliation::Ambiguous)
+            }
+            CodexThreadState::Resumable => {
+                let session = server.resume_thread(&provider_ref).await?;
+                if session.session_id != durable[0].id {
+                    let _ = server.shutdown().await;
+                    return Ok(CodexTaskReconciliation::Ambiguous);
+                }
+                let stored = self
+                    .repository
+                    .v3()
+                    .get_session(&session.session_id)
+                    .await
+                    .map_err(|_| CodexError::Storage)?;
+                if stored.lifecycle == SessionLifecycle::RecoveryRequired {
+                    self.repository
+                        .v3()
+                        .transition_session(&stored, SessionLifecycle::Active, now_ms())
+                        .await
+                        .map_err(|_| CodexError::Storage)?;
+                }
+                let turn = self
+                    .repository
+                    .v3()
+                    .list_events(&task.id)
+                    .await
+                    .map_err(|_| CodexError::Storage)?
+                    .into_iter()
+                    .rev()
+                    .find_map(|event| {
+                        event
+                            .payload
+                            .get("turn_id")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.is_empty())
+                            .map(|turn_id| CodexTurn {
+                                turn_id: turn_id.into(),
+                            })
+                    });
+                let task = self
+                    .repository
+                    .v3()
+                    .transition_task(&task, TaskLifecycle::Implementing, now_ms())
+                    .await
+                    .map_err(|_| CodexError::Storage)?;
+                Ok(CodexTaskReconciliation::Resumed(StartedCodexTask {
+                    task,
+                    server,
+                    session,
+                    turn,
+                    repository: self.repository.clone(),
+                }))
+            }
+        }
     }
 }
 

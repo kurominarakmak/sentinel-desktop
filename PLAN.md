@@ -16,17 +16,17 @@ V3 adds a supervisor-owned durable workflow that maps supported Codex and Claude
 
 ## Ordered V3 delivery
 
-| Phase | Outcome | Exit criterion |
+| Phase | Outcome | Status |
 | --- | --- | --- |
-| 1 | Unified event and durable task model | **Complete.** Versioned events, replay, state transitions, additive SQLite migration, and fail-closed restart recovery pass contract tests. |
-| 2 | Native Codex adapter | Supported Codex interface starts, streams, cancels, resumes/recoverably reconciles, and passes adapter fixtures. |
-| 3 | Native Claude Code adapter | Supported Claude Code CLI/session interface meets the same bounded contract. |
-| 4 | Worktree task transactions | Create/diff/merge/discard/rollback/cleanup are ownership-bound and protect the main tree. |
-| 5 | Validation and command profiles | Configurable deterministic checks execute in the worktree with durable artifacts. |
-| 6 | Read-only review and bounded repair | Structured review findings and capped repair rounds reach a reliable final-decision boundary. |
-| 7 | Attention widget and approval surfaces | Ambient controls expose truthful status and require confirmed approval for consequential actions. |
-| 8 | Recovery, security, and license hardening | Restart, permission, artifact redaction, provenance, and license gates pass. |
-| 9 | Final UI redesign | The end-to-end V3 workflow is usable without disrupting the current app. |
+| 1 | Unified event and durable task model | Complete |
+| 2 | Native Codex adapter | Complete with documented provider limitations |
+| 3 | Native Claude Code adapter | Complete with authentication-limited live validation |
+| 4 | Worktree task transactions | Complete |
+| 5 | Validation and command profiles | Complete |
+| 6 | Read-only review and bounded repair | Complete |
+| 7 | Attention widget and approval surfaces | Complete in Tauri; native presentation implemented in parallel |
+| 8 | Recovery, security, and provenance hardening | Complete |
+| 9 | Final Tauri UI redesign | Complete |
 
 Detailed phase scope, dependencies, validation, rollback, commit boundaries, and deferrals are in [V3 implementation plan](docs/v3-implementation-plan.md).
 
@@ -36,6 +36,8 @@ Cloud synchronization, teams, remote execution, automatic pull requests, IDE/bro
 
 ## Current implementation position
 
-Phase 1 is implemented in `sentinel-core` only. It adds a provider-neutral V3 task aggregate, append-only normalized event envelopes, session/approval/validation/finding/repair/artifact records, and additive SQLite persistence. Restart reconciliation marks unfinished non-draft tasks `Recovering` and active sessions `RecoveryRequired`; it never assumes that an external agent process survived or infers completion. The React UI and provider adapters remain non-authoritative and unchanged.
-
-Only Phase 2 may begin next, after focused authorization: a supported Codex adapter that supplies normalized events to the Phase 1 supervisor store. No later phase has started.
+The V3 Rust workflow is implemented through the human-approval boundary. The
+native SwiftUI/AppKit frontend now runs in parallel with Tauri and remains
+presentation-only through `sentinel-native-bridge`. Native replacement is a
+parity and release decision, not a backend rewrite; Tauri remains available
+until native interaction QA and distribution requirements are accepted.

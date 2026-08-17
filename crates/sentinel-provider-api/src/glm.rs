@@ -250,6 +250,7 @@ mod tests {
                 content: "hello".into(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: Vec::new(),
             }],
             tools: vec![ToolDefinition {
                 name: "read_file".into(),

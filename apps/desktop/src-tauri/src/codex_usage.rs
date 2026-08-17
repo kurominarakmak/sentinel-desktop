@@ -39,6 +39,10 @@ impl CodexUsageManager {
         if owned.as_ref().is_some_and(CodexAppServer::is_alive) {
             return Ok(());
         }
+        // A child has exited (or this is a new manager).  Never expose a
+        // snapshot from that dead connection while a replacement starts.
+        let _ = self.latest.send(None);
+        *owned = None;
         let Some(program) = self.program.clone() else {
             return Err(CodexError::MissingExecutable);
         };
@@ -93,6 +97,7 @@ impl CodexUsageManager {
         if let Some(mut server) = self.server.lock().await.take() {
             server.shutdown().await?;
         }
+        let _ = self.latest.send(None);
         Ok(())
     }
 
@@ -229,6 +234,7 @@ mod tests {
         let pid = manager.pid_for_test().await.unwrap();
         manager.shutdown().await.unwrap();
         assert_eq!(manager.pid_for_test().await, None);
+        assert!(manager.subscribe().borrow().is_none());
         assert!(!is_running(pid));
         manager.shutdown().await.unwrap();
     }

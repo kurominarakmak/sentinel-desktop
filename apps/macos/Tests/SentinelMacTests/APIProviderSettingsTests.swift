@@ -74,4 +74,32 @@ final class APIProviderSettingsTests: XCTestCase {
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("apiKey"))
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("executable"))
     }
+
+    func testWorkflowRoleSelectionHonorsRustReportedCapabilities() {
+        let provider = APIProviderSettingsItem(
+            id: "custom.review",
+            displayName: "Review Only",
+            modelId: "review-model",
+            supportedModels: nil,
+            baseUrl: "https://models.example/v1",
+            enabled: true,
+            capabilities: APIProviderCapabilities(
+                streaming: true,
+                cancellation: true,
+                toolCalling: false,
+                structuredOutput: true,
+                modelSelection: true,
+                rateLimits: false,
+                implementation: false,
+                readOnlyReview: true,
+                repair: false
+            ),
+            credentialState: "configured",
+            custom: true
+        )
+
+        XCTAssertFalse(provider.supportsWorkflowRole("implementer"))
+        XCTAssertTrue(provider.supportsWorkflowRole("reviewer"))
+        XCTAssertFalse(provider.supportsWorkflowRole("repair"))
+    }
 }

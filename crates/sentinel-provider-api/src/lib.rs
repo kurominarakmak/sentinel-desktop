@@ -20,6 +20,7 @@ use std::{
 use thiserror::Error;
 use tokio::{sync::Notify, task::JoinHandle};
 
+pub mod agent;
 pub mod gemini;
 pub mod glm;
 pub mod kimi;
@@ -209,6 +210,8 @@ pub struct ProviderMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -275,6 +278,22 @@ impl ProviderRequest {
             if message.content.len() > 2 * 1024 * 1024 || message.content.contains('\0') {
                 return Err(ProviderError::InvalidRequest(
                     "message content is invalid or too large".into(),
+                ));
+            }
+            if message.role != MessageRole::Assistant && !message.tool_calls.is_empty() {
+                return Err(ProviderError::InvalidRequest(
+                    "only assistant messages may contain tool calls".into(),
+                ));
+            }
+            if message.role == MessageRole::Tool
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(ProviderError::InvalidRequest(
+                    "tool results require a tool call ID".into(),
                 ));
             }
         }
@@ -1253,6 +1272,7 @@ mod tests {
                 content: "hello".into(),
                 tool_call_id: None,
                 name: None,
+                tool_calls: Vec::new(),
             }],
             tools: Vec::new(),
             response_format: ResponseFormat::Text,

@@ -9,8 +9,10 @@ use sentinel_core::{
     CoreError, RunRepository,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    io::Read,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -29,7 +31,7 @@ use tokio::{
 };
 
 pub mod task_start;
-pub use task_start::{CodexTaskStarter, StartedCodexTask};
+pub use task_start::{CodexTaskReconciliation, CodexTaskStarter, StartedCodexTask};
 
 pub const PROVIDER: &str = "openai.codex.app_server";
 pub const MAX_JSON_LINE_BYTES: usize = 16 * 1024;
@@ -72,18 +74,45 @@ pub enum CodexInstallation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexProgram {
     executable: PathBuf,
+    digest: [u8; 32],
 }
 impl CodexProgram {
     pub fn from_executable(executable: impl Into<PathBuf>) -> Result<Self, CodexError> {
-        let executable = executable.into();
-        executable
-            .is_file()
-            .then_some(Self { executable })
-            .ok_or(CodexError::MissingExecutable)
+        let executable = executable
+            .into()
+            .canonicalize()
+            .map_err(|_| CodexError::MissingExecutable)?;
+        let digest = executable_digest(&executable).ok_or(CodexError::MissingExecutable)?;
+        Ok(Self { executable, digest })
     }
     pub fn executable(&self) -> &Path {
         &self.executable
     }
+    fn verified_executable(&self) -> Result<&Path, CodexError> {
+        let canonical = self
+            .executable
+            .canonicalize()
+            .map_err(|_| CodexError::MissingExecutable)?;
+        if canonical != self.executable || executable_digest(&canonical) != Some(self.digest) {
+            return Err(CodexError::MissingExecutable);
+        }
+        Ok(&self.executable)
+    }
+}
+
+fn executable_digest(path: &Path) -> Option<[u8; 32]> {
+    std::fs::metadata(path).ok()?.is_file().then_some(())?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Some(hasher.finalize().into())
 }
 pub async fn detect_installation(executable: impl Into<PathBuf>) -> CodexInstallation {
     let executable = executable.into();
@@ -158,6 +187,14 @@ pub struct CodexTurn {
     pub turn_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexThreadState {
+    Resumable,
+    Inactive,
+    Missing,
+    Ambiguous,
+}
+
 /// The supported account-rate-limit payload, retained verbatim only after its
 /// two documented windows have passed basic shape validation.
 #[derive(Clone, Debug, PartialEq)]
@@ -175,10 +212,10 @@ fn rate_limits(value: &Value) -> Option<CodexRateLimits> {
                     .get("usedPercent")
                     .and_then(Value::as_f64)
                     .is_some_and(|used| (0.0..=100.0).contains(&used))
-                    && window
-                        .get("resetsAt")
-                        .and_then(Value::as_str)
-                        .is_some_and(|reset| !reset.is_empty())
+                    && window.get("resetsAt").is_some_and(|reset| {
+                        reset.as_str().is_some_and(|value| !value.is_empty())
+                            || reset.as_i64().is_some_and(|value| value > 0)
+                    })
             })
     };
     (valid_window("primary") || valid_window("secondary")).then(|| CodexRateLimits(limits.clone()))
@@ -273,7 +310,7 @@ impl CodexAppServer {
             .last()
             .map(|event| event.sequence_number)
             .unwrap_or(0);
-        let mut command = Command::new(program.executable());
+        let mut command = Command::new(program.verified_executable()?);
         command
             .arg("app-server")
             .current_dir(cwd)
@@ -396,6 +433,32 @@ impl CodexAppServer {
         self.session_from_result_with_fallback(result, thread_id, EventKind::SessionResumed)
             .await
     }
+    /// Inspects one persisted Sentinel-owned thread without creating or
+    /// resuming it. Unknown response shapes remain ambiguous and therefore
+    /// cannot be used to infer recovery success.
+    pub async fn inspect_thread(&self, thread_id: &str) -> Result<CodexThreadState, CodexError> {
+        valid_id(thread_id)?;
+        match self
+            .request(
+                "thread/read",
+                json!({"threadId":thread_id,"includeTurns":true}),
+            )
+            .await
+        {
+            Ok(snapshot) => Ok(classify_thread_snapshot(&snapshot, thread_id)),
+            Err(CodexError::RpcError) => {
+                let listed = self
+                    .request("thread/list", json!({"limit":100,"archived":false}))
+                    .await?;
+                Ok(if thread_list_contains(&listed, thread_id) {
+                    CodexThreadState::Ambiguous
+                } else {
+                    CodexThreadState::Missing
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
     async fn session_from_result(
         &self,
         result: Value,
@@ -465,6 +528,39 @@ impl CodexAppServer {
         session: &CodexSession,
         prompt: &str,
     ) -> Result<CodexTurn, CodexError> {
+        self.start_turn_with_policy(session, prompt, None).await
+    }
+
+    /// Starts a reviewer turn with an explicit provider read-only sandbox and
+    /// no approval requests. The caller should also use an isolated empty cwd;
+    /// no task-worktree path is supplied to the reviewer process.
+    pub async fn start_read_only_turn(
+        &self,
+        session: &CodexSession,
+        prompt: &str,
+        cwd: &Path,
+    ) -> Result<CodexTurn, CodexError> {
+        if !cwd.is_dir() {
+            return Err(CodexError::InvalidInput);
+        }
+        self.start_turn_with_policy(
+            session,
+            prompt,
+            Some(json!({
+                "cwd": cwd,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type":"readOnly","networkAccess":false}
+            })),
+        )
+        .await
+    }
+
+    async fn start_turn_with_policy(
+        &self,
+        session: &CodexSession,
+        prompt: &str,
+        policy: Option<Value>,
+    ) -> Result<CodexTurn, CodexError> {
         if prompt.trim().is_empty() || prompt.len() > 8000 || prompt.contains('\0') {
             return Err(CodexError::InvalidInput);
         }
@@ -473,12 +569,15 @@ impl CodexAppServer {
             .send(NotificationCommand::Activate(session.thread_id.clone()))
             .await
             .map_err(|_| CodexError::UnexpectedExit)?;
-        let result = self
-            .request(
-                "turn/start",
-                json!({"threadId":session.thread_id,"input":[{"type":"text","text":prompt}]}),
-            )
-            .await;
+        let mut params =
+            json!({"threadId":session.thread_id,"input":[{"type":"text","text":prompt}]});
+        if let Some(policy) = policy.and_then(|value| value.as_object().cloned()) {
+            params
+                .as_object_mut()
+                .expect("turn params are an object")
+                .extend(policy);
+        }
+        let result = self.request("turn/start", params).await;
         let result = match result {
             Ok(v) => v,
             Err(e) => {
@@ -633,6 +732,50 @@ impl CodexAppServer {
         )
         .await
     }
+}
+
+fn classify_thread_snapshot(value: &Value, expected_id: &str) -> CodexThreadState {
+    let Some(thread) = value.get("thread").and_then(Value::as_object) else {
+        return CodexThreadState::Ambiguous;
+    };
+    if thread
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id != expected_id)
+    {
+        return CodexThreadState::Ambiguous;
+    }
+    let turn_status = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .and_then(|turns| turns.last())
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str);
+    match turn_status {
+        Some("inProgress") => CodexThreadState::Resumable,
+        Some("completed" | "failed" | "interrupted" | "cancelled") => CodexThreadState::Inactive,
+        _ => match thread
+            .get("status")
+            .and_then(|status| status.get("type").or(Some(status)))
+            .and_then(Value::as_str)
+        {
+            Some("active") => CodexThreadState::Resumable,
+            Some("idle" | "completed" | "inactive") => CodexThreadState::Inactive,
+            _ => CodexThreadState::Ambiguous,
+        },
+    }
+}
+
+fn thread_list_contains(value: &Value, expected_id: &str) -> bool {
+    value
+        .get("data")
+        .or_else(|| value.get("threads"))
+        .and_then(Value::as_array)
+        .is_some_and(|threads| {
+            threads
+                .iter()
+                .any(|thread| thread.get("id").and_then(Value::as_str) == Some(expected_id))
+        })
 }
 impl Drop for CodexAppServer {
     fn drop(&mut self) {

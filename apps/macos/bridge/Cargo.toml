@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 sentinel-core = { path = "../../../crates/sentinel-core" }
 sentinel-review = { path = "../../../crates/sentinel-review" }
@@ -14,7 +16,6 @@ sentinel-codex = { path = "../../../crates/sentinel-codex" }
 sentinel-git = { path = "../../../crates/sentinel-git" }
 sentinel-agent-api = { path = "../../../crates/sentinel-agent-api" }
 sentinel-validation = { path = "../../../crates/sentinel-validation" }
+sentinel-supervisor = { path = "../../../crates/sentinel-supervisor" }
+sentinel-claude = { path = "../../../crates/sentinel-claude" }
 sentinel-provider-api = { path = "../../../crates/sentinel-provider-api" }
-
-[dev-dependencies]
-tempfile.workspace = true

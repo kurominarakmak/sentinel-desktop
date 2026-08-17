@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let bridge = NativeBridge()
     private var statusItem: NSStatusItem?
     private var quickPrompt: SentinelFloatingPanel?
@@ -25,6 +25,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installPanels()
         installGlobalShortcut()
         observeGlobalShortcut()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(attentionActionAccepted(_:)),
+            name: .sentinelAttentionActionAccepted,
+            object: nil
+        )
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(accessibilityDisplayOptionsChanged),
@@ -38,7 +44,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        .terminateCancel
+        .terminateNow
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        shortcutController.stop()
+        bridge.stop()
+        NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     private func installStatusItem() {
@@ -59,7 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         attentionMenuItem.target = self
         let settingsMenuItem = menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         settingsMenuItem.target = self
+        menu.addItem(.separator())
+        let quitItem = menu.addItem(withTitle: "Quit Agent Sentinel", action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
         item.menu = menu
+        menu.delegate = self
         statusItem = item
     }
 
@@ -71,22 +88,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatusItem(_ status: NativeStatus?) {
-        statusItem?.button?.title = CodexTrayTitle.make(status)
+        let title = CodexTrayTitle.make(status)
+        statusItem?.button?.title = title
+        statusItem?.button?.toolTip = title == "—" ? "Codex usage unavailable" : "Codex usage \(title)"
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        bridge.loadStatus()
     }
 
     private func codexTrayImage() -> NSImage? {
-        let sourceRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
         let candidates = [
             Bundle.main.url(forResource: "codex-tray", withExtension: "png"),
+            Bundle.main.url(forResource: "codex-mark", withExtension: "svg"),
             ProcessInfo.processInfo.environment["SENTINEL_CODEX_TRAY_ICON"].map(URL.init(fileURLWithPath:)),
-            sourceRoot.appendingPathComponent("apps/desktop/src-tauri/icons/codex-tray.png"),
         ].compactMap { $0 }
-        return candidates.lazy.compactMap(NSImage.init(contentsOf:)).first
+        return candidates.lazy.compactMap(NSImage.init(contentsOf:)).first.map { image in
+            image.isTemplate = true
+            image.accessibilityDescription = "Codex"
+            return image
+        }
     }
 
     private func installPanels() {
@@ -104,6 +125,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showQuickPrompt() { present(quickPrompt) }
     @objc func showAttention() { present(attention) }
+    @objc private func attentionActionAccepted(_ notification: Notification) {
+        if notification.object as? Bool == true {
+            attention?.hide()
+        } else {
+            attention?.orderOut(nil)
+        }
+    }
+    @objc private func quit() { NSApp.terminate(nil) }
 
     @objc func showStatus() {
         if statusWindow == nil {

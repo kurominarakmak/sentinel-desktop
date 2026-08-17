@@ -251,6 +251,7 @@ mod tests {
                         content: "hello".into(),
                         tool_call_id: None,
                         name: None,
+                        tool_calls: Vec::new(),
                     }],
                     tools: Vec::new(),
                     response_format: ResponseFormat::Text,

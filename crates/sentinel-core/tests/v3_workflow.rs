@@ -3,7 +3,7 @@ use sentinel_core::{
         ApprovalLifecycle, CreateApproval, CreateArtifact, CreateRepairRound, CreateReviewFinding,
         CreateSession, CreateTask, CreateValidationResult, EventId, EventKind, FindingDisposition,
         NormalizedEventEnvelope, RecoveryCondition, RepairRoundLifecycle, SessionLifecycle,
-        TaskLifecycle, ValidationLifecycle,
+        SupervisorRequestReservation, TaskLifecycle, ValidationLifecycle,
     },
     CoreError, RunRepository,
 };
@@ -444,6 +444,56 @@ async fn existing_v1_database_migrates_additively_and_corruption_fails_closed() 
     assert!(matches!(
         repository.v3().get_task(&task.id).await,
         Err(CoreError::CorruptV3State)
+    ));
+    drop(directory);
+}
+
+#[tokio::test]
+async fn supervisor_mutation_responses_are_durable_and_intent_bound() {
+    let (directory, url, repository) = repository().await;
+    assert_eq!(
+        repository
+            .v3()
+            .reserve_supervisor_request("request-1", "start_task", "sha256:one", TIME)
+            .await
+            .expect("reserve"),
+        SupervisorRequestReservation::New
+    );
+    assert_eq!(
+        repository
+            .v3()
+            .reserve_supervisor_request("request-1", "start_task", "sha256:one", TIME + 1)
+            .await
+            .expect("pending replay"),
+        SupervisorRequestReservation::Pending
+    );
+    repository
+        .v3()
+        .complete_supervisor_request(
+            "request-1",
+            r#"{"kind":"task_start_result","accepted":true}"#,
+            TIME + 2,
+        )
+        .await
+        .expect("complete");
+    drop(repository);
+    let reopened = RunRepository::open(&url).await.expect("reopen");
+    assert_eq!(
+        reopened
+            .v3()
+            .reserve_supervisor_request("request-1", "start_task", "sha256:one", TIME + 3)
+            .await
+            .expect("completed replay"),
+        SupervisorRequestReservation::Completed(
+            r#"{"kind":"task_start_result","accepted":true}"#.into()
+        )
+    );
+    assert!(matches!(
+        reopened
+            .v3()
+            .reserve_supervisor_request("request-1", "attention_action", "sha256:two", TIME + 4)
+            .await,
+        Err(CoreError::V3Conflict)
     ));
     drop(directory);
 }

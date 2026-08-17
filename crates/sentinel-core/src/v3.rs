@@ -7,6 +7,11 @@ use super::{CoreError, SqlitePool};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, Transaction};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 macro_rules! v3_id {
@@ -517,9 +522,34 @@ pub struct CreateArtifact {
     pub metadata: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SupervisorRequestReservation {
+    New,
+    Pending,
+    Completed(String),
+}
+
 #[derive(Clone)]
 pub struct V3Repository {
     pool: SqlitePool,
+    changes: V3ChangeNotifier,
+}
+
+#[derive(Clone)]
+pub(crate) struct V3ChangeNotifier {
+    sender: broadcast::Sender<u64>,
+    sequence: Arc<AtomicU64>,
+}
+
+impl V3ChangeNotifier {
+    pub(crate) fn new(sender: broadcast::Sender<u64>, sequence: Arc<AtomicU64>) -> Self {
+        Self { sender, sequence }
+    }
+
+    fn changed(&self) {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.sender.send(sequence);
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskWorktree {
@@ -570,6 +600,75 @@ pub struct TaskWorktreeCleanupOutcome {
     pub completed_at_ms: i64,
 }
 impl V3Repository {
+    /// Atomically reserves a presentation-layer mutation request. The stored
+    /// fingerprint contains no prompt/config text, and a completed response is
+    /// safe to replay after a bridge restart without repeating the mutation.
+    pub async fn reserve_supervisor_request(
+        &self,
+        request_id: &str,
+        request_kind: &str,
+        intent_fingerprint: &str,
+        timestamp: i64,
+    ) -> Result<SupervisorRequestReservation, CoreError> {
+        nonempty(request_id, 256)?;
+        nonempty(request_kind, 128)?;
+        nonempty(intent_fingerprint, 256)?;
+        let mut transaction = self.pool.begin().await.map_err(|_| CoreError::Storage)?;
+        let inserted = sqlx::query("INSERT OR IGNORE INTO v3_supervisor_requests (request_id,request_kind,intent_fingerprint,lifecycle,response_json,created_at_ms,completed_at_ms) VALUES (?,?,?,'pending',NULL,?,NULL)")
+            .bind(request_id)
+            .bind(request_kind)
+            .bind(intent_fingerprint)
+            .bind(timestamp)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .rows_affected();
+        if inserted == 1 {
+            transaction.commit().await.map_err(|_| CoreError::Storage)?;
+            return Ok(SupervisorRequestReservation::New);
+        }
+        let row = sqlx::query("SELECT request_kind,intent_fingerprint,lifecycle,response_json FROM v3_supervisor_requests WHERE request_id=?")
+            .bind(request_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| CoreError::Storage)?;
+        if row.get::<String, _>("request_kind") != request_kind
+            || row.get::<String, _>("intent_fingerprint") != intent_fingerprint
+        {
+            return Err(CoreError::V3Conflict);
+        }
+        let lifecycle = row.get::<String, _>("lifecycle");
+        let response = row.get::<Option<String>, _>("response_json");
+        transaction.commit().await.map_err(|_| CoreError::Storage)?;
+        match (lifecycle.as_str(), response) {
+            ("pending", None) => Ok(SupervisorRequestReservation::Pending),
+            ("completed", Some(response)) => Ok(SupervisorRequestReservation::Completed(response)),
+            _ => Err(CoreError::CorruptV3State),
+        }
+    }
+
+    pub async fn complete_supervisor_request(
+        &self,
+        request_id: &str,
+        response_json: &str,
+        timestamp: i64,
+    ) -> Result<(), CoreError> {
+        nonempty(request_id, 256)?;
+        nonempty(response_json, 64 * 1024)?;
+        serde_json::from_str::<Value>(response_json).map_err(|_| CoreError::InvalidV3Record)?;
+        let updated = sqlx::query("UPDATE v3_supervisor_requests SET lifecycle='completed',response_json=?,completed_at_ms=? WHERE request_id=? AND lifecycle='pending'")
+            .bind(response_json)
+            .bind(timestamp)
+            .bind(request_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?;
+        if updated.rows_affected() != 1 {
+            return Err(CoreError::V3Conflict);
+        }
+        Ok(())
+    }
+
     pub async fn get_task_worktree(&self, task_id: &TaskId) -> Result<TaskWorktree, CoreError> {
         let row = sqlx::query("SELECT task_id,repository_root,worktree_path,branch,base_commit,state FROM v3_task_worktrees WHERE task_id=?")
             .bind(task_id.to_string()).fetch_optional(&self.pool).await.map_err(|_| CoreError::Storage)?
@@ -615,6 +714,7 @@ impl V3Repository {
         }
         sqlx::query("INSERT INTO v3_task_worktrees (task_id,repository_root,worktree_path,branch,base_commit,state,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,'ready',?,?)")
             .bind(input.task_id.to_string()).bind(&input.repository_root).bind(&input.worktree_path).bind(&input.branch).bind(&input.base_commit).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         self.get_task_worktree(&input.task_id).await
     }
     pub async fn set_task_worktree_recovery_required(
@@ -631,6 +731,7 @@ impl V3Repository {
         if updated.rows_affected() != 1 {
             return Err(CoreError::NotFound);
         }
+        self.changes.changed();
         self.get_task_worktree(task_id).await
     }
     pub async fn save_task_worktree_merge_preparation(
@@ -640,6 +741,7 @@ impl V3Repository {
     ) -> Result<TaskWorktreeMergePreparation, CoreError> {
         sqlx::query("INSERT INTO v3_task_worktree_merge_preparations (task_id,target_branch,target_commit,worktree_commit,target_advanced,merge_ready,conflicts_json,diff_json,prepared_at_ms) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET target_branch=excluded.target_branch,target_commit=excluded.target_commit,worktree_commit=excluded.worktree_commit,target_advanced=excluded.target_advanced,merge_ready=excluded.merge_ready,conflicts_json=excluded.conflicts_json,diff_json=excluded.diff_json,prepared_at_ms=excluded.prepared_at_ms")
             .bind(input.task_id.to_string()).bind(&input.target_branch).bind(&input.target_commit).bind(&input.worktree_commit).bind(input.target_advanced).bind(input.merge_ready).bind(&input.conflicts_json).bind(&input.diff_json).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         self.get_task_worktree_merge_preparation(&input.task_id)
             .await
     }
@@ -696,10 +798,11 @@ impl V3Repository {
         }
         sqlx::query("INSERT INTO v3_task_worktree_cleanup_outcomes (task_id,state,reason,approval_id,completed_at_ms) VALUES (?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,reason=excluded.reason,approval_id=excluded.approval_id,completed_at_ms=excluded.completed_at_ms")
             .bind(task_id.to_string()).bind(state).bind(reason).bind(approval_id.map(ToString::to_string)).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         self.get_task_worktree_cleanup_outcome(task_id).await
     }
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: SqlitePool, changes: V3ChangeNotifier) -> Self {
+        Self { pool, changes }
     }
     pub async fn create_task(&self, input: CreateTask, timestamp: i64) -> Result<Task, CoreError> {
         nonempty(&input.workflow_id, 128)?;
@@ -719,6 +822,7 @@ impl V3Repository {
         };
         sqlx::query("INSERT INTO v3_tasks (id, project_id, workflow_id, summary, lifecycle, recovery_condition, recovery_previous_lifecycle, version, created_at_ms, updated_at_ms, terminal_at_ms) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL)")
             .bind(task.id.to_string()).bind(&task.project_id).bind(&task.workflow_id).bind(&task.summary).bind(enum_name(&task.lifecycle)).bind(enum_name(&task.recovery_condition)).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         Ok(task)
     }
     pub async fn get_task(&self, id: &TaskId) -> Result<Task, CoreError> {
@@ -764,6 +868,7 @@ impl V3Repository {
         if updated.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_task(&task.id).await
     }
     pub async fn append_event(&self, event: &NormalizedEventEnvelope) -> Result<(), CoreError> {
@@ -783,7 +888,9 @@ impl V3Repository {
             return Err(CoreError::V3Conflict);
         }
         insert_event(&mut tx, event).await?;
-        tx.commit().await.map_err(|_| CoreError::Storage)
+        tx.commit().await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
+        Ok(())
     }
     pub async fn transition_task_with_event(
         &self,
@@ -805,6 +912,7 @@ impl V3Repository {
         }
         insert_event(&mut tx, event).await?;
         tx.commit().await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         self.get_task(&task.id).await
     }
     pub async fn list_events(
@@ -840,6 +948,7 @@ impl V3Repository {
             terminal_at_ms: None,
         };
         sqlx::query("INSERT INTO v3_sessions (id, task_id, provider, provider_session_ref, lifecycle, recovery_condition, version, created_at_ms, updated_at_ms, terminal_at_ms) VALUES (?, ?, ?, ?, 'created', 'none', 0, ?, ?, NULL)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(&result.provider).bind(&result.provider_session_ref).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         Ok(result)
     }
     pub async fn get_session(&self, id: &SessionId) -> Result<AgentSession, CoreError> {
@@ -899,6 +1008,7 @@ impl V3Repository {
         if affected.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_session(&session.id).await
     }
     pub async fn create_approval(
@@ -920,6 +1030,7 @@ impl V3Repository {
             decided_at_ms: None,
         };
         sqlx::query("INSERT INTO v3_approvals (id, task_id, session_id, action_kind, summary, lifecycle, version, created_at_ms, decided_at_ms) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(result.session_id.as_ref().map(ToString::to_string)).bind(&result.action_kind).bind(&result.summary).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         Ok(result)
     }
     pub async fn get_approval(&self, id: &ApprovalId) -> Result<Approval, CoreError> {
@@ -956,6 +1067,7 @@ impl V3Repository {
         if result.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_approval(&approval.id).await
     }
     pub async fn create_validation_result(
@@ -978,6 +1090,7 @@ impl V3Repository {
             updated_at_ms: timestamp,
         };
         sqlx::query("INSERT INTO v3_validation_results (id,task_id,profile_id,check_name,required,lifecycle,summary,artifact_id,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,'pending',?,NULL,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(&result.profile_id).bind(&result.check_name).bind(result.required).bind(&result.summary).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
+        self.changes.changed();
         Ok(result)
     }
     pub async fn get_validation_result(
@@ -1018,6 +1131,7 @@ impl V3Repository {
         if result.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_validation_result(&value.id).await
     }
     pub async fn save_validation_execution(
@@ -1026,6 +1140,7 @@ impl V3Repository {
     ) -> Result<(), CoreError> {
         sqlx::query("INSERT INTO v3_validation_executions (validation_id,command_json,exit_code,duration_ms,stdout,stderr,outcome,started_at_ms,finished_at_ms) VALUES (?,?,?,?,?,?,?,?,?)")
             .bind(value.validation_id.to_string()).bind(&value.command_json).bind(value.exit_code).bind(value.duration_ms).bind(&value.stdout).bind(&value.stderr).bind(&value.outcome).bind(value.started_at_ms).bind(value.finished_at_ms).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
         Ok(())
     }
     pub async fn get_validation_execution(
@@ -1052,6 +1167,25 @@ impl V3Repository {
     }
     pub async fn recover_interrupted_validations(&self, timestamp: i64) -> Result<u64, CoreError> {
         let result = sqlx::query("UPDATE v3_validation_results SET lifecycle='incomplete',summary='interrupted by restart',updated_at_ms=? WHERE lifecycle='running'").bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        if result.rows_affected() > 0 {
+            self.changes.changed();
+        }
+        Ok(result.rows_affected())
+    }
+    pub async fn recover_interrupted_validations_for_task(
+        &self,
+        task_id: &TaskId,
+        timestamp: i64,
+    ) -> Result<u64, CoreError> {
+        let result = sqlx::query("UPDATE v3_validation_results SET lifecycle='incomplete',summary='interrupted by restart',updated_at_ms=? WHERE task_id=? AND lifecycle='running'")
+            .bind(timestamp)
+            .bind(task_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?;
+        if result.rows_affected() > 0 {
+            self.changes.changed();
+        }
         Ok(result.rows_affected())
     }
     pub async fn create_repair_round(
@@ -1069,6 +1203,7 @@ impl V3Repository {
             updated_at_ms: timestamp,
         };
         sqlx::query("INSERT INTO v3_repair_rounds (id,task_id,round_number,lifecycle,version,created_at_ms,updated_at_ms) VALUES (?,?,?,'pending',0,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(result.round_number).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
+        self.changes.changed();
         Ok(result)
     }
     pub async fn get_repair_round(&self, id: &RepairRoundId) -> Result<RepairRound, CoreError> {
@@ -1112,6 +1247,7 @@ impl V3Repository {
         if result.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_repair_round(&round.id).await
     }
     pub async fn create_review_finding(
@@ -1135,6 +1271,7 @@ impl V3Repository {
             updated_at_ms: timestamp,
         };
         sqlx::query("INSERT INTO v3_review_findings (id,task_id,repair_round_id,severity,disposition,summary,evidence_json,created_at_ms,updated_at_ms) VALUES (?,?,?,?, 'reported',?,?,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(result.repair_round_id.as_ref().map(ToString::to_string)).bind(&result.severity).bind(&result.summary).bind(evidence).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
+        self.changes.changed();
         Ok(result)
     }
     pub async fn get_review_finding(
@@ -1178,6 +1315,7 @@ impl V3Repository {
         if result.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_review_finding(&finding.id).await
     }
     pub async fn assign_review_finding_to_repair_round(
@@ -1198,6 +1336,7 @@ impl V3Repository {
         if result.rows_affected() != 1 {
             return Err(CoreError::V3Conflict);
         }
+        self.changes.changed();
         self.get_review_finding(&finding.id).await
     }
     pub async fn create_artifact(
@@ -1219,6 +1358,7 @@ impl V3Repository {
             created_at_ms: timestamp,
         };
         sqlx::query("INSERT INTO v3_artifacts (id,task_id,kind,display_name,content_hash,metadata_json,created_at_ms) VALUES (?,?,?,?,?,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(&result.kind).bind(&result.display_name).bind(&result.content_hash).bind(metadata).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
+        self.changes.changed();
         Ok(result)
     }
     pub async fn list_artifacts(&self, task_id: &TaskId) -> Result<Vec<Artifact>, CoreError> {
@@ -1241,8 +1381,37 @@ impl V3Repository {
             .transpose()?
             .ok_or(CoreError::NotFound)
     }
-    /// Moves active records into an explicit recovery state. It never assumes a
-    /// provider process survived the restart and never derives completion.
+    /// Moves one active record into an explicit recovery state. It never
+    /// assumes a provider process survived restart and never derives completion.
+    pub async fn restore_unfinished_task(
+        &self,
+        task_id: &TaskId,
+        timestamp: i64,
+    ) -> Result<Task, CoreError> {
+        let task = self.get_task(task_id).await?;
+        if task.lifecycle.terminal() || task.lifecycle == TaskLifecycle::Draft {
+            return Ok(task);
+        }
+        if task.lifecycle == TaskLifecycle::Recovering {
+            reconcile_task_sessions(&self.pool, &task.id, timestamp).await?;
+            return Ok(task);
+        }
+        let updated = self
+            .update_task(
+                &task,
+                TaskLifecycle::Recovering,
+                RecoveryCondition::NoLiveProcessAssumed,
+                Some(task.lifecycle),
+                timestamp,
+            )
+            .await?;
+        reconcile_task_sessions(&self.pool, &updated.id, timestamp).await?;
+        self.changes.changed();
+        Ok(updated)
+    }
+
+    /// Moves all active records into recovery. Repository-scoped supervisors
+    /// should prefer `restore_unfinished_task` for their owned tasks.
     pub async fn restore_unfinished_tasks(&self, timestamp: i64) -> Result<Vec<Task>, CoreError> {
         let tasks = self.list_tasks().await?;
         let mut restored = Vec::new();
@@ -1250,20 +1419,11 @@ impl V3Repository {
             .into_iter()
             .filter(|task| !task.lifecycle.terminal() && task.lifecycle != TaskLifecycle::Draft)
         {
-            if task.lifecycle == TaskLifecycle::Recovering {
-                reconcile_task_sessions(&self.pool, &task.id, timestamp).await?;
+            let was_recovering = task.lifecycle == TaskLifecycle::Recovering;
+            let updated = self.restore_unfinished_task(&task.id, timestamp).await?;
+            if was_recovering {
                 continue;
             }
-            let updated = self
-                .update_task(
-                    &task,
-                    TaskLifecycle::Recovering,
-                    RecoveryCondition::NoLiveProcessAssumed,
-                    Some(task.lifecycle),
-                    timestamp,
-                )
-                .await?;
-            reconcile_task_sessions(&self.pool, &updated.id, timestamp).await?;
             restored.push(updated)
         }
         Ok(restored)

@@ -82,6 +82,16 @@ impl ReviewSupervisor {
         main: &Path,
         reviewer: &dyn Reviewer,
     ) -> Result<ReviewReport, ReviewError> {
+        let packet = Self::build_packet(repository.clone(), task_id.clone(), main).await?;
+        let candidates = reviewer.review(&packet)?;
+        Self::persist_candidates(repository, task_id, &packet, candidates).await
+    }
+
+    pub async fn build_packet(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+    ) -> Result<ReviewPacket, ReviewError> {
         let task = repository.v3().get_task(&task_id).await.map_err(map_core)?;
         let worktree = WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
             .await
@@ -107,7 +117,7 @@ impl ReviewSupervisor {
                 outcome: execution.map(|v| v.outcome),
             });
         }
-        let packet = ReviewPacket {
+        Ok(ReviewPacket {
             task_id: task_id.to_string(),
             task_summary: task.summary,
             base_commit: worktree.base_commit,
@@ -116,8 +126,15 @@ impl ReviewSupervisor {
                 .map_err(|_| ReviewError::Reconciliation)?,
             changed_files: diff.files,
             validations: facts,
-        };
-        let candidates = reviewer.review(&packet)?;
+        })
+    }
+
+    pub async fn persist_candidates(
+        repository: RunRepository,
+        task_id: TaskId,
+        packet: &ReviewPacket,
+        candidates: Vec<ReviewCandidate>,
+    ) -> Result<ReviewReport, ReviewError> {
         if candidates.iter().any(|candidate| !valid(candidate)) {
             return Err(ReviewError::MalformedFinding);
         }

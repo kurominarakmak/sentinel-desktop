@@ -209,26 +209,40 @@ fn request_body(request: &ProviderRequest) -> Value {
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let input = request
+    let mut input = Vec::new();
+    for message in request
         .messages
         .iter()
         .filter(|message| message.role != MessageRole::System)
-        .map(|message| match message.role {
-            MessageRole::User => {
-                json!({"type":"user_input","content":[{"type":"text","text":message.content}]})
-            }
+    {
+        match message.role {
+            MessageRole::User => input.push(
+                json!({"type":"user_input","content":[{"type":"text","text":message.content}]}),
+            ),
             MessageRole::Assistant => {
-                json!({"type":"model_output","content":[{"type":"text","text":message.content}]})
+                if !message.content.is_empty() {
+                    input.push(
+                        json!({"type":"model_output","content":[{"type":"text","text":message.content}]}),
+                    );
+                }
+                input.extend(message.tool_calls.iter().map(|call| {
+                    json!({
+                        "type":"function_call",
+                        "name":call.name,
+                        "call_id":call.id,
+                        "arguments":call.arguments,
+                    })
+                }));
             }
-            MessageRole::Tool => json!({
+            MessageRole::Tool => input.push(json!({
                 "type":"function_result",
                 "name":message.name,
                 "call_id":message.tool_call_id,
                 "result":[{"type":"text","text":message.content}]
-            }),
+            })),
             MessageRole::System => unreachable!("system messages are filtered"),
-        })
-        .collect::<Vec<_>>();
+        }
+    }
     let mut body = Map::from_iter([
         ("model".into(), Value::String(request.model_id.clone())),
         ("input".into(), Value::Array(input)),
@@ -689,12 +703,14 @@ mod tests {
                     content: "Review only".into(),
                     tool_call_id: None,
                     name: None,
+                    tool_calls: Vec::new(),
                 },
                 ProviderMessage {
                     role: MessageRole::User,
                     content: "Inspect".into(),
                     tool_call_id: None,
                     name: None,
+                    tool_calls: Vec::new(),
                 },
             ],
             tools: vec![ToolDefinition {
@@ -767,6 +783,7 @@ mod tests {
             content: "result".into(),
             tool_call_id: Some("call".into()),
             name: None,
+            tool_calls: Vec::new(),
         };
         assert!(validate_tool_results(&[message]).is_err());
     }

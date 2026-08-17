@@ -147,6 +147,23 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(gate.current?.repository, "/repo")
     }
 
+    func testRepositoryMutationDecodesConfirmedSettingsAndGatePreventsDuplicates() throws {
+        let data = Data(#"{"kind":"settings_mutation_result","requestId":"setting-1","accepted":true,"settings":{"version":9,"globalShortcut":"Command+Shift+Space","repository":"/repo","defaultProvider":"codex","codex":{"name":"Codex","installation":"available","executableOverride":null,"supportsExecutableOverride":false,"authentication":"CLI-owned"},"claude":{"name":"Claude Code","installation":"unavailable","executableOverride":null,"supportsExecutableOverride":false,"authentication":"unavailable"},"validationProfiles":[],"validationError":null}}"#.utf8)
+        guard case .settingsMutationResult(let requestID, let accepted, let settings, let message) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected settings mutation")
+        }
+        XCTAssertEqual(requestID, "setting-1")
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(settings?.repository, "/repo")
+        XCTAssertNil(message)
+
+        var gate = SettingsMutationGate()
+        XCTAssertTrue(gate.begin(requestID: "setting-1"))
+        XCTAssertFalse(gate.begin(requestID: "setting-2"))
+        XCTAssertFalse(gate.complete(requestID: "stale"))
+        XCTAssertTrue(gate.complete(requestID: "setting-1"))
+    }
+
     func testSurfaceRegistryCreatesEachSurfaceOnlyOnce() {
         var registry = NativeSurfaceRegistry()
         XCTAssertTrue(registry.requestOpen(.quickPrompt))
@@ -223,5 +240,31 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(CodexTrayTitle.make(NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: codex, claude: claude)), "25%")
         XCTAssertEqual(CodexTrayTitle.make(nil), "—")
         XCTAssertEqual(CodexTrayTitle.make(NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: ["primary": RateLimitWindow(usedPercent: 101, resetsAt: nil, windowDurationMins: nil)]), claude: claude)), "—")
+    }
+
+    func testMissingCodexUsageRetriesAreBoundedAndStopAfterVerifiedSnapshot() {
+        var gate = CodexUsageRetryGate()
+        XCTAssertTrue(gate.observe(hasVerifiedUsage: false))
+        XCTAssertFalse(gate.observe(hasVerifiedUsage: false))
+        gate.fired()
+        XCTAssertTrue(gate.observe(hasVerifiedUsage: false))
+        gate.fired()
+        XCTAssertTrue(gate.observe(hasVerifiedUsage: false))
+        gate.fired()
+        XCTAssertFalse(gate.observe(hasVerifiedUsage: false))
+
+        gate.reset()
+        XCTAssertFalse(gate.observe(hasVerifiedUsage: true))
+        XCTAssertEqual(gate.remainingAttempts, 0)
+    }
+
+    func testStatusGateAcceptsNewTaskEvenWhenItsVersionRestartsLower() {
+        let provider = NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: nil)
+        let old = NativeStatus(version: 9, sentinel: "failed", activeTask: NativeTask(id: "old", summary: "Old", lifecycle: "failed", recoveryRequired: false, recoveryReason: nil, version: 9, updatedAtMs: 9), recoveryRequired: false, codex: provider, claude: provider)
+        let replacement = NativeStatus(version: 1, sentinel: "implementing", activeTask: NativeTask(id: "new", summary: "New", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 10), recoveryRequired: false, codex: provider, claude: provider)
+        var gate = StatusUpdateGate()
+        XCTAssertTrue(gate.apply(old))
+        XCTAssertTrue(gate.apply(replacement))
+        XCTAssertEqual(gate.current?.activeTask?.id, "new")
     }
 }

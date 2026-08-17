@@ -1,11 +1,13 @@
 pub const DEFAULT_GLOBAL_SHORTCUT: &str = "Command+Shift+Space";
 pub const PROMPT_WINDOW_LABEL: &str = "prompt";
 pub const STATUS_WINDOW_LABEL: &str = "status";
+pub const SETTINGS_WINDOW_LABEL: &str = "settings";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
     OpenPrompt,
     ShowStatus,
+    Settings,
     Quit,
     Ignore,
 }
@@ -14,6 +16,7 @@ pub fn tray_action(id: &str) -> TrayAction {
     match id {
         "open-prompt" => TrayAction::OpenPrompt,
         "show-status" => TrayAction::ShowStatus,
+        "settings" => TrayAction::Settings,
         "quit" => TrayAction::Quit,
         _ => TrayAction::Ignore,
     }
@@ -37,6 +40,7 @@ mod tests {
     fn tray_quit_is_distinct_from_opening_the_prompt() {
         assert_eq!(tray_action("open-prompt"), TrayAction::OpenPrompt);
         assert_eq!(tray_action("show-status"), TrayAction::ShowStatus);
+        assert_eq!(tray_action("settings"), TrayAction::Settings);
         assert_eq!(tray_action("quit"), TrayAction::Quit);
         assert_eq!(tray_action("unknown"), TrayAction::Ignore);
     }

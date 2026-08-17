@@ -5,4 +5,16 @@
 /apps/desktop/src-tauri/binaries/
 /target/
 /.DS_Store
-/.sentinel/local.toml
+/.sentinel/local.toml/
+.pnpm-store/
+apps/macos/Resources/
+apps/macos/Sources/SentinelMac/Resources/
+docs/
+*.log
+*.swp
+*~
+.env
+.env.local
+*.db
+*.db-shm
+*.db-wal
