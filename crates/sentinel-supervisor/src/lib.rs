@@ -317,6 +317,70 @@ impl SentinelSupervisor {
         self.start_with_selection(selection, summary, prompt).await
     }
 
+    /// Starts a new OMP turn/session in the existing owned worktree after an
+    /// interrupted run. It never resumes or replaces the prior OMP session.
+    pub async fn retry_interrupted_omp(
+        &mut self,
+        task_id: &TaskId,
+        prompt: String,
+    ) -> Result<(), SupervisorError> {
+        let task = self
+            .repository
+            .v3()
+            .get_task(task_id)
+            .await
+            .map_err(|_| SupervisorError::NotAvailable)?;
+        if task.recovery_condition == RecoveryCondition::None
+            || prompt.trim().is_empty()
+            || prompt.len() > 8_000
+            || prompt.contains('\0')
+        {
+            return Err(SupervisorError::NotAvailable);
+        }
+        let roles = self.roles_for_task(task_id).await?;
+        if roles.implementer.provider_id.as_str() != OMP_PROVIDER_ID {
+            return Err(SupervisorError::NotAvailable);
+        }
+        let worktree = self
+            .repository
+            .v3()
+            .get_task_worktree(task_id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        let program = self
+            .programs
+            .omp
+            .clone()
+            .ok_or(SupervisorError::ProviderUnavailable)?;
+        let (process, session) = OmpProcess::start(
+            program,
+            self.repository.clone(),
+            task_id.clone(),
+            Path::new(&worktree.worktree_path),
+            &roles.implementer.model_id,
+            &prompt,
+            false,
+        )
+        .await
+        .map_err(|_| SupervisorError::Provider)?;
+        activate_session(&self.repository, &session.session_id).await?;
+        let current = self
+            .repository
+            .v3()
+            .get_task(task_id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.repository
+            .v3()
+            .transition_task(&current, TaskLifecycle::Implementing, now_ms())
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.owned
+            .insert(task_id.clone(), OwnedProvider::Omp { process, session });
+        self.persist_reconciliation(task_id, "omp", "fresh_retry_started")
+            .await
+    }
+
     fn selection_for_provider(
         &self,
         provider: &str,
@@ -833,6 +897,7 @@ impl SentinelSupervisor {
     /// deterministic evidence. Calling it repeatedly is safe: durable state
     /// gates every stage and provider text never grants approval or completion.
     pub async fn reconcile_progress(&mut self) -> Result<(), SupervisorError> {
+        self.reconcile_interrupted_omp_runs().await?;
         self.reconcile_finished_api_runs().await?;
         let Some(task) = self.active_task().await? else {
             return Ok(());
@@ -879,6 +944,48 @@ impl SentinelSupervisor {
                 }
             }
             return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn reconcile_interrupted_omp_runs(&mut self) -> Result<(), SupervisorError> {
+        let omp_tasks = self
+            .owned
+            .iter()
+            .filter_map(|(task_id, provider)| {
+                matches!(provider, OwnedProvider::Omp { .. }).then(|| task_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut interrupted = Vec::new();
+        for task_id in omp_tasks {
+            if let Some(OwnedProvider::Omp { process, .. }) = self.owned.get_mut(&task_id) {
+                if process
+                    .poll_exit()
+                    .await
+                    .map_err(|_| SupervisorError::Provider)?
+                {
+                    interrupted.push(task_id);
+                }
+            }
+        }
+        for task_id in interrupted {
+            self.owned.remove(&task_id);
+            let task = self
+                .repository
+                .v3()
+                .get_task(&task_id)
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            if task.lifecycle.terminal() || self.implementer_turn_completed(&task_id).await? {
+                continue;
+            }
+            self.repository
+                .v3()
+                .restore_unfinished_task(&task_id, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            self.persist_reconciliation(&task_id, "omp", "interrupted_no_implicit_resume")
+                .await?;
         }
         Ok(())
     }
@@ -1830,6 +1937,13 @@ impl SentinelSupervisor {
                     // owned live child. Persist the uncertainty and keep the
                     // task recovery-required; never infer a successful resume.
                     self.persist_reconciliation(&task.id, "claude_code", "unproven")
+                        .await?;
+                }
+                OMP_PROVIDER => {
+                    // OMP RPC sessions are deliberately never resumed across a
+                    // Sentinel restart. The owned worktree and durable evidence
+                    // remain available for an explicit fresh retry.
+                    self.persist_reconciliation(&task.id, "omp", "interrupted_no_implicit_resume")
                         .await?;
                 }
                 _ => {

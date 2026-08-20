@@ -316,6 +316,30 @@ impl OmpProcess {
     pub async fn ensure_healthy(&self) -> Result<(), OmpError> {
         self.rpc.lock().await.late_error.clone().map_or(Ok(()), Err)
     }
+    /// Reports an owned child exit without deriving turn success from it.
+    pub async fn poll_exit(&mut self) -> Result<bool, OmpError> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|_| OmpError::UnexpectedExit)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.await;
+        }
+        let state = self.state.lock().await;
+        let session = state.session.clone();
+        let completed = state.completed;
+        drop(state);
+        if !completed {
+            if let Some(session) = session {
+                emit(&self.state, EventKind::SessionFailed, json!({"reason":"owned_process_exited_before_turn_completed","provider_session_id":session.provider_session_id})).await?;
+            }
+        }
+        Ok(true)
+    }
     pub async fn cancel(&mut self) -> Result<(), OmpError> {
         self.state.lock().await.cancelling = true;
         let frame = json!({"id":format!("abort-{}", now_ms()), "type":"abort"}).to_string() + "\n";
