@@ -881,7 +881,20 @@ impl SentinelSupervisor {
         )
         .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                let current = self
+                    .repository
+                    .v3()
+                    .get_task(task_id)
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                self.repository
+                    .v3()
+                    .transition_task(&current, TaskLifecycle::Finalized, now_ms())
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| SupervisorError::Storage)
+            }
             Err(FinalApprovalError::ApprovalRejected) if !approve => {
                 let current = self
                     .repository
@@ -3155,6 +3168,81 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             .get_task_worktree_merge_preparation(&task.id)
             .await
             .is_ok());
+        assert_eq!(
+            fs::read_to_string(fixture.main.join("tracked.txt")).unwrap(),
+            "primary\n"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_human_approval_finalizes_once_without_touching_primary() {
+        let fixture = fixture().await;
+        fs::create_dir_all(fixture.main.join(".agent-sentinel")).unwrap();
+        fs::write(
+            fixture.main.join(".agent-sentinel/validation.json"),
+            r#"{"profiles":[{"id":"default","steps":[{"name":"implemented","argv":["/bin/test","-f","implemented.txt"],"kind":"test","cwd":".","env":{},"required":true,"timeout_ms":5000}]}]}"#,
+        )
+        .unwrap();
+        git(&fixture.main, &["add", ".agent-sentinel/validation.json"]);
+        git(&fixture.main, &["commit", "-qm", "validation profile"]);
+        let mut supervisor = SentinelSupervisor::new(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: Some(CodexProgram::from_executable(&fixture.codex).unwrap()),
+                claude: Some(ClaudeProgram::from_executable(&fixture.claude).unwrap()),
+                omp: None,
+            },
+        )
+        .unwrap();
+        let task = supervisor
+            .start_task(StartTaskIntent {
+                provider: ProviderKind::Codex,
+                summary: "approve workflow".into(),
+                prompt: "implement it".into(),
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            supervisor.reconcile_progress().await.unwrap();
+        }
+        let ready = fixture.repository.v3().get_task(&task.id).await.unwrap();
+        assert_eq!(ready.lifecycle, TaskLifecycle::ReadyForHuman);
+        let approval_id = supervisor
+            .available_actions(&ready)
+            .await
+            .unwrap()
+            .approval_id
+            .unwrap();
+        supervisor
+            .decide_final_approval(&task.id, &approval_id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            TaskLifecycle::Finalized
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_approval(&approval_id)
+                .await
+                .unwrap()
+                .lifecycle,
+            ApprovalLifecycle::Approved
+        );
+        assert!(supervisor
+            .decide_final_approval(&task.id, &approval_id, true)
+            .await
+            .is_err());
         assert_eq!(
             fs::read_to_string(fixture.main.join("tracked.txt")).unwrap(),
             "primary\n"
