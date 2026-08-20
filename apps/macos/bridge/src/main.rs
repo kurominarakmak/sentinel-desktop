@@ -48,6 +48,11 @@ enum Request {
         summary: String,
         prompt: String,
     },
+    RetryInterruptedOmp {
+        request_id: String,
+        task_id: String,
+        prompt: String,
+    },
     AttentionAction {
         request_id: String,
         action: String,
@@ -1154,6 +1159,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     response(
                         json!({"kind":"error","message":"task response could not be durably confirmed"}),
+                    );
+                }
+            }
+            Ok(BridgeInput::Request(Request::RetryInterruptedOmp {
+                request_id,
+                task_id,
+                prompt,
+            })) => {
+                let fingerprint = request_fingerprint(&json!({"task_id":task_id,"prompt":prompt}));
+                let payload = match reserve_mutation(
+                    &runtime,
+                    &repository,
+                    &request_id,
+                    "retry_interrupted_omp",
+                    &fingerprint,
+                ) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(|_| json!({"kind":"error","message":"stored retry response is invalid"})));
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::Pending) | Err(()) => {
+                        json!({"kind":"retry_omp_result","requestId":request_id,"accepted":false,"message":"retry request was rejected"})
+                    }
+                    Ok(SupervisorRequestReservation::New) => match supervisor.as_mut() {
+                        Some(supervisor) => match runtime.block_on(
+                            supervisor.retry_interrupted_omp(&TaskId(task_id.clone()), prompt),
+                        ) {
+                            Ok(()) => match runtime
+                                .block_on(supervisor.repository().v3().get_task(&TaskId(task_id)))
+                            {
+                                Ok(task) => {
+                                    json!({"kind":"retry_omp_result","requestId":request_id,"accepted":true,"task":task_dto(task)})
+                                }
+                                Err(_) => {
+                                    json!({"kind":"retry_omp_result","requestId":request_id,"accepted":false,"message":"refreshed task state unavailable"})
+                                }
+                            },
+                            Err(_) => {
+                                json!({"kind":"retry_omp_result","requestId":request_id,"accepted":false,"message":"OMP retry was rejected"})
+                            }
+                        },
+                        None => {
+                            json!({"kind":"retry_omp_result","requestId":request_id,"accepted":false,"message":"repository is unavailable or invalid"})
+                        }
+                    },
+                };
+                if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                    response(payload);
+                } else {
+                    response(
+                        json!({"kind":"error","message":"retry response could not be durably confirmed"}),
                     );
                 }
             }
