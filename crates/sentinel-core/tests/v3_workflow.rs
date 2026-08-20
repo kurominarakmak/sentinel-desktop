@@ -64,6 +64,18 @@ fn event(
     }
 }
 
+#[tokio::test]
+async fn turn_completed_round_trips_as_a_distinct_durable_kind() {
+    let (_directory, _url, repository) = repository().await;
+    let task = task(&repository).await;
+    let completed = event(task.id.clone(), EventId::new(), 1, EventKind::TurnCompleted);
+    repository.v3().append_event(&completed).await.unwrap();
+    assert_eq!(
+        repository.v3().list_events(&task.id).await.unwrap()[0].kind,
+        EventKind::TurnCompleted
+    );
+}
+
 #[test]
 fn normalized_event_round_trips_and_unknown_kinds_are_explicit() {
     let envelope = event(

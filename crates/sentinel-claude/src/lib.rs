@@ -414,7 +414,7 @@ async fn read_stdout(
         let kind = match value.get("type").and_then(Value::as_str) {
             Some("assistant") | Some("stream_event") => EventKind::Message,
             Some("tool_use") => EventKind::ToolStarted,
-            Some("result") => EventKind::ToolCompleted,
+            Some("result") => EventKind::TurnCompleted,
             Some(other) => EventKind::Unknown {
                 discriminator: format!("claude/{other}"),
             },

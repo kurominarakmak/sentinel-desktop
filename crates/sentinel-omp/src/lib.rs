@@ -12,23 +12,28 @@ use sentinel_core::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, Command},
-    sync::{watch, Mutex},
+    sync::{oneshot, watch, Mutex},
     task::JoinHandle,
     time,
 };
 
 pub const PROVIDER: &str = "oh_my_pi.omp.rpc";
 pub const START_TIMEOUT: Duration = Duration::from_secs(15);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,8 +129,14 @@ pub enum OmpError {
     StartTimeout,
     #[error("OMP RPC process exited unexpectedly")]
     UnexpectedExit,
-    #[error("OMP rejected the command")]
-    CommandFailed,
+    #[error("OMP rejected the prompt command")]
+    PromptRejected,
+    #[error("OMP completed the prompt without invoking an agent")]
+    PromptLocalCompletion,
+    #[error("OMP did not acknowledge the prompt command in time")]
+    PromptTimeout,
+    #[error("OMP reported a late prompt scheduling error")]
+    LatePromptError,
     #[error("invalid adapter input")]
     InvalidInput,
     #[error("persistence failure")]
@@ -135,6 +146,16 @@ pub enum OmpError {
 pub struct OmpSession {
     pub session_id: SessionId,
     pub provider_session_id: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OmpPromptOutcome {
+    AgentInvoked,
+    LocalCompletion,
+}
+struct RpcState {
+    pending: HashMap<String, oneshot::Sender<Result<OmpPromptOutcome, OmpError>>>,
+    accepted: HashSet<String>,
+    late_error: Option<OmpError>,
 }
 struct EventState {
     repository: RunRepository,
@@ -152,6 +173,9 @@ pub struct OmpProcess {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     reader: Option<JoinHandle<()>>,
     state: Arc<Mutex<EventState>>,
+    rpc: Arc<Mutex<RpcState>>,
+    next_request_id: AtomicU64,
+    request_timeout: Duration,
     ready: watch::Receiver<bool>,
 }
 impl OmpProcess {
@@ -211,12 +235,20 @@ impl OmpProcess {
             completed: false,
             cancelling: false,
         }));
-        let reader = tokio::spawn(read_stdout(stdout, state.clone(), ready_tx));
+        let rpc = Arc::new(Mutex::new(RpcState {
+            pending: HashMap::new(),
+            accepted: HashSet::new(),
+            late_error: None,
+        }));
+        let reader = tokio::spawn(read_stdout(stdout, state.clone(), rpc.clone(), ready_tx));
         let process = Self {
             child,
             stdin,
             reader: Some(reader),
             state,
+            rpc,
+            next_request_id: AtomicU64::new(1),
+            request_timeout: REQUEST_TIMEOUT,
             ready,
         };
         let mut receiver = process.ready.clone();
@@ -233,25 +265,56 @@ impl OmpProcess {
         })
         .await
         .map_err(|_| OmpError::StartTimeout)??;
-        let session = process.send_prompt(prompt).await?;
+        let (session, outcome) = process.send_prompt(prompt).await?;
+        if outcome == OmpPromptOutcome::LocalCompletion {
+            return Err(OmpError::PromptLocalCompletion);
+        }
         Ok((process, session))
     }
-    pub async fn send_prompt(&self, prompt: &str) -> Result<OmpSession, OmpError> {
+    pub async fn send_prompt(
+        &self,
+        prompt: &str,
+    ) -> Result<(OmpSession, OmpPromptOutcome), OmpError> {
         if prompt.trim().is_empty() || prompt.len() > 8_000 || prompt.contains('\0') {
             return Err(OmpError::InvalidInput);
         }
-        let id = format!("sentinel-{}", now_ms());
+        self.ensure_healthy().await?;
+        // Persist the Sentinel session before writing: an immediate OMP response
+        // can otherwise race this caller's session creation.
+        let session = ensure_session(self.state.clone()).await?;
+        let id = format!(
+            "sentinel-{}",
+            self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        );
+        let (sender, receiver) = oneshot::channel();
+        self.rpc.lock().await.pending.insert(id.clone(), sender);
         let frame = json!({"id": id, "type":"prompt", "message":prompt}).to_string() + "\n";
-        let mut stdin = self.stdin.lock().await;
-        let stdin = stdin.as_mut().ok_or(OmpError::UnexpectedExit)?;
-        stdin
-            .write_all(frame.as_bytes())
-            .await
-            .map_err(|_| OmpError::UnexpectedExit)?;
-        stdin.flush().await.map_err(|_| OmpError::UnexpectedExit)?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            let Some(stdin) = stdin.as_mut() else {
+                self.rpc.lock().await.pending.remove(&id);
+                return Err(OmpError::UnexpectedExit);
+            };
+            stdin
+                .write_all(frame.as_bytes())
+                .await
+                .map_err(|_| OmpError::UnexpectedExit)?;
+            stdin.flush().await.map_err(|_| OmpError::UnexpectedExit)?;
+        }
         // OMP does not expose a mandatory session id in the ready frame. Sentinel
         // creates an opaque process-scoped ref before receipt of the first event.
-        ensure_session(self.state.clone()).await
+        let outcome = match time::timeout(self.request_timeout, receiver).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_)) => Err(OmpError::UnexpectedExit)?,
+            Err(_) => {
+                self.rpc.lock().await.pending.remove(&id);
+                Err(OmpError::PromptTimeout)?
+            }
+        };
+        Ok((session, outcome))
+    }
+    pub async fn ensure_healthy(&self) -> Result<(), OmpError> {
+        self.rpc.lock().await.late_error.clone().map_or(Ok(()), Err)
     }
     pub async fn cancel(&mut self) -> Result<(), OmpError> {
         self.state.lock().await.cancelling = true;
@@ -320,6 +383,7 @@ impl OmpProcess {
 async fn read_stdout(
     stdout: tokio::process::ChildStdout,
     state: Arc<Mutex<EventState>>,
+    rpc: Arc<Mutex<RpcState>>,
     ready: watch::Sender<bool>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
@@ -357,22 +421,76 @@ async fn read_stdout(
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("missing_type");
-        let kind = match ty {
-            "agent_start" | "turn_start" | "message_start" | "message_update" | "message_end" => {
-                EventKind::Message
-            }
-            "tool_execution_start" => EventKind::ToolStarted,
-            "tool_execution_end" | "agent_end" => EventKind::ToolCompleted,
-            "response" => EventKind::Message,
-            other => EventKind::Unknown {
-                discriminator: format!("omp/{other}"),
-            },
-        };
+        let kind = normalize_event_kind(ty);
+        if ty == "response" {
+            settle_response(&value, &rpc).await;
+        }
+        if ty == "prompt_result" {
+            settle_prompt_result(&value, &rpc).await;
+        }
         if ty == "agent_end" {
             state.lock().await.completed = true;
         }
         let _ = ensure_session(state.clone()).await;
         let _ = emit(&state, kind, json!({"omp_event":value})).await;
+    }
+    let mut rpc = rpc.lock().await;
+    for (_, sender) in rpc.pending.drain() {
+        let _ = sender.send(Err(OmpError::UnexpectedExit));
+    }
+}
+fn normalize_event_kind(ty: &str) -> EventKind {
+    match ty {
+        "agent_start" | "turn_start" | "message_start" | "message_update" | "message_end" => {
+            EventKind::Message
+        }
+        "tool_execution_start" => EventKind::ToolStarted,
+        "tool_execution_end" => EventKind::ToolCompleted,
+        "agent_end" => EventKind::TurnCompleted,
+        "response" => EventKind::Message,
+        other => EventKind::Unknown {
+            discriminator: format!("omp/{other}"),
+        },
+    }
+}
+async fn settle_response(value: &Value, rpc: &Arc<Mutex<RpcState>>) {
+    if value.get("command").and_then(Value::as_str) != Some("prompt") {
+        return;
+    }
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let success = value.get("success").and_then(Value::as_bool) == Some(true);
+    let mut state = rpc.lock().await;
+    if let Some(sender) = state.pending.remove(id) {
+        if !success {
+            let _ = sender.send(Err(OmpError::PromptRejected));
+            return;
+        }
+        let outcome = match value.pointer("/data/agentInvoked").and_then(Value::as_bool) {
+            Some(false) => OmpPromptOutcome::LocalCompletion,
+            _ => OmpPromptOutcome::AgentInvoked,
+        };
+        if outcome == OmpPromptOutcome::AgentInvoked {
+            state.accepted.insert(id.into());
+        }
+        let _ = sender.send(Ok(outcome));
+    } else if !success && state.accepted.contains(id) {
+        state.late_error = Some(OmpError::LatePromptError);
+    }
+}
+async fn settle_prompt_result(value: &Value, rpc: &Arc<Mutex<RpcState>>) {
+    if value.get("agentInvoked").and_then(Value::as_bool) != Some(false) {
+        return;
+    }
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let mut state = rpc.lock().await;
+    if let Some(sender) = state.pending.remove(id) {
+        let _ = sender.send(Ok(OmpPromptOutcome::LocalCompletion));
+    } else if state.accepted.contains(id) {
+        state.late_error = Some(OmpError::PromptLocalCompletion);
     }
 }
 async fn ensure_session(state: Arc<Mutex<EventState>>) -> Result<OmpSession, OmpError> {
@@ -461,15 +579,24 @@ mod tests {
     use super::*;
     use sentinel_core::v3::CreateTask;
 
+    #[test]
+    fn agent_end_is_turn_completion_while_tool_end_remains_tool_completion() {
+        assert_eq!(normalize_event_kind("agent_end"), EventKind::TurnCompleted);
+        assert_eq!(
+            normalize_event_kind("tool_execution_end"),
+            EventKind::ToolCompleted
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn rpc_ready_prompt_and_agent_end_are_persisted() {
+    async fn rpc_prompt_outcomes_are_correlated_by_id() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("fake-omp");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo omp-test; exit 0; fi\necho '{\"type\":\"ready\"}'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *'\"type\":\"prompt\"'*) echo '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"delta\":\"done\"}}'; echo '{\"type\":\"agent_end\"}' ;;\n  esac\ndone\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo omp-test; exit 0; fi\necho '{\"type\":\"ready\"}'\nwhile IFS= read -r line; do\n id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n case \"$line\" in\n  *initial*|*accepted*) echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":true,\\\"data\\\":{\\\"agentInvoked\\\":true}}\" ;;\n  *omitted*) echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":true}\" ;;\n  *local*) echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":true,\\\"data\\\":{\\\"agentInvoked\\\":false}}\" ;;\n  *result*) echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"prompt_result\\\",\\\"agentInvoked\\\":false}\" ;;\n  *reject*) echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":false}\" ;;\n  *late*) echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":true,\\\"data\\\":{\\\"agentInvoked\\\":true}}\"; sleep 0.05; echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":false}\" ;;\n  *exit*) exit 0 ;;\n  *timeout*) sleep 1 ;;\n esac\ndone\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -496,35 +623,59 @@ mod tests {
             task.id.clone(),
             directory.path(),
             "zai/glm-5.2",
-            "work",
+            "initial",
             false,
         )
         .await
         .unwrap();
-        time::timeout(Duration::from_secs(2), async {
-            loop {
-                if repository
-                    .v3()
-                    .list_events(&task.id)
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|event| event.kind == EventKind::ToolCompleted)
-                {
-                    break;
-                }
-                time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        assert_eq!(
+            process.send_prompt("accepted").await.unwrap().1,
+            OmpPromptOutcome::AgentInvoked
+        );
+        assert_eq!(
+            process.send_prompt("omitted").await.unwrap().1,
+            OmpPromptOutcome::AgentInvoked
+        );
+        assert_eq!(
+            process.send_prompt("local").await.unwrap().1,
+            OmpPromptOutcome::LocalCompletion
+        );
+        assert_eq!(
+            process.send_prompt("result").await.unwrap().1,
+            OmpPromptOutcome::LocalCompletion
+        );
+        assert_eq!(
+            process.send_prompt("reject").await.unwrap_err(),
+            OmpError::PromptRejected
+        );
+        assert_eq!(
+            process.send_prompt("late").await.unwrap().1,
+            OmpPromptOutcome::AgentInvoked
+        );
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            process.ensure_healthy().await.unwrap_err(),
+            OmpError::LatePromptError
+        );
+        process.rpc.lock().await.late_error = None;
+        process.request_timeout = Duration::from_millis(25);
+        assert_eq!(
+            process.send_prompt("timeout").await.unwrap_err(),
+            OmpError::PromptTimeout
+        );
+        time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            process.send_prompt("exit").await.unwrap_err(),
+            OmpError::UnexpectedExit
+        );
+        process.shutdown().await.unwrap();
         process.shutdown().await.unwrap();
         let events = repository.v3().list_events(&task.id).await.unwrap();
         assert!(events.iter().any(|event| event
             .payload
             .pointer("/omp_event/type")
             .and_then(Value::as_str)
-            == Some("agent_end")));
+            == Some("response")));
         assert!(events
             .iter()
             .any(|event| event.session_id.as_ref() == Some(&session.session_id)));

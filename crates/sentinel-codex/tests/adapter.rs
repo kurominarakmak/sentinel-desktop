@@ -324,6 +324,9 @@ async fn app_server_starts_threads_turns_interrupts_and_persists_normalized_even
     assert!(events
         .iter()
         .any(|event| matches!(event.kind, EventKind::ToolCompleted)));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::TurnCompleted)));
     assert!(events.iter().any(|event| {
         event.payload.get("turn_id").is_some() && event.payload.get("item_id").is_some()
     }));

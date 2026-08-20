@@ -112,7 +112,7 @@ async fn starts_streams_and_persists_the_claude_session() {
         .any(|event| matches!(event.kind, EventKind::Message)));
     assert!(events
         .iter()
-        .any(|event| matches!(event.kind, EventKind::ToolCompleted)));
+        .any(|event| matches!(event.kind, EventKind::TurnCompleted)));
     assert_eq!(
         repository.v3().get_task(&task.id).await.unwrap().lifecycle,
         TaskLifecycle::Draft,

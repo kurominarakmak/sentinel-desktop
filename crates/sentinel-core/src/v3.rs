@@ -319,6 +319,7 @@ pub enum EventKind {
     Message,
     ToolStarted,
     ToolCompleted,
+    TurnCompleted,
     FileChanged,
     ApprovalRequested,
     ValidationReported,

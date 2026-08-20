@@ -1893,7 +1893,7 @@ async fn persist_api_run_outcome(
                     task_id: task_id.clone(),
                     session_id: Some(session_id.clone()),
                     provider: provider_id.to_string(),
-                    kind: EventKind::ToolCompleted,
+                    kind: EventKind::TurnCompleted,
                     schema_version: 1,
                     occurred_at_ms: now_ms(),
                     sequence_number: last_event_sequence(repository, task_id)
@@ -2018,6 +2018,15 @@ async fn complete_session_if_active(
 }
 
 fn provider_turn_completed(event: &NormalizedEventEnvelope) -> bool {
+    if event.kind == EventKind::TurnCompleted {
+        return true;
+    }
+    legacy_provider_turn_completed(event)
+}
+
+/// Compatibility for persisted V3 history written before `TurnCompleted` was
+/// introduced. New adapters never emit these encodings.
+fn legacy_provider_turn_completed(event: &NormalizedEventEnvelope) -> bool {
     match event.provider.as_str() {
         CODEX_PROVIDER => {
             event.kind == EventKind::ToolCompleted
@@ -2443,6 +2452,39 @@ mod tests {
     };
     use std::{collections::VecDeque, fs, process::Command, sync::Mutex};
     use tempfile::TempDir;
+
+    #[test]
+    fn completion_detection_prefers_turn_completed_and_recovers_legacy_evidence() {
+        let event = |kind, provider: &str, payload| NormalizedEventEnvelope {
+            event_id: EventId::new(),
+            task_id: TaskId::new(),
+            session_id: None,
+            provider: provider.into(),
+            kind,
+            schema_version: 1,
+            occurred_at_ms: 1,
+            sequence_number: 1,
+            causation_id: None,
+            correlation_id: None,
+            payload,
+            raw_diagnostic_payload: None,
+        };
+        assert!(provider_turn_completed(&event(
+            EventKind::TurnCompleted,
+            "unrelated",
+            serde_json::json!({})
+        )));
+        assert!(!provider_turn_completed(&event(
+            EventKind::ToolCompleted,
+            OMP_PROVIDER,
+            serde_json::json!({"omp_event":{"type":"tool_execution_end"}})
+        )));
+        assert!(provider_turn_completed(&event(
+            EventKind::ToolCompleted,
+            OMP_PROVIDER,
+            serde_json::json!({"omp_event":{"type":"agent_end"}})
+        )));
+    }
 
     struct Fixture {
         _temp: TempDir,
