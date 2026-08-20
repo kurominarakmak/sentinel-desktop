@@ -34,7 +34,11 @@ use tokio::{
 pub const PROVIDER: &str = "oh_my_pi.omp.rpc";
 pub const START_TIMEOUT: Duration = Duration::from_secs(15);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-pub const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Largest normal OMP RPC frame retained as provider evidence. Real terminal
+/// `agent_end` frames can include a large final transcript.
+pub const MAX_LINE_BYTES: usize = 512 * 1024;
+/// Frames beyond this boundary are never parsed as completion evidence.
+pub const HARD_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OmpInstallation {
@@ -432,29 +436,35 @@ async fn read_stdout(
                 line.pop();
             }
         }
+        if line.len() > HARD_MAX_LINE_BYTES {
+            let _ = emit(
+                &state,
+                EventKind::SessionFailed,
+                json!({"reason":"omp_frame_exceeds_hard_limit","bytes":line.len(),"hard_max_bytes":HARD_MAX_LINE_BYTES}),
+            )
+            .await;
+            break;
+        }
         if line.len() > MAX_LINE_BYTES {
             let _ = emit(
                 &state,
                 EventKind::Unknown {
-                    discriminator: "omp/oversized_line".into(),
+                    discriminator: "omp/large_frame".into(),
                 },
-                json!({"bytes":line.len()}),
+                json!({"bytes":line.len(),"max_bytes":MAX_LINE_BYTES}),
             )
             .await;
-            continue;
         }
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(_) => {
                 let _ = emit(
                     &state,
-                    EventKind::Unknown {
-                        discriminator: "omp/malformed_json".into(),
-                    },
-                    json!({}),
+                    EventKind::SessionFailed,
+                    json!({"reason":"omp_truncated_or_malformed_frame","bytes":line.len()}),
                 )
                 .await;
-                continue;
+                break;
             }
         };
         if value.get("type").and_then(Value::as_str) == Some("ready") {
