@@ -402,6 +402,7 @@ impl SentinelSupervisor {
         let selection = ProviderSelection {
             provider_id: provider,
             model_id: config.model_id.clone(),
+            reasoning_effort: None,
         };
         self.provider_registry
             .validate_selection(&selection, role)
@@ -1393,11 +1394,21 @@ impl SentinelSupervisor {
                 .map_err(|_| SupervisorError::Provider)?;
             activate_session_if_needed(&self.repository, &session.session_id).await?;
             server
-                .start_read_only_turn(&session, &prompt, &review_root)
+                .start_read_only_turn(
+                    &session,
+                    &prompt,
+                    &review_root,
+                    (reviewer.model_id != "cli-owned").then_some(reviewer.model_id.as_str()),
+                    reviewer.reasoning_effort.as_deref(),
+                )
                 .await
                 .map_err(|_| SupervisorError::Provider)?;
             wait_for_provider_completion(&self.repository, &task.id, CODEX_PROVIDER, before)
                 .await?;
+            server
+                .ensure_requested_selection_enforced()
+                .await
+                .map_err(|_| SupervisorError::Provider)?;
             let output = latest_codex_message(&self.repository, &task.id, before).await?;
             complete_session_if_active(&self.repository, &session.session_id).await?;
             server
@@ -2454,6 +2465,7 @@ fn managed_selection(provider: &str) -> ProviderSelection {
     ProviderSelection {
         provider_id: ProviderId::new(provider).expect("managed provider ID is constant"),
         model_id: "cli-owned".into(),
+        reasoning_effort: None,
     }
 }
 
@@ -2908,6 +2920,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
         let selection = ProviderSelection {
             provider_id: provider_id.clone(),
             model_id: "fake-model".into(),
+            reasoning_effort: None,
         };
         let workflow = WorkflowProviderConfiguration {
             implementer: selection.clone(),

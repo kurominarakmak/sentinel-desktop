@@ -178,6 +178,10 @@ pub enum ProviderRole {
 pub struct ProviderSelection {
     pub provider_id: ProviderId,
     pub model_id: String,
+    /// Optional provider-specific reasoning effort. Managed CLIs that cannot
+    /// enforce this value must reject the selection rather than fall back.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -597,7 +601,14 @@ impl ProviderRegistry {
         let config = self
             .provider(&selection.provider_id)
             .ok_or_else(|| ProviderError::ProviderUnavailable(selection.provider_id.to_string()))?;
-        if !config.enabled || selection.model_id != config.model_id {
+        let model_override_supported =
+            config.capabilities.model_selection && matches!(role, ProviderRole::Reviewer);
+        let effort_override_supported =
+            model_override_supported && config.id.as_str() == CODEX_PROVIDER_ID;
+        if !config.enabled
+            || (!model_override_supported && selection.model_id != config.model_id)
+            || (selection.reasoning_effort.is_some() && !effort_override_supported)
+        {
             return Err(ProviderError::ProviderUnavailable(
                 selection.provider_id.to_string(),
             ));
@@ -670,7 +681,9 @@ pub fn managed_codex_config(available: bool) -> ProviderConfig {
             cancellation: true,
             tool_calling: true,
             structured_output: true,
-            model_selection: false,
+            // App Server turn/start supports explicit model and effort
+            // overrides; `cli-owned` remains the backwards-compatible default.
+            model_selection: true,
             rate_limits: true,
             implementation: true,
             read_only_review: true,
@@ -1431,14 +1444,17 @@ mod tests {
             implementer: ProviderSelection {
                 provider_id: ProviderId::new("codex").unwrap(),
                 model_id: "cli-owned".into(),
+                reasoning_effort: None,
             },
             reviewer: ProviderSelection {
                 provider_id: ProviderId::new("claude_code").unwrap(),
                 model_id: "cli-owned".into(),
+                reasoning_effort: None,
             },
             repair: Some(ProviderSelection {
                 provider_id: ProviderId::new("fake").unwrap(),
                 model_id: "fake-1".into(),
+                reasoning_effort: None,
             }),
         };
         assert_eq!(
@@ -1447,5 +1463,35 @@ mod tests {
                 .unwrap_err(),
             ProviderError::RoleUnavailable(ProviderRole::Repair)
         );
+    }
+
+    #[test]
+    fn managed_codex_accepts_explicit_reviewer_model_without_changing_implementer_role() {
+        let registry = ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            true,
+            false,
+            false,
+        );
+        let reviewer = ProviderSelection {
+            provider_id: ProviderId::new(CODEX_PROVIDER_ID).unwrap(),
+            model_id: "gpt-5.6-terra".into(),
+            reasoning_effort: Some("medium".into()),
+        };
+        let implementer = ProviderSelection {
+            provider_id: ProviderId::new(CODEX_PROVIDER_ID).unwrap(),
+            model_id: "cli-owned".into(),
+            reasoning_effort: None,
+        };
+        assert!(registry
+            .validate_selection(&reviewer, ProviderRole::Reviewer)
+            .is_ok());
+        assert!(registry
+            .validate_selection(&implementer, ProviderRole::Implementer)
+            .is_ok());
+        assert!(registry
+            .validate_selection(&reviewer, ProviderRole::Implementer)
+            .is_err());
+        assert_ne!(reviewer, implementer);
     }
 }

@@ -240,6 +240,8 @@ struct EventState {
     buffered: Vec<BufferedNotification>,
     completed_turns: HashSet<String>,
     started_items: HashSet<(String, String)>,
+    requested_model: Option<String>,
+    selection_rerouted: bool,
     rate_limits: watch::Sender<Option<CodexRateLimits>>,
 }
 struct BufferedNotification {
@@ -341,6 +343,8 @@ impl CodexAppServer {
             buffered: Vec::new(),
             completed_turns: HashSet::new(),
             started_items: HashSet::new(),
+            requested_model: None,
+            selection_rerouted: false,
             rate_limits: rate_limits_tx.clone(),
         }));
         let notification_worker = tokio::spawn(notification_worker(notification_rx, state.clone()));
@@ -552,20 +556,29 @@ impl CodexAppServer {
         session: &CodexSession,
         prompt: &str,
         cwd: &Path,
+        model: Option<&str>,
+        effort: Option<&str>,
     ) -> Result<CodexTurn, CodexError> {
         if !cwd.is_dir() {
             return Err(CodexError::InvalidInput);
         }
-        self.start_turn_with_policy(
-            session,
-            prompt,
-            Some(json!({
-                "cwd": cwd,
-                "approvalPolicy": "never",
-                "sandboxPolicy": {"type":"readOnly","networkAccess":false}
-            })),
-        )
-        .await
+        let policy = read_only_turn_policy(cwd, model, effort)?;
+        {
+            let mut state = self.state.lock().await;
+            state.requested_model = model.map(str::to_owned);
+            state.selection_rerouted = false;
+        }
+        self.start_turn_with_policy(session, prompt, Some(policy))
+            .await
+    }
+    /// A requested model may not be silently substituted by App Server.
+    pub async fn ensure_requested_selection_enforced(&self) -> Result<(), CodexError> {
+        let state = self.state.lock().await;
+        if state.selection_rerouted {
+            Err(CodexError::Unsupported)
+        } else {
+            Ok(())
+        }
     }
 
     async fn start_turn_with_policy(
@@ -590,6 +603,10 @@ impl CodexAppServer {
                 .expect("turn params are an object")
                 .extend(policy);
         }
+        let requested_model = params.get("model").cloned();
+        let requested_effort = params.get("effort").cloned();
+        let effective_model = requested_model.clone();
+        let effective_effort = requested_effort.clone();
         let result = self.request("turn/start", params).await;
         let result = match result {
             Ok(v) => v,
@@ -608,7 +625,7 @@ impl CodexAppServer {
         self.emit(
             EventKind::ToolStarted,
             Some(session.session_id.clone()),
-            json!({"thread_id":session.thread_id,"turn_id":turn_id,"event":"turn_started"}),
+            json!({"thread_id":session.thread_id,"turn_id":turn_id,"event":"turn_started","requested_model":requested_model,"requested_effort":requested_effort,"effective_model":effective_model,"effective_effort":effective_effort}),
             None,
         )
         .await?;
@@ -1020,6 +1037,16 @@ async fn handle_notification(
             let _ = state.rate_limits.send(Some(snapshot));
         }
     }
+    if method == "model/rerouted" {
+        let to_model = params.get("toModel").and_then(Value::as_str);
+        if state
+            .requested_model
+            .as_deref()
+            .is_some_and(|requested| to_model != Some(requested))
+        {
+            state.selection_rerouted = true;
+        }
+    }
     let thread_id = params.get("threadId").and_then(Value::as_str).or_else(|| {
         params
             .get("thread")
@@ -1176,6 +1203,71 @@ fn valid_id(value: &str) -> Result<(), CodexError> {
         Err(CodexError::InvalidInput)
     } else {
         Ok(())
+    }
+}
+fn valid_selection_value(value: &str) -> Result<(), CodexError> {
+    if value.is_empty() || value.len() > 128 || value.contains('\0') {
+        Err(CodexError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+fn read_only_turn_policy(
+    cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Value, CodexError> {
+    let mut policy = json!({
+        "cwd": cwd,
+        "approvalPolicy": "never",
+        "sandboxPolicy": {"type":"readOnly","networkAccess":false}
+    });
+    let policy_object = policy.as_object_mut().expect("policy is an object");
+    if let Some(model) = model {
+        valid_selection_value(model)?;
+        policy_object.insert("model".into(), Value::String(model.into()));
+    }
+    if let Some(effort) = effort {
+        valid_selection_value(effort)?;
+        policy_object.insert("effort".into(), Value::String(effort.into()));
+    }
+    Ok(policy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reviewer_model_and_effort_are_sent_without_weakening_read_only_policy() {
+        let policy = read_only_turn_policy(
+            Path::new("/tmp/review"),
+            Some("gpt-5.6-terra"),
+            Some("medium"),
+        )
+        .unwrap();
+        assert_eq!(policy["model"], "gpt-5.6-terra");
+        assert_eq!(policy["effort"], "medium");
+        assert_eq!(policy["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(policy["approvalPolicy"], "never");
+    }
+
+    #[test]
+    fn reviewer_model_is_not_hard_coded_and_defaults_remain_cli_owned() {
+        let explicit =
+            read_only_turn_policy(Path::new("/tmp/review"), Some("another-model"), None).unwrap();
+        assert_eq!(explicit["model"], "another-model");
+        let default = read_only_turn_policy(Path::new("/tmp/review"), None, None).unwrap();
+        assert!(default.get("model").is_none());
+        assert!(default.get("effort").is_none());
+    }
+
+    #[test]
+    fn invalid_unenforceable_reviewer_selection_fails_closed() {
+        assert_eq!(
+            read_only_turn_policy(Path::new("/tmp/review"), Some(""), Some("medium")),
+            Err(CodexError::InvalidInput)
+        );
     }
 }
 fn bounded_text(bytes: &[u8]) -> String {

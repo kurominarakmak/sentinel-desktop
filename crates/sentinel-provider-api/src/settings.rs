@@ -48,10 +48,12 @@ impl Default for ProviderSettingsDocument {
                 implementer: ProviderSelection {
                     provider_id: ProviderId::new(CODEX_PROVIDER_ID).expect("constant provider ID"),
                     model_id: "cli-owned".into(),
+                    reasoning_effort: None,
                 },
                 reviewer: ProviderSelection {
                     provider_id: ProviderId::new(CLAUDE_PROVIDER_ID).expect("constant provider ID"),
                     model_id: "cli-owned".into(),
+                    reasoning_effort: None,
                 },
                 repair: None,
             },
@@ -532,6 +534,7 @@ mod tests {
         let codex = ProviderSelection {
             provider_id: ProviderId::new("codex").unwrap(),
             model_id: "cli-owned".into(),
+            reasoning_effort: None,
         };
         store
             .set_workflow(WorkflowProviderConfiguration {
@@ -650,6 +653,7 @@ mod tests {
         ProviderSelection {
             provider_id: ProviderId::new(OMP_PROVIDER_ID).unwrap(),
             model_id: "zai/glm-5.2".into(),
+            reasoning_effort: None,
         }
     }
 }

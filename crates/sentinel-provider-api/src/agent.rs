@@ -300,6 +300,7 @@ mod tests {
                 selection: ProviderSelection {
                     provider_id: id,
                     model_id: "fake-model".into(),
+                    reasoning_effort: None,
                 },
                 role: crate::ProviderRole::Implementer,
                 system_prompt: "implement".into(),
