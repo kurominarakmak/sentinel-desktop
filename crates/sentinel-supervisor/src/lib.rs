@@ -1410,11 +1410,14 @@ impl SentinelSupervisor {
                 .await
                 .map_err(|_| SupervisorError::Provider)?;
             let output = latest_codex_message(&self.repository, &task.id, before).await?;
+            // The review result is now durably observable. An App Server that
+            // has already reaped itself after turn/completed is benign; retain
+            // a live-child shutdown failure as a real provider error.
+            let shutdown = server.shutdown().await;
             complete_session_if_active(&self.repository, &session.session_id).await?;
-            server
-                .shutdown()
-                .await
-                .map_err(|_| SupervisorError::Provider)?;
+            if shutdown.is_err() && server.is_alive() {
+                return Err(SupervisorError::Provider);
+            }
             output
         } else if reviewer.provider_id.as_str() == OMP_PROVIDER_ID {
             let program = self
