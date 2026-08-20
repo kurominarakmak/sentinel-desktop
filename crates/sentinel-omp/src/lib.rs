@@ -162,6 +162,7 @@ struct EventState {
     task_id: TaskId,
     sequence: u64,
     session: Option<OmpSession>,
+    session_initialization: Arc<Mutex<()>>,
     completed: bool,
     cancelling: bool,
 }
@@ -232,6 +233,7 @@ impl OmpProcess {
             task_id,
             sequence,
             session: None,
+            session_initialization: Arc::new(Mutex::new(())),
             completed: false,
             cancelling: false,
         }));
@@ -410,8 +412,22 @@ async fn read_stdout(
     rpc: Arc<Mutex<RpcState>>,
     ready: watch::Sender<bool>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    // `Lines` imposes Tokio's 8 KiB default limit. OMP legitimately sends
+    // extension/command inventory frames larger than that during startup, so
+    // use `read_line` and apply the transport's explicit 64 KiB policy below.
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
         if line.len() > MAX_LINE_BYTES {
             let _ = emit(
                 &state,
@@ -521,6 +537,15 @@ async fn ensure_session(state: Arc<Mutex<EventState>>) -> Result<OmpSession, Omp
     if let Some(session) = state.lock().await.session.clone() {
         return Ok(session);
     }
+    // OMP can send startup inventory events immediately after `ready`, while
+    // `send_prompt` is also creating the session. Serialize that first write:
+    // otherwise concurrent SQLite writes can make a real accepted prompt look
+    // like transport/storage failure.
+    let initialization = state.lock().await.session_initialization.clone();
+    let _initializing = initialization.lock().await;
+    if let Some(session) = state.lock().await.session.clone() {
+        return Ok(session);
+    }
     let (repository, task_id) = {
         let state = state.lock().await;
         (state.repository.clone(), state.task_id.clone())
@@ -609,6 +634,53 @@ mod tests {
         assert_eq!(
             normalize_event_kind("tool_execution_end"),
             EventKind::ToolCompleted
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_event_and_prompt_share_one_session_initialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = RunRepository::open(&format!(
+            "sqlite://{}",
+            directory.path().join("test.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        let task = repository
+            .v3()
+            .create_task(
+                CreateTask {
+                    project_id: None,
+                    workflow_id: "test".into(),
+                    summary: "test".into(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(Mutex::new(EventState {
+            repository: repository.clone(),
+            task_id: task.id.clone(),
+            sequence: 0,
+            session: None,
+            session_initialization: Arc::new(Mutex::new(())),
+            completed: false,
+            cancelling: false,
+        }));
+        let (first, second) = tokio::join!(ensure_session(state.clone()), ensure_session(state));
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            repository
+                .v3()
+                .list_sessions_for_task(&task.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repository.v3().list_events(&task.id).await.unwrap().len(),
+            1
         );
     }
 
