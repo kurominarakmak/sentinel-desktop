@@ -80,9 +80,9 @@ struct APIProviderSettingsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
-            Text("API keys, models, and workflow roles")
+            Text("Provider models and workflow roles")
                 .font(.caption.weight(.semibold))
-            Text("Keys are sent once to Rust and stored in macOS Keychain. Sentinel never returns their plaintext.")
+            Text("OMP uses its own login or environment credentials for GLM/Kimi. Other provider keys are sent once to Rust and stored in macOS Keychain.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             if let message = bridge.settingsMutationMessage {

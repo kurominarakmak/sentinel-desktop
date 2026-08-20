@@ -3478,6 +3478,7 @@ dependencies = [
  "sentinel-codex",
  "sentinel-core",
  "sentinel-git",
+ "sentinel-omp",
  "sentinel-provider-api",
  "sentinel-review",
  "sentinel-supervisor",
@@ -3486,6 +3487,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "sentinel-omp"
+version = "0.1.0"
+dependencies = [
+ "sentinel-core",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
  "tokio",
 ]
 
@@ -3560,6 +3573,7 @@ dependencies = [
  "sentinel-codex",
  "sentinel-core",
  "sentinel-git",
+ "sentinel-omp",
  "sentinel-provider-api",
  "sentinel-review",
  "sentinel-validation",

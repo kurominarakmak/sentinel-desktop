@@ -9,6 +9,7 @@ sentinel-core = { path = "../sentinel-core" }
 sentinel-worktree = { path = "../sentinel-worktree" }
 sentinel-codex = { path = "../sentinel-codex" }
 sentinel-claude = { path = "../sentinel-claude" }
+sentinel-omp = { path = "../sentinel-omp" }
 sentinel-review = { path = "../sentinel-review" }
 sentinel-validation = { path = "../sentinel-validation" }
 sentinel-git = { path = "../sentinel-git" }

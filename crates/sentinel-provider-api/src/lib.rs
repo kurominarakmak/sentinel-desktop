@@ -30,6 +30,7 @@ pub mod settings;
 
 pub const CODEX_PROVIDER_ID: &str = "codex";
 pub const CLAUDE_PROVIDER_ID: &str = "claude_code";
+pub const OMP_PROVIDER_ID: &str = "omp";
 pub const DEFAULT_KEYCHAIN_SERVICE: &str = "dev.agent-sentinel.api-provider";
 pub const MAX_PERSISTED_DIAGNOSTIC_BYTES: usize = 4_096;
 
@@ -492,6 +493,7 @@ impl ProviderRegistry {
         credentials: Arc<dyn CredentialStore>,
         codex_available: bool,
         claude_available: bool,
+        omp_available: bool,
     ) -> Self {
         let mut registry = Self::new(credentials);
         registry
@@ -500,6 +502,9 @@ impl ProviderRegistry {
         registry
             .register_managed(managed_claude_config(claude_available))
             .expect("built-in Claude descriptor is valid");
+        registry
+            .register_managed(managed_omp_config(omp_available))
+            .expect("built-in OMP descriptor is valid");
         registry
     }
 
@@ -693,6 +698,35 @@ pub fn managed_claude_config(available: bool) -> ProviderConfig {
             tool_calling: true,
             structured_output: true,
             model_selection: false,
+            rate_limits: false,
+            implementation: true,
+            read_only_review: true,
+            repair: true,
+        },
+        limits: ModelLimits {
+            context_tokens: None,
+            max_output_tokens: None,
+        },
+        credential: None,
+    }
+}
+
+pub fn managed_omp_config(available: bool) -> ProviderConfig {
+    ProviderConfig {
+        id: ProviderId::new(OMP_PROVIDER_ID).expect("constant provider ID"),
+        display_name: "OMP (Oh My Pi)".into(),
+        // A model can be selected through settings (for example `zai/glm-5.2`
+        // or `moonshot/kimi-k2.7-code`); OMP resolves its own credentials.
+        model_id: "zai/glm-5.2".into(),
+        base_url: None,
+        enabled: available,
+        transport: ProviderTransport::ManagedCli,
+        capabilities: ProviderCapabilities {
+            streaming: true,
+            cancellation: true,
+            tool_calling: true,
+            structured_output: false,
+            model_selection: true,
             rate_limits: false,
             implementation: true,
             read_only_review: true,
@@ -1296,7 +1330,8 @@ mod tests {
                 SecretString::new("secret").unwrap(),
             )
             .unwrap();
-        let mut registry = ProviderRegistry::with_managed_cli_providers(credentials, true, false);
+        let mut registry =
+            ProviderRegistry::with_managed_cli_providers(credentials, true, false, false);
         registry.register_api(adapter).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = seen.clone();
@@ -1326,7 +1361,8 @@ mod tests {
     #[test]
     fn capability_and_role_differences_fail_closed() {
         let credentials = Arc::new(MemoryCredentialStore::default());
-        let registry = ProviderRegistry::with_managed_cli_providers(credentials, true, false);
+        let registry =
+            ProviderRegistry::with_managed_cli_providers(credentials, true, false, false);
         let codex = registry
             .provider(&ProviderId::new("codex").unwrap())
             .unwrap();
@@ -1382,7 +1418,8 @@ mod tests {
     #[test]
     fn workflow_selection_uses_registry_capabilities() {
         let credentials = Arc::new(MemoryCredentialStore::default());
-        let mut registry = ProviderRegistry::with_managed_cli_providers(credentials, true, true);
+        let mut registry =
+            ProviderRegistry::with_managed_cli_providers(credentials, true, true, false);
         let mut config = fake_config(true);
         config.capabilities.repair = false;
         let adapter = Arc::new(FakeAdapter {

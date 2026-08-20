@@ -18,4 +18,5 @@ sentinel-agent-api = { path = "../../../crates/sentinel-agent-api" }
 sentinel-validation = { path = "../../../crates/sentinel-validation" }
 sentinel-supervisor = { path = "../../../crates/sentinel-supervisor" }
 sentinel-claude = { path = "../../../crates/sentinel-claude" }
+sentinel-omp = { path = "../../../crates/sentinel-omp" }
 sentinel-provider-api = { path = "../../../crates/sentinel-provider-api" }

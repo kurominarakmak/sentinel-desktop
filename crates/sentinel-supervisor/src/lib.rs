@@ -23,11 +23,13 @@ use sentinel_core::{
     RunRepository,
 };
 use sentinel_git::{inspect_repository, RepositoryState};
+use sentinel_omp::{OmpProcess, OmpProgram, OmpSession, PROVIDER as OMP_PROVIDER};
 use sentinel_provider_api::{
     agent::{run_agent_loop, AgentLoopRequest, AgentLoopResult},
     CancellationHandle, MemoryCredentialStore, MessageRole, ProviderError, ProviderId,
     ProviderMessage, ProviderRegistry, ProviderRequest, ProviderRole, ProviderSelection,
     ResponseFormat, WorkflowProviderConfiguration, CLAUDE_PROVIDER_ID, CODEX_PROVIDER_ID,
+    OMP_PROVIDER_ID,
 };
 use sentinel_review::{
     FinalApprovalError, FinalApprovalSupervisor, FindingSeverity, RepairError, RepairEvidence,
@@ -54,6 +56,7 @@ const MAX_REPAIR_ROUNDS: usize = 3;
 pub enum ProviderKind {
     Codex,
     ClaudeCode,
+    Omp,
 }
 
 impl ProviderKind {
@@ -61,6 +64,7 @@ impl ProviderKind {
         match value {
             "codex" => Ok(Self::Codex),
             "claude_code" => Ok(Self::ClaudeCode),
+            "omp" => Ok(Self::Omp),
             _ => Err(SupervisorError::ProviderUnavailable),
         }
     }
@@ -69,6 +73,7 @@ impl ProviderKind {
         match self {
             Self::Codex => CODEX_PROVIDER,
             Self::ClaudeCode => CLAUDE_PROVIDER,
+            Self::Omp => OMP_PROVIDER,
         }
     }
 }
@@ -77,6 +82,7 @@ impl ProviderKind {
 pub struct SupervisorPrograms {
     pub codex: Option<CodexProgram>,
     pub claude: Option<ClaudeProgram>,
+    pub omp: Option<OmpProgram>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +124,10 @@ enum OwnedProvider {
         process: ClaudeProcess,
         session: ClaudeSession,
     },
+    Omp {
+        process: OmpProcess,
+        session: OmpSession,
+    },
     Api {
         session_id: sentinel_core::v3::SessionId,
         provider_id: ProviderId,
@@ -149,6 +159,7 @@ impl SentinelSupervisor {
             Arc::new(MemoryCredentialStore::default()),
             programs.codex.is_some(),
             programs.claude.is_some(),
+            programs.omp.is_some(),
         ));
         let provider_workflow = WorkflowProviderConfiguration {
             implementer: managed_selection(CODEX_PROVIDER_ID),
@@ -227,6 +238,7 @@ impl SentinelSupervisor {
         match provider {
             ProviderKind::Codex => self.programs.codex.is_some(),
             ProviderKind::ClaudeCode => self.programs.claude.is_some(),
+            ProviderKind::Omp => self.programs.omp.is_some(),
         }
     }
 
@@ -281,6 +293,7 @@ impl SentinelSupervisor {
         let selection = managed_selection(match intent.provider {
             ProviderKind::Codex => CODEX_PROVIDER_ID,
             ProviderKind::ClaudeCode => CLAUDE_PROVIDER_ID,
+            ProviderKind::Omp => OMP_PROVIDER_ID,
         });
         self.start_with_selection(selection, intent.summary, intent.prompt)
             .await
@@ -457,6 +470,37 @@ impl SentinelSupervisor {
                     .await
                     .map_err(|_| SupervisorError::Storage)?;
                 OwnedProvider::Claude { process, session }
+            }
+            OMP_PROVIDER_ID => {
+                let program = self
+                    .programs
+                    .omp
+                    .clone()
+                    .ok_or(SupervisorError::ProviderUnavailable)?;
+                let (process, session) = match OmpProcess::start(
+                    program,
+                    self.repository.clone(),
+                    prepared.id.clone(),
+                    &cwd,
+                    &selection.model_id,
+                    &prompt,
+                    false,
+                )
+                .await
+                {
+                    Ok(started) => started,
+                    Err(_) => {
+                        fail_task(&self.repository, &prepared).await;
+                        return Err(SupervisorError::Provider);
+                    }
+                };
+                activate_session(&self.repository, &session.session_id).await?;
+                self.repository
+                    .v3()
+                    .transition_task(&prepared, TaskLifecycle::Implementing, now_ms())
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                OwnedProvider::Omp { process, session }
             }
             _ => {
                 let session = self
@@ -655,6 +699,43 @@ impl SentinelSupervisor {
                 .await
                 .map_err(|_| SupervisorError::Provider),
             Some(OwnedProvider::Claude { process, session }) => {
+                let durable = self
+                    .repository
+                    .v3()
+                    .get_session(&session.session_id)
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                let cancelling = self
+                    .repository
+                    .v3()
+                    .transition_session(&durable, SessionLifecycle::Cancelling, now_ms())
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                process
+                    .cancel()
+                    .await
+                    .map_err(|_| SupervisorError::Provider)?;
+                self.repository
+                    .v3()
+                    .transition_session(&cancelling, SessionLifecycle::Cancelled, now_ms())
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                let current = self
+                    .repository
+                    .v3()
+                    .get_task(task_id)
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                if !current.lifecycle.terminal() {
+                    self.repository
+                        .v3()
+                        .transition_task(&current, TaskLifecycle::Cancelled, now_ms())
+                        .await
+                        .map_err(|_| SupervisorError::Storage)?;
+                }
+                Ok(())
+            }
+            Some(OwnedProvider::Omp { process, session }) => {
                 let durable = self
                     .repository
                     .v3()
@@ -1172,6 +1253,31 @@ impl SentinelSupervisor {
                 .await
                 .map_err(|_| SupervisorError::Provider)?;
             output
+        } else if reviewer.provider_id.as_str() == OMP_PROVIDER_ID {
+            let program = self
+                .programs
+                .omp
+                .clone()
+                .ok_or(SupervisorError::ProviderUnavailable)?;
+            let (mut process, session) = OmpProcess::start(
+                program,
+                self.repository.clone(),
+                task.id.clone(),
+                &review_root,
+                &reviewer.model_id,
+                &prompt,
+                true,
+            )
+            .await
+            .map_err(|_| SupervisorError::Provider)?;
+            activate_session_if_needed(&self.repository, &session.session_id).await?;
+            wait_for_provider_completion(&self.repository, &task.id, OMP_PROVIDER, before).await?;
+            let output = latest_omp_message(&self.repository, &task.id, before).await?;
+            process
+                .shutdown()
+                .await
+                .map_err(|_| SupervisorError::Provider)?;
+            output
         } else {
             let session = self
                 .repository
@@ -1497,6 +1603,22 @@ impl SentinelSupervisor {
                 .map_err(|_| SupervisorError::Provider)?;
             complete_session_if_active(&self.repository, &session.session_id).await?;
             return Ok(());
+        }
+        if selection.provider_id.as_str() == OMP_PROVIDER_ID {
+            if let Some(OwnedProvider::Omp { process, .. }) = self.owned.get_mut(task_id) {
+                process
+                    .send_prompt(&prompt)
+                    .await
+                    .map_err(|_| SupervisorError::Provider)?;
+                return wait_for_provider_completion(
+                    &self.repository,
+                    task_id,
+                    OMP_PROVIDER,
+                    before,
+                )
+                .await;
+            }
+            return Err(SupervisorError::ProviderUnavailable);
         }
 
         let worktree = self
@@ -1914,6 +2036,15 @@ fn provider_turn_completed(event: &NormalizedEventEnvelope) -> bool {
                     .and_then(serde_json::Value::as_str)
                     == Some("result")
         }
+        OMP_PROVIDER => {
+            event.kind == EventKind::ToolCompleted
+                && event
+                    .payload
+                    .get("omp_event")
+                    .and_then(|value| value.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("agent_end")
+        }
         _ => {
             event.kind == EventKind::ToolCompleted
                 && event
@@ -2050,6 +2181,33 @@ async fn latest_codex_message(
     Err(SupervisorError::Provider)
 }
 
+async fn latest_omp_message(
+    repository: &RunRepository,
+    task_id: &TaskId,
+    after_sequence: u64,
+) -> Result<String, SupervisorError> {
+    let text = repository
+        .v3()
+        .list_events(task_id)
+        .await
+        .map_err(|_| SupervisorError::Storage)?
+        .into_iter()
+        .filter(|event| event.sequence_number > after_sequence && event.provider == OMP_PROVIDER)
+        .filter_map(|event| {
+            event
+                .payload
+                .get("omp_event")
+                .and_then(|value| value.get("assistantMessageEvent"))
+                .and_then(|event| event.get("delta"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<String>();
+    (!text.trim().is_empty())
+        .then_some(text)
+        .ok_or(SupervisorError::Provider)
+}
+
 #[derive(Deserialize)]
 struct ReviewerOutput {
     findings: Vec<ReviewerFinding>,
@@ -2134,6 +2292,7 @@ fn managed_selection(provider: &str) -> ProviderSelection {
 fn provider_alias(provider: &str) -> &str {
     match provider {
         "claude" | "claude-code" => CLAUDE_PROVIDER_ID,
+        "oh-my-pi" | "oh_my_pi" => OMP_PROVIDER_ID,
         value => value,
     }
 }
@@ -2206,9 +2365,11 @@ async fn original_implementer_session(
     let provider = match task.workflow_id.strip_prefix("v3:") {
         Some(CODEX_PROVIDER_ID) => CODEX_PROVIDER,
         Some(CLAUDE_PROVIDER_ID) => CLAUDE_PROVIDER,
+        Some(OMP_PROVIDER_ID) => OMP_PROVIDER,
         Some(provider) => provider,
         None if task.workflow_id.contains(CODEX_PROVIDER) => CODEX_PROVIDER,
         None if task.workflow_id.contains(CLAUDE_PROVIDER) => CLAUDE_PROVIDER,
+        None if task.workflow_id.contains(OMP_PROVIDER) => OMP_PROVIDER,
         None => return Ok(None),
     };
     repository
@@ -2417,6 +2578,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             SupervisorPrograms {
                 codex: Some(program),
                 claude: None,
+                omp: None,
             },
         )
         .unwrap();
@@ -2509,7 +2671,8 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
                 completion("implementation ready", Vec::new()),
             ])),
         });
-        let mut registry = ProviderRegistry::with_managed_cli_providers(credentials, false, true);
+        let mut registry =
+            ProviderRegistry::with_managed_cli_providers(credentials, false, true, false);
         registry.register_api(adapter).unwrap();
         let selection = ProviderSelection {
             provider_id: provider_id.clone(),
@@ -2527,6 +2690,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             SupervisorPrograms {
                 codex: None,
                 claude: Some(ClaudeProgram::from_executable(&fixture.claude).unwrap()),
+                omp: None,
             },
             Arc::new(registry),
             workflow.clone(),
@@ -2584,6 +2748,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             SupervisorPrograms {
                 codex: None,
                 claude: None,
+                omp: None,
             },
         )
         .unwrap();
@@ -2642,6 +2807,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
                 SupervisorPrograms {
                     codex: Some(program.clone()),
                     claude: None,
+                    omp: None,
                 },
             )
             .unwrap();
@@ -2668,6 +2834,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             SupervisorPrograms {
                 codex: Some(program),
                 claude: None,
+                omp: None,
             },
         )
         .unwrap();
@@ -2709,6 +2876,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             SupervisorPrograms {
                 codex: Some(CodexProgram::from_executable(&fixture.codex).unwrap()),
                 claude: Some(ClaudeProgram::from_executable(&fixture.claude).unwrap()),
+                omp: None,
             },
         )
         .unwrap();
@@ -2869,6 +3037,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             SupervisorPrograms {
                 codex: None,
                 claude: None,
+                omp: None,
             },
         )
         .unwrap();

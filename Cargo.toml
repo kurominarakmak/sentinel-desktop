@@ -9,6 +9,7 @@ members = [
   "crates/sentinel-probe",
   "crates/sentinel-codex",
   "crates/sentinel-claude",
+  "crates/sentinel-omp",
   "crates/sentinel-provider-api",
   "crates/sentinel-worktree",
   "crates/sentinel-validation",

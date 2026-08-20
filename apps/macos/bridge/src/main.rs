@@ -11,6 +11,7 @@ use sentinel_core::{
     CoreError, RunRepository,
 };
 use sentinel_git::{inspect_repository, RepositoryState};
+use sentinel_omp::OmpProgram;
 use sentinel_provider_api::{
     openai_compatible::CustomProviderSpec,
     settings::{ProviderSettingsSnapshot, ProviderSettingsStore},
@@ -711,6 +712,10 @@ fn claude_program() -> Option<ClaudeProgram> {
     executable_path("AGENT_SENTINEL_CLAUDE_EXECUTABLE", "claude")
         .and_then(|path| ClaudeProgram::from_executable(path).ok())
 }
+fn omp_program() -> Option<OmpProgram> {
+    executable_path("AGENT_SENTINEL_OMP_EXECUTABLE", "omp")
+        .and_then(|path| OmpProgram::from_executable(path).ok())
+}
 
 fn executable_path(override_name: &str, executable_name: &str) -> Option<PathBuf> {
     std::env::var_os(override_name)
@@ -752,7 +757,11 @@ fn build_supervisor(
         return None;
     }
     let registry = provider_settings
-        .build_registry(programs.codex.is_some(), programs.claude.is_some())
+        .build_registry(
+            programs.codex.is_some(),
+            programs.claude.is_some(),
+            programs.omp.is_some(),
+        )
         .ok()?;
     let workflow = provider_settings.snapshot().workflow;
     let mut supervisor = SentinelSupervisor::with_provider_runtime(
@@ -774,10 +783,11 @@ fn quick_prompt_providers(
     settings: &ProviderSettingsStore,
     codex_available: bool,
     claude_available: bool,
+    omp_available: bool,
 ) -> Vec<ProviderDto> {
     let snapshot = settings.snapshot();
     let registry = settings
-        .build_registry(codex_available, claude_available)
+        .build_registry(codex_available, claude_available, omp_available)
         .ok();
     let configured_available = registry.as_ref().is_some_and(|registry| {
         registry
@@ -936,9 +946,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root = repository_root(&config);
     let program = codex_program();
     let claude = claude_program();
+    let omp = omp_program();
     let programs = SupervisorPrograms {
         codex: program.clone(),
         claude: claude.clone(),
+        omp: omp.clone(),
     };
     let worktree_root = database_path
         .parent()
@@ -1007,7 +1019,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(BridgeInput::Request(Request::Capabilities)) => response(json!({
                 "kind":"capabilities",
                 "repository":root.as_ref().map(|root| root.display().to_string()),
-                "providers":quick_prompt_providers(&provider_settings, program.is_some(), claude.is_some())
+                "providers":quick_prompt_providers(&provider_settings, program.is_some(), claude.is_some(), omp.is_some())
             })),
             Ok(BridgeInput::Request(Request::ActiveTask)) => match runtime
                 .block_on(active_task(supervisor.as_ref()))
@@ -1350,7 +1362,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .as_mut()
                             .map(|supervisor| {
                                 provider_settings
-                                    .build_registry(program.is_some(), claude.is_some())
+                                    .build_registry(
+                                        program.is_some(),
+                                        claude.is_some(),
+                                        omp.is_some(),
+                                    )
                                     .map_err(|_| "provider registry could not be rebuilt")
                                     .and_then(|registry| {
                                         supervisor

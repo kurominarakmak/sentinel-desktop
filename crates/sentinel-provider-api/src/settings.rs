@@ -2,14 +2,12 @@
 
 use crate::{
     gemini::GeminiAdapter,
-    glm::GlmAdapter,
-    kimi::KimiAdapter,
-    managed_claude_config, managed_codex_config,
+    managed_claude_config, managed_codex_config, managed_omp_config,
     openai_compatible::{CustomProviderSpec, OpenAiCompatibleAdapter},
     CredentialError, CredentialState, CredentialStore, ProviderAdapter, ProviderCapabilities,
     ProviderConfig, ProviderError, ProviderId, ProviderRegistry, ProviderRole, ProviderSelection,
     ProviderTransport, SecretString, WorkflowProviderConfiguration, CLAUDE_PROVIDER_ID,
-    CODEX_PROVIDER_ID,
+    CODEX_PROVIDER_ID, OMP_PROVIDER_ID,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -33,28 +31,17 @@ pub struct ProviderSettingsDocument {
 
 impl Default for ProviderSettingsDocument {
     fn default() -> Self {
-        let mut glm = GlmAdapter::new(crate::glm::DEFAULT_GLM_MODEL)
-            .expect("default GLM configuration")
-            .config()
-            .clone();
-        let mut kimi = KimiAdapter::new(crate::kimi::DEFAULT_KIMI_MODEL)
-            .expect("default Kimi configuration")
-            .config()
-            .clone();
         let mut gemini = GeminiAdapter::new(crate::gemini::DEFAULT_GEMINI_MODEL)
             .expect("default Gemini configuration")
             .config()
             .clone();
-        glm.enabled = false;
-        kimi.enabled = false;
         gemini.enabled = false;
         Self {
             version: 1,
             providers: vec![
                 managed_codex_config(true),
                 managed_claude_config(true),
-                glm,
-                kimi,
+                managed_omp_config(false),
                 gemini,
             ],
             workflow: WorkflowProviderConfiguration {
@@ -114,13 +101,11 @@ fn validate_provider_shape(provider: &ProviderConfig) -> Result<(), SettingsErro
                 return Err(SettingsError::InvalidConfiguration);
             }
         }
-        "glm" => {
-            GlmAdapter::from_config(provider.clone())
-                .map_err(|_| SettingsError::InvalidConfiguration)?;
-        }
-        "kimi" => {
-            KimiAdapter::from_config(provider.clone())
-                .map_err(|_| SettingsError::InvalidConfiguration)?;
+        OMP_PROVIDER_ID => {
+            if provider.transport != ProviderTransport::ManagedCli || provider.credential.is_some()
+            {
+                return Err(SettingsError::InvalidConfiguration);
+            }
         }
         "gemini" => {
             GeminiAdapter::from_config(provider.clone())
@@ -190,7 +175,7 @@ impl ProviderSettingsStore {
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, SettingsError> {
         let path = path.as_ref().to_path_buf();
-        let document = if path.exists() {
+        let mut document = if path.exists() {
             let bytes = std::fs::read(&path).map_err(|_| SettingsError::Storage)?;
             if bytes.len() > MAX_CONFIG_BYTES {
                 return Err(SettingsError::Corrupt);
@@ -200,6 +185,7 @@ impl ProviderSettingsStore {
         } else {
             ProviderSettingsDocument::default()
         };
+        migrate_glm_kimi_to_omp(&mut document);
         document.validate()?;
         Ok(Self {
             path,
@@ -361,6 +347,7 @@ impl ProviderSettingsStore {
         &self,
         codex_available: bool,
         claude_available: bool,
+        omp_available: bool,
     ) -> Result<ProviderRegistry, SettingsError> {
         let document = self
             .document
@@ -378,8 +365,10 @@ impl ProviderSettingsStore {
                     provider.enabled &= claude_available;
                     registry.register_managed(provider)?;
                 }
-                "glm" => registry.register_api(Arc::new(GlmAdapter::from_config(provider)?))?,
-                "kimi" => registry.register_api(Arc::new(KimiAdapter::from_config(provider)?))?,
+                OMP_PROVIDER_ID => {
+                    provider.enabled &= omp_available;
+                    registry.register_managed(provider)?;
+                }
                 "gemini" => {
                     registry.register_api(Arc::new(GeminiAdapter::from_config(provider)?))?
                 }
@@ -423,10 +412,53 @@ impl ProviderSettingsStore {
     }
 }
 
+/// Older settings stored direct GLM/Kimi API descriptors. OMP owns those
+/// provider protocols now, so retain the user's selected model while dropping
+/// the direct credential reference (OMP reads its own login/key configuration).
+fn migrate_glm_kimi_to_omp(document: &mut ProviderSettingsDocument) {
+    let selected = [&document.workflow.implementer, &document.workflow.reviewer]
+        .into_iter()
+        .chain(document.workflow.repair.iter())
+        .find_map(|selection| match selection.provider_id.as_str() {
+            "glm" => Some(format!("zai/{}", selection.model_id)),
+            "kimi" => Some(format!("moonshot/{}", selection.model_id)),
+            _ => None,
+        });
+    let had_legacy = document
+        .providers
+        .iter()
+        .any(|provider| matches!(provider.id.as_str(), "glm" | "kimi"));
+    if !had_legacy {
+        return;
+    }
+    document
+        .providers
+        .retain(|provider| !matches!(provider.id.as_str(), "glm" | "kimi"));
+    let enabled = selected.is_some();
+    let mut omp = managed_omp_config(enabled);
+    if let Some(model) = selected {
+        omp.model_id = model;
+    }
+    document.providers.push(omp.clone());
+    for selection in [
+        &mut document.workflow.implementer,
+        &mut document.workflow.reviewer,
+    ] {
+        if matches!(selection.provider_id.as_str(), "glm" | "kimi") {
+            selection.provider_id = ProviderId::new(OMP_PROVIDER_ID).expect("constant");
+            selection.model_id = omp.model_id.clone();
+        }
+    }
+    if let Some(selection) = &mut document.workflow.repair {
+        if matches!(selection.provider_id.as_str(), "glm" | "kimi") {
+            selection.provider_id = ProviderId::new(OMP_PROVIDER_ID).expect("constant");
+            selection.model_id = omp.model_id;
+        }
+    }
+}
+
 fn supported_models(provider: &ProviderConfig) -> Vec<String> {
     let documented = match provider.id.as_str() {
-        "glm" => crate::glm::SUPPORTED_GLM_MODELS,
-        "kimi" => crate::kimi::SUPPORTED_KIMI_MODELS,
         "gemini" => crate::gemini::SUPPORTED_GEMINI_MODELS,
         _ => return vec![provider.model_id.clone()],
     };
@@ -488,34 +520,38 @@ mod tests {
         let path = temporary.path().join("providers.json");
         let credentials = Arc::new(MemoryCredentialStore::default());
         let store = ProviderSettingsStore::load(&path, credentials.clone()).unwrap();
-        let kimi = ProviderId::new("kimi").unwrap();
+        let gemini = ProviderId::new("gemini").unwrap();
+        let omp = ProviderId::new(OMP_PROVIDER_ID).unwrap();
         store
-            .set_credential(&kimi, SecretString::new("never-persist-this-key").unwrap())
+            .set_credential(
+                &gemini,
+                SecretString::new("never-persist-this-key").unwrap(),
+            )
             .unwrap();
-        store.set_enabled(&kimi, true).unwrap();
+        store.set_enabled(&omp, true).unwrap();
         let codex = ProviderSelection {
             provider_id: ProviderId::new("codex").unwrap(),
             model_id: "cli-owned".into(),
         };
         store
             .set_workflow(WorkflowProviderConfiguration {
-                implementer: kimi_selection(),
+                implementer: omp_selection(),
                 reviewer: codex.clone(),
-                repair: Some(kimi_selection()),
+                repair: Some(omp_selection()),
             })
             .unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("never-persist-this-key"));
-        assert!(raw.contains("\"providerId\": \"kimi\""));
+        assert!(raw.contains("\"providerId\": \"omp\""));
 
         let reopened = ProviderSettingsStore::load(&path, credentials).unwrap();
         let snapshot = reopened.snapshot();
-        assert_eq!(snapshot.workflow.implementer.provider_id, kimi);
+        assert_eq!(snapshot.workflow.implementer.provider_id, omp);
         assert_eq!(
             snapshot
                 .providers
                 .iter()
-                .find(|provider| provider.id.as_str() == "kimi")
+                .find(|provider| provider.id.as_str() == "gemini")
                 .unwrap()
                 .credential_state,
             CredentialState::Configured
@@ -528,7 +564,7 @@ mod tests {
         let path = temporary.path().join("providers.json");
         let credentials = Arc::new(MemoryCredentialStore::default());
         let store = ProviderSettingsStore::load(&path, credentials.clone()).unwrap();
-        let glm = ProviderId::new("glm").unwrap();
+        let glm = ProviderId::new("gemini").unwrap();
         store
             .set_credential(&glm, SecretString::new("first").unwrap())
             .unwrap();
@@ -593,7 +629,7 @@ mod tests {
             .providers
             .iter()
             .any(|provider| provider.id.as_str() == "custom.company" && provider.custom));
-        let registry = store.build_registry(true, true).unwrap();
+        let registry = store.build_registry(true, true, true).unwrap();
         assert!(registry
             .provider(&ProviderId::new("custom.company").unwrap())
             .is_some());
@@ -610,10 +646,10 @@ mod tests {
         ));
     }
 
-    fn kimi_selection() -> ProviderSelection {
+    fn omp_selection() -> ProviderSelection {
         ProviderSelection {
-            provider_id: ProviderId::new("kimi").unwrap(),
-            model_id: crate::kimi::DEFAULT_KIMI_MODEL.into(),
+            provider_id: ProviderId::new(OMP_PROVIDER_ID).unwrap(),
+            model_id: "zai/glm-5.2".into(),
         }
     }
 }

@@ -56,7 +56,7 @@ struct QuickPromptView: View {
                     .focused($promptFocused)
                     .onSubmit(send)
                 HStack {
-                    Text("⌘↩ send · /codex /claude /kimi /glm /gemini · Esc hide")
+                    Text("⌘↩ send · Select OMP for GLM/Kimi · Esc hide")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
