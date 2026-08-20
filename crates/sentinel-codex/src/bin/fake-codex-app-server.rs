@@ -109,6 +109,24 @@ fn main() {
                 continue;
             }
             if method == "turn/start" {
+                if scenario == "implementation-policy" {
+                    let valid = value.get("params").is_some_and(|params| {
+                        params.get("approvalPolicy").and_then(Value::as_str) == Some("never")
+                            && params
+                                .get("sandboxPolicy")
+                                .and_then(|policy| policy.get("type"))
+                                .and_then(Value::as_str)
+                                == Some("workspaceWrite")
+                    });
+                    if !valid {
+                        println!(
+                            "{}",
+                            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"missing implementation policy"}})
+                        );
+                        let _ = output.flush();
+                        continue;
+                    }
+                }
                 println!(
                     "{}",
                     json!({"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-test","turn":{"id":"turn-test"}}})
@@ -158,6 +176,12 @@ fn main() {
                     "{}",
                     json!({"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-test","turnId":"turn-test","item":{"id":"item-test","type":"agentMessage","text":"hello"}}})
                 );
+                if scenario != "late-notification" {
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-test","turn":{"id":"turn-test"}}})
+                    );
+                }
             }
             if scenario == "rate-limit-update" && method == "thread/start" {
                 println!(

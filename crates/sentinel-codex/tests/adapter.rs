@@ -345,6 +345,22 @@ async fn app_server_starts_threads_turns_interrupts_and_persists_normalized_even
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn implementation_turn_disables_interactive_approval_in_the_owned_worktree() {
+    let _guard = fake_server_env_lock();
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "implementation-policy");
+    let (d, r, t) = fixture().await;
+    let p = CodexProgram::from_executable(fake()).unwrap();
+    let mut server = CodexAppServer::start(p, r, t.id, d.path()).await.unwrap();
+    let session = server.start_thread(d.path()).await.unwrap();
+    server
+        .start_turn(&session, "make the owned fixture edit")
+        .await
+        .unwrap();
+    server.shutdown().await.unwrap();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn malformed_frame_isolated_from_following_valid_response() {
     let _guard = fake_server_env_lock();
     let (d, r, t, mut server) =

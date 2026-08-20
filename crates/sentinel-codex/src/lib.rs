@@ -528,7 +528,20 @@ impl CodexAppServer {
         session: &CodexSession,
         prompt: &str,
     ) -> Result<CodexTurn, CodexError> {
-        self.start_turn_with_policy(session, prompt, None).await
+        // The supervisor has already proved that this App Server's process
+        // cwd is its owned task worktree.  Do not leave a native implementation
+        // turn at Codex's interactive default: no UI is connected to answer
+        // approval requests, which otherwise leaves a real task stalled after
+        // it proposes its first edit.
+        self.start_turn_with_policy(
+            session,
+            prompt,
+            Some(json!({
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "workspaceWrite"}
+            })),
+        )
+        .await
     }
 
     /// Starts a reviewer turn with an explicit provider read-only sandbox and

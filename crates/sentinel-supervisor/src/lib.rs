@@ -913,13 +913,15 @@ impl SentinelSupervisor {
             return Ok(());
         }
         let result = match task.lifecycle {
-            TaskLifecycle::Implementing if self.implementer_turn_completed(&task.id).await? => self
-                .repository
-                .v3()
-                .transition_task(&task, TaskLifecycle::Validating, now_ms())
-                .await
-                .map(|_| ())
-                .map_err(|_| SupervisorError::Storage),
+            TaskLifecycle::Implementing if self.implementer_turn_completed(&task.id).await? => {
+                self.release_completed_codex_implementer(&task.id).await?;
+                self.repository
+                    .v3()
+                    .transition_task(&task, TaskLifecycle::Validating, now_ms())
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| SupervisorError::Storage)
+            }
             TaskLifecycle::Validating => self.run_validation_stage(task.clone()).await,
             TaskLifecycle::Reviewing => self.run_review_stage(task.clone()).await,
             _ => Ok(()),
@@ -1034,6 +1036,19 @@ impl SentinelSupervisor {
             .await
             .map_err(|_| SupervisorError::Storage)
             .map(|events| events.iter().any(provider_turn_completed))
+    }
+
+    async fn release_completed_codex_implementer(
+        &mut self,
+        task_id: &TaskId,
+    ) -> Result<(), SupervisorError> {
+        let Some(OwnedProvider::Codex(started)) = self.owned.remove(task_id) else {
+            return Ok(());
+        };
+        started
+            .complete()
+            .await
+            .map_err(|_| SupervisorError::Provider)
     }
 
     fn selected_profile(&self) -> Result<ValidationProfile, SupervisorError> {
@@ -2771,7 +2786,37 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             "primary\n"
         );
         assert_eq!(task.lifecycle, TaskLifecycle::Implementing);
-        supervisor.stop(&task.id).await.unwrap();
+        for _ in 0..50 {
+            if supervisor
+                .implementer_turn_completed(&task.id)
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        supervisor.reconcile_progress().await.unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            TaskLifecycle::Validating
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .list_sessions_for_task(&task.id)
+                .await
+                .unwrap()[0]
+                .lifecycle,
+            SessionLifecycle::Completed
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

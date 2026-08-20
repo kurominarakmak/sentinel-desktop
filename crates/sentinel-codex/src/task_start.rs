@@ -73,6 +73,27 @@ impl StartedCodexTask {
         Ok(())
     }
 
+    /// Releases the completed implementation transport.  A later repair, if
+    /// required, starts its own owned App Server rather than retaining an idle
+    /// implementation child through validation and review.
+    pub async fn complete(mut self) -> Result<(), CodexError> {
+        self.server.shutdown().await?;
+        let durable = self
+            .repository
+            .v3()
+            .get_session(&self.session.session_id)
+            .await
+            .map_err(|_| CodexError::Storage)?;
+        if durable.lifecycle == SessionLifecycle::Active {
+            self.repository
+                .v3()
+                .transition_session(&durable, SessionLifecycle::Completed, now_ms())
+                .await
+                .map_err(|_| CodexError::Storage)?;
+        }
+        Ok(())
+    }
+
     pub fn into_parts(self) -> (Task, CodexAppServer, CodexSession) {
         (self.task, self.server, self.session)
     }
