@@ -149,6 +149,13 @@ pub struct SentinelSupervisor {
 }
 
 impl SentinelSupervisor {
+    #[cfg(feature = "test-support")]
+    pub fn owned_omp_pid_for_test(&self, task_id: &TaskId) -> Option<u32> {
+        match self.owned.get(task_id) {
+            Some(OwnedProvider::Omp { process, .. }) => process.child_pid_for_test(),
+            _ => None,
+        }
+    }
     pub fn new(
         repository: RunRepository,
         primary_root: impl AsRef<Path>,

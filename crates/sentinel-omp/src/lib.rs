@@ -180,6 +180,10 @@ pub struct OmpProcess {
     ready: watch::Receiver<bool>,
 }
 impl OmpProcess {
+    #[cfg(feature = "test-support")]
+    pub fn child_pid_for_test(&self) -> Option<u32> {
+        self.child.id()
+    }
     pub async fn start(
         program: OmpProgram,
         repository: RunRepository,
