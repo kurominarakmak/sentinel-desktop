@@ -14,6 +14,7 @@ use sentinel_core::{
 use sentinel_validation::{ValidationProfile, ValidationRunner};
 use sentinel_worktree::{ChangedFileState, WorktreeTransaction};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, path::Path};
 use thiserror::Error;
 
@@ -513,13 +514,21 @@ pub struct FinalApproval {
 /// action approval. Values are opaque identifiers/digests, never secrets.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionApprovalContext {
+    #[serde(rename = "t", alias = "taskId")]
     pub task_id: String,
+    #[serde(rename = "a", alias = "action")]
     pub action: String,
+    #[serde(rename = "w", alias = "worktreePath")]
     pub worktree_path: String,
+    #[serde(rename = "r", alias = "repositoryRoot")]
     pub repository_root: String,
+    #[serde(rename = "b", alias = "branch")]
     pub branch: String,
+    #[serde(rename = "h", alias = "head")]
     pub head: String,
+    #[serde(rename = "c", alias = "baseCommit")]
     pub base_commit: String,
+    #[serde(rename = "d", alias = "evidenceDigest")]
     pub evidence_digest: String,
 }
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -566,6 +575,21 @@ impl ActionAuthorizationGuard {
         context: &ActionApprovalContext,
         timestamp: i64,
     ) -> Result<Approval, ActionAuthorizationError> {
+        let approval = Self::validate(repository.clone(), approval_id, context).await?;
+        let consumed = repository
+            .v3()
+            .transition_approval(&approval, ApprovalLifecycle::Approved, timestamp)
+            .await
+            .map_err(|_| ActionAuthorizationError::Denied)?;
+        repository.v3().create_artifact(CreateArtifact { task_id: approval.task_id.clone(), kind: "authorization_audit".into(), display_name: context.action.clone(), content_hash: None, metadata: serde_json::json!({"approval_id":approval.id.to_string(),"action":context.action,"evidence_digest":context.evidence_digest,"outcome":"consumed"}) }, timestamp).await.map_err(|_| ActionAuthorizationError::Storage)?;
+        Ok(consumed)
+    }
+
+    pub async fn validate(
+        repository: RunRepository,
+        approval_id: &ApprovalId,
+        context: &ActionApprovalContext,
+    ) -> Result<Approval, ActionAuthorizationError> {
         let approval = repository
             .v3()
             .get_approval(approval_id)
@@ -604,13 +628,7 @@ impl ActionAuthorizationGuard {
         {
             return Err(ActionAuthorizationError::Denied);
         }
-        let consumed = repository
-            .v3()
-            .transition_approval(&approval, ApprovalLifecycle::Approved, timestamp)
-            .await
-            .map_err(|_| ActionAuthorizationError::Denied)?;
-        repository.v3().create_artifact(CreateArtifact { task_id: approval.task_id.clone(), kind: "authorization_audit".into(), display_name: context.action.clone(), content_hash: None, metadata: serde_json::json!({"approval_id":approval.id.to_string(),"action":context.action,"evidence_digest":context.evidence_digest,"outcome":"consumed"}) }, timestamp).await.map_err(|_| ActionAuthorizationError::Storage)?;
-        Ok(consumed)
+        Ok(approval)
     }
 }
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -774,6 +792,8 @@ impl FinalApprovalSupervisor {
             .iter()
             .map(|round| serde_json::json!({"id":round.id.to_string(),"round_number":round.round_number,"lifecycle":round.lifecycle,"created_at_ms":round.created_at_ms,"updated_at_ms":round.updated_at_ms}))
             .collect();
+        let evidence = serde_json::json!({"base_commit":worktree.base_commit,"diff":diff,"validations":validations,"findings":finding_packet,"repair_history":repair_history,"unresolved_risks":unresolved});
+        let digest = evidence_digest(&evidence)?;
         repository
             .v3()
             .create_artifact(
@@ -782,25 +802,23 @@ impl FinalApprovalSupervisor {
                     kind: "final_approval_packet".into(),
                     display_name: "final-approval".into(),
                     content_hash: None,
-                    metadata: serde_json::json!({"base_commit":worktree.base_commit,"diff":diff,"validations":validations,"findings":finding_packet,"repair_history":repair_history,"unresolved_risks":unresolved}),
+                    metadata: serde_json::json!({"evidence":evidence,"evidence_digest":digest}),
                 },
                 now(),
             )
             .await
             .map_err(|_| FinalApprovalError::Storage)?;
-        let approval = repository
-            .v3()
-            .create_approval(
-                CreateApproval {
-                    task_id,
-                    session_id: None,
-                    action_kind: "v3_final_git_action".into(),
-                    summary:
-                        "Human approval is required before any commit, merge, push, or discard."
-                            .into(),
-                },
-                now(),
-            )
+        let context = ActionApprovalContext {
+            task_id: task_id.to_string(),
+            action: "final_git_action".into(),
+            worktree_path: worktree.worktree_path,
+            repository_root: worktree.repository_root,
+            branch: worktree.branch,
+            head: worktree.base_commit.clone(),
+            base_commit: worktree.base_commit,
+            evidence_digest: digest,
+        };
+        let approval = ActionAuthorizationGuard::issue(repository, context, now())
             .await
             .map_err(|_| FinalApprovalError::Storage)?;
         Ok(FinalApproval {
@@ -836,6 +854,53 @@ impl FinalApprovalSupervisor {
         }
         Ok(updated)
     }
+
+    pub async fn current_action_context(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+    ) -> Result<ActionApprovalContext, FinalApprovalError> {
+        let worktree = WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| FinalApprovalError::Reconciliation)?;
+        let diff = WorktreeTransaction::diff_text(repository.clone(), task_id.clone(), main)
+            .await
+            .map_err(|_| FinalApprovalError::Reconciliation)?;
+        let validations = review_validations(&repository, &task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let findings = repository
+            .v3()
+            .list_review_findings(&task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let finding_packet: Vec<_> = findings.iter().map(|finding| serde_json::json!({"id":finding.id.to_string(),"severity":finding.severity,"disposition":finding.disposition,"summary":finding.summary,"evidence":finding.evidence})).collect();
+        let unresolved: Vec<_> = findings.iter().filter(|finding| finding.disposition != FindingDisposition::Repaired && finding.disposition != FindingDisposition::Dismissed).map(|finding| serde_json::json!({"id":finding.id.to_string(),"severity":finding.severity,"summary":finding.summary,"disposition":finding.disposition})).collect();
+        let history = repository
+            .v3()
+            .list_repair_rounds(&task_id)
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        let repair_history: Vec<_> = history.iter().map(|round| serde_json::json!({"id":round.id.to_string(),"round_number":round.round_number,"lifecycle":round.lifecycle,"created_at_ms":round.created_at_ms,"updated_at_ms":round.updated_at_ms})).collect();
+        let evidence = serde_json::json!({"base_commit":worktree.base_commit,"diff":diff,"validations":validations,"findings":finding_packet,"repair_history":repair_history,"unresolved_risks":unresolved});
+        Ok(ActionApprovalContext {
+            task_id: task_id.to_string(),
+            action: "final_git_action".into(),
+            worktree_path: worktree.worktree_path,
+            repository_root: worktree.repository_root,
+            branch: worktree.branch,
+            head: worktree.base_commit.clone(),
+            base_commit: worktree.base_commit,
+            evidence_digest: evidence_digest(&evidence)?,
+        })
+    }
+}
+
+fn evidence_digest(value: &serde_json::Value) -> Result<String, FinalApprovalError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).map_err(|_| FinalApprovalError::Storage)?)
+    ))
 }
 
 #[cfg(test)]
@@ -1738,5 +1803,70 @@ mod tests {
                 .lifecycle,
             ApprovalLifecycle::Denied
         );
+    }
+
+    #[tokio::test]
+    async fn final_approval_digest_rejects_stale_diff_and_allows_a_new_generation() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        owned_session(&repo, &id).await;
+        let repair = Repairing {
+            evidence: RepairEvidence {
+                changed_files: vec![],
+            },
+            seen: Mutex::new(None),
+        };
+        let first = FinalApprovalSupervisor::prepare(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &Fixed(vec![]),
+            &repair,
+            1,
+        )
+        .await
+        .unwrap();
+        let first_context =
+            FinalApprovalSupervisor::current_action_context(repo.clone(), id.clone(), main.path())
+                .await
+                .unwrap();
+        ActionAuthorizationGuard::validate(repo.clone(), &first.approval.id, &first_context)
+            .await
+            .unwrap();
+        let worktree = WorktreeTransaction::reopen(repo.clone(), id.clone(), main.path())
+            .await
+            .unwrap();
+        fs::write(
+            Path::new(&worktree.worktree_path).join("README.md"),
+            "changed evidence\n",
+        )
+        .unwrap();
+        let changed =
+            FinalApprovalSupervisor::current_action_context(repo.clone(), id.clone(), main.path())
+                .await
+                .unwrap();
+        assert_ne!(first_context.evidence_digest, changed.evidence_digest);
+        assert_eq!(
+            ActionAuthorizationGuard::validate(repo.clone(), &first.approval.id, &changed).await,
+            Err(ActionAuthorizationError::Denied)
+        );
+        let second = FinalApprovalSupervisor::prepare(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &Fixed(vec![]),
+            &repair,
+            1,
+        )
+        .await
+        .unwrap();
+        let current =
+            FinalApprovalSupervisor::current_action_context(repo.clone(), id.clone(), main.path())
+                .await
+                .unwrap();
+        ActionAuthorizationGuard::validate(repo, &second.approval.id, &current)
+            .await
+            .unwrap();
     }
 }

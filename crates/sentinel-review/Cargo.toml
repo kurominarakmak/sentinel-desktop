@@ -10,6 +10,7 @@ sentinel-worktree = { path = "../sentinel-worktree" }
 sentinel-validation = { path = "../sentinel-validation" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

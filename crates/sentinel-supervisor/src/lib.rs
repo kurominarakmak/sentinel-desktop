@@ -32,9 +32,9 @@ use sentinel_provider_api::{
     OMP_PROVIDER_ID,
 };
 use sentinel_review::{
-    FinalApprovalError, FinalApprovalSupervisor, FindingSeverity, RepairError, RepairEvidence,
-    RepairFinding, RepairImplementer, RepairPacket, ReviewCandidate, ReviewError, ReviewPacket,
-    ReviewSupervisor, ReviewValidation, Reviewer,
+    ActionAuthorizationGuard, FinalApprovalError, FinalApprovalSupervisor, FindingSeverity,
+    RepairError, RepairEvidence, RepairFinding, RepairImplementer, RepairPacket, ReviewCandidate,
+    ReviewError, ReviewPacket, ReviewSupervisor, ReviewValidation, Reviewer,
 };
 use sentinel_validation::{load_repository_profiles, ValidationProfile, ValidationSupervisor};
 use sentinel_worktree::{TransactionError, WorktreeTransaction};
@@ -680,7 +680,7 @@ impl SentinelSupervisor {
             .into_iter()
             .rev()
             .find(|approval| {
-                approval.action_kind == "v3_final_git_action"
+                approval.action_kind == "v3_action:final_git_action"
                     && approval.lifecycle == ApprovalLifecycle::Pending
             })
             .map(|approval| approval.id);
@@ -869,11 +869,21 @@ impl SentinelSupervisor {
             .await
             .map_err(|_| SupervisorError::NotAvailable)?;
         if approval.task_id != *task_id
-            || approval.action_kind != "v3_final_git_action"
+            || approval.action_kind != "v3_action:final_git_action"
             || approval.lifecycle != ApprovalLifecycle::Pending
         {
             return Err(SupervisorError::NotAvailable);
         }
+        let context = FinalApprovalSupervisor::current_action_context(
+            self.repository.clone(),
+            task_id.clone(),
+            &self.primary_root,
+        )
+        .await
+        .map_err(|_| SupervisorError::NotAvailable)?;
+        ActionAuthorizationGuard::validate(self.repository.clone(), approval_id, &context)
+            .await
+            .map_err(|_| SupervisorError::NotAvailable)?;
         match FinalApprovalSupervisor::require_human_approval(
             self.repository.clone(),
             approval_id,
@@ -1913,7 +1923,7 @@ impl SentinelSupervisor {
                     .await
                     .map_err(|_| SupervisorError::Storage)?
                     .iter()
-                    .any(|approval| approval.action_kind == "v3_final_git_action");
+                    .any(|approval| approval.action_kind == "v3_action:final_git_action");
                 if packet_exists && approval_exists {
                     self.repository
                         .v3()
@@ -3319,7 +3329,7 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
                 CreateApproval {
                     task_id: ready.id.clone(),
                     session_id: None,
-                    action_kind: "v3_final_git_action".into(),
+                    action_kind: "v3_action:final_git_action".into(),
                     summary: "human required".into(),
                 },
                 7,
