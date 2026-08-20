@@ -7,11 +7,12 @@ use sentinel_core::{
     v3::{
         AgentSession, Approval, ApprovalId, ApprovalLifecycle, CreateApproval, CreateArtifact,
         CreateRepairRound, CreateReviewFinding, FindingDisposition, RepairRoundId,
-        RepairRoundLifecycle, ReviewFinding, SessionLifecycle, TaskId, ValidationLifecycle,
+        RepairRoundLifecycle, ReviewFinding, ReviewGenerationId, SessionLifecycle, TaskId,
+        ValidationLifecycle,
     },
     CoreError, RunRepository,
 };
-use sentinel_validation::{ValidationProfile, ValidationRunner};
+use sentinel_validation::{digest, review_generation_digest, ValidationProfile, ValidationRunner};
 use sentinel_worktree::{ChangedFileState, WorktreeTransaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +43,8 @@ pub struct ReviewPacket {
     pub diff: String,
     pub changed_files: Vec<ChangedFileState>,
     pub validations: Vec<ReviewValidation>,
+    pub review_generation_id: String,
+    pub review_generation_digest: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewCandidate {
@@ -65,6 +68,8 @@ pub struct ReviewReport {
 }
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ReviewError {
+    #[error("validation evidence is stale; revalidation is required")]
+    StaleValidation,
     #[error("worktree reconciliation is required")]
     Reconciliation,
     #[error("reviewer returned a malformed finding")]
@@ -94,6 +99,11 @@ impl ReviewSupervisor {
         main: &Path,
     ) -> Result<ReviewPacket, ReviewError> {
         let task = repository.v3().get_task(&task_id).await.map_err(map_core)?;
+        let generation = repository
+            .v3()
+            .latest_review_generation(&task_id)
+            .await
+            .map_err(|_| ReviewError::StaleValidation)?;
         let worktree = WorktreeTransaction::reopen(repository.clone(), task_id.clone(), main)
             .await
             .map_err(|_| ReviewError::Reconciliation)?;
@@ -118,15 +128,35 @@ impl ReviewSupervisor {
                 outcome: execution.map(|v| v.outcome),
             });
         }
+        let evidence =
+            WorktreeTransaction::review_evidence(repository.clone(), task_id.clone(), main)
+                .await
+                .map_err(|_| ReviewError::Reconciliation)?;
+        let current_diff_digest = digest(&evidence.diff_text);
+        let current_generation = review_generation_digest(
+            &task_id,
+            &evidence.base_commit,
+            &evidence.revision,
+            &current_diff_digest,
+            &generation.validation_evidence,
+        )
+        .map_err(|_| ReviewError::Storage)?;
+        if generation.digest != current_generation
+            || generation.base_commit != evidence.base_commit
+            || generation.worktree_revision != evidence.revision
+            || generation.diff_digest != current_diff_digest
+        {
+            return Err(ReviewError::StaleValidation);
+        }
         Ok(ReviewPacket {
             task_id: task_id.to_string(),
             task_summary: task.summary,
             base_commit: worktree.base_commit,
-            diff: WorktreeTransaction::diff_text(repository.clone(), task_id.clone(), main)
-                .await
-                .map_err(|_| ReviewError::Reconciliation)?,
+            diff: evidence.diff_text,
             changed_files: diff.files,
             validations: facts,
+            review_generation_id: generation.id.to_string(),
+            review_generation_digest: generation.digest,
         })
     }
 
@@ -139,6 +169,7 @@ impl ReviewSupervisor {
         if candidates.iter().any(|candidate| !valid(candidate)) {
             return Err(ReviewError::MalformedFinding);
         }
+        let generation_id = ReviewGenerationId(packet.review_generation_id.clone());
         let existing = repository
             .v3()
             .list_review_findings(&task_id)
@@ -163,7 +194,8 @@ impl ReviewSupervisor {
                 evidence
             );
             let duplicate = existing.iter().any(|finding| {
-                finding.severity == severity(&candidate.severity)
+                finding.review_generation_id.as_ref() == Some(&generation_id)
+                    && finding.severity == severity(&candidate.severity)
                     && finding.summary == candidate.summary
                     && finding.evidence == evidence
             }) || !seen.insert(key);
@@ -177,6 +209,7 @@ impl ReviewSupervisor {
                     CreateReviewFinding {
                         task_id: task_id.clone(),
                         repair_round_id: None,
+                        review_generation_id: Some(generation_id.clone()),
                         severity: severity(&candidate.severity).into(),
                         summary: candidate.summary,
                         evidence,
@@ -907,7 +940,8 @@ fn evidence_digest(value: &serde_json::Value) -> Result<String, FinalApprovalErr
 mod tests {
     use super::*;
     use sentinel_core::v3::{
-        CreateSession, CreateTask, CreateValidationResult, ValidationExecution, ValidationLifecycle,
+        CreateReviewGeneration, CreateSession, CreateTask, CreateValidationResult,
+        ValidationExecution, ValidationLifecycle,
     };
     use std::{fs, path::Path, process::Command, sync::Mutex};
     use tempfile::TempDir;
@@ -1026,6 +1060,33 @@ mod tests {
             "pub fn changed() {}\n",
         )
         .unwrap();
+        let evidence =
+            WorktreeTransaction::review_evidence(repo.clone(), task.id.clone(), main.path())
+                .await
+                .unwrap();
+        let diff_digest = digest(&evidence.diff_text);
+        let generation_digest = review_generation_digest(
+            &task.id,
+            &evidence.base_commit,
+            &evidence.revision,
+            &diff_digest,
+            &serde_json::json!([]),
+        )
+        .unwrap();
+        repo.v3()
+            .create_review_generation(
+                CreateReviewGeneration {
+                    task_id: task.id.clone(),
+                    digest: generation_digest,
+                    base_commit: evidence.base_commit,
+                    worktree_revision: evidence.revision,
+                    diff_digest,
+                    validation_evidence: serde_json::json!([]),
+                },
+                2,
+            )
+            .await
+            .unwrap();
         (main, database, worktree_root, repo, task.id)
     }
     #[test]
@@ -1127,6 +1188,79 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+    #[tokio::test]
+    async fn successful_validation_binds_the_generation_used_by_review() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        ValidationRunner::run_profile(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &mut cancellation,
+        )
+        .await
+        .unwrap();
+        let generation = repo.v3().latest_review_generation(&id).await.unwrap();
+        let packet = ReviewSupervisor::build_packet(repo, id, main.path())
+            .await
+            .unwrap();
+        assert_eq!(packet.review_generation_id, generation.id.to_string());
+        assert_eq!(packet.review_generation_digest, generation.digest);
+    }
+    #[tokio::test]
+    async fn changed_diff_rejects_review_as_stale_validation() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let worktree = repo.v3().get_task_worktree(&id).await.unwrap();
+        fs::write(
+            Path::new(&worktree.worktree_path).join("changed.rs"),
+            "pub fn changed() { panic!() }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ReviewSupervisor::build_packet(repo, id, main.path())
+                .await
+                .unwrap_err(),
+            ReviewError::StaleValidation
+        );
+    }
+    #[tokio::test]
+    async fn fresh_findings_persist_once_for_the_same_generation() {
+        let (main, _database, _root, repo, id) = fixture().await;
+        let packet = ReviewSupervisor::build_packet(repo.clone(), id.clone(), main.path())
+            .await
+            .unwrap();
+        let first = ReviewSupervisor::persist_candidates(
+            repo.clone(),
+            id.clone(),
+            &packet,
+            vec![finding()],
+        )
+        .await
+        .unwrap();
+        let second = ReviewSupervisor::persist_candidates(
+            repo.clone(),
+            id.clone(),
+            &packet,
+            vec![finding()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (first.persisted, second.persisted, second.deduplicated),
+            (1, 0, 1)
+        );
+        let findings = repo.v3().list_review_findings(&id).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0]
+                .review_generation_id
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            packet.review_generation_id
+        );
     }
     #[tokio::test]
     async fn blocker_finding_is_persisted_with_location_evidence_and_disposition() {
@@ -1387,6 +1521,7 @@ mod tests {
                 CreateReviewFinding {
                     task_id: id.clone(),
                     repair_round_id: None,
+                    review_generation_id: None,
                     severity: "blocker".into(),
                     summary: "unsupported claim".into(),
                     evidence: serde_json::json!({"file":"changed.rs","line":2,"evidence":""}),
@@ -1850,6 +1985,16 @@ mod tests {
             ActionAuthorizationGuard::validate(repo.clone(), &first.approval.id, &changed).await,
             Err(ActionAuthorizationError::Denied)
         );
+        let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
+        ValidationRunner::run_profile(
+            repo.clone(),
+            id.clone(),
+            main.path(),
+            profile("/usr/bin/true"),
+            &mut cancellation,
+        )
+        .await
+        .unwrap();
         let second = FinalApprovalSupervisor::prepare(
             repo.clone(),
             id.clone(),

@@ -7,6 +7,7 @@ use sentinel_core::{
 };
 use sentinel_git::{inspect_repository, resolve_exact_head, RepositoryState};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -42,6 +43,12 @@ pub struct ChangedFileState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeDiff {
     pub files: Vec<ChangedFileState>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewWorktreeEvidence {
+    pub base_commit: String,
+    pub revision: String,
+    pub diff_text: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergePreparation {
@@ -83,8 +90,38 @@ impl WorktreeTransaction {
         {
             text.push_str("\n# untracked file: ");
             text.push_str(&file.path);
+            let path = Path::new(&worktree.worktree_path).join(&file.path);
+            if std::fs::symlink_metadata(&path)
+                .map_err(|_| TransactionError::Git)?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(TransactionError::Git);
+            }
+            let bytes = std::fs::read(path).map_err(|_| TransactionError::Git)?;
+            text.push_str(" sha256:");
+            text.push_str(&format!("{:x}", Sha256::digest(bytes)));
         }
         Ok(text)
+    }
+    /// Read-only evidence used to bind a validation run to its exact review input.
+    pub async fn review_evidence(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+    ) -> Result<ReviewWorktreeEvidence, TransactionError> {
+        let worktree = Self::reopen(repository.clone(), task_id.clone(), main).await?;
+        let revision = git_output(
+            Path::new(&worktree.worktree_path),
+            &["rev-parse", "--verify", "HEAD^{commit}"],
+        )
+        .await?;
+        let diff_text = Self::diff_text(repository, task_id, main).await?;
+        Ok(ReviewWorktreeEvidence {
+            base_commit: worktree.base_commit,
+            revision,
+            diff_text,
+        })
     }
     pub async fn create(
         repository: RunRepository,

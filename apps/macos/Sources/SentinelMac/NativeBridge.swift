@@ -472,6 +472,14 @@ final class NativeBridge: ObservableObject {
         }
     }
 
+    func retryReview(taskID: String) {
+        let requestID = UUID().uuidString.lowercased()
+        guard send(["kind": "retry_review", "request_id": requestID, "task_id": taskID]) else {
+            attentionActionMessage = "Native bridge is unavailable."
+            return
+        }
+    }
+
     func loadTaskDetail(taskID: String? = nil) {
         guard let taskID = taskID ?? attention?.task.id ?? activeTask?.id else { return }
         _ = send(["kind": "task_detail", "task_id": taskID])

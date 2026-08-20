@@ -1,13 +1,15 @@
 use sentinel_core::{
     redact,
     v3::{
-        CreateArtifact, CreateValidationResult, TaskId, ValidationExecution, ValidationLifecycle,
+        CreateArtifact, CreateReviewGeneration, CreateValidationResult, TaskId,
+        ValidationExecution, ValidationLifecycle,
     },
     RunRepository,
 };
 use sentinel_process::{ProcessEvent, SupervisedProcess};
 use sentinel_worktree::WorktreeTransaction;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -171,8 +173,64 @@ impl ValidationRunner {
                 .map_err(|_| ValidationError::Storage)?;
             results.push(execution);
         }
+        if results.iter().all(|result| result.outcome == "passed") {
+            let evidence =
+                WorktreeTransaction::review_evidence(repository.clone(), task_id.clone(), main)
+                    .await
+                    .map_err(|_| ValidationError::Worktree)?;
+            let validations = serde_json::json!(results
+                .iter()
+                .map(|result| serde_json::json!({
+                    "validation_id": result.validation_id.to_string(),
+                    "execution_id": result.validation_id.to_string(),
+                    "outcome": result.outcome,
+                }))
+                .collect::<Vec<_>>());
+            let diff_digest = digest(&evidence.diff_text);
+            let generation_digest = review_generation_digest(
+                &task_id,
+                &evidence.base_commit,
+                &evidence.revision,
+                &diff_digest,
+                &validations,
+            )?;
+            repository
+                .v3()
+                .create_review_generation(
+                    CreateReviewGeneration {
+                        task_id: task_id.clone(),
+                        digest: generation_digest,
+                        base_commit: evidence.base_commit,
+                        worktree_revision: evidence.revision,
+                        diff_digest,
+                        validation_evidence: validations,
+                    },
+                    now(),
+                )
+                .await
+                .map_err(|_| ValidationError::Storage)?;
+        }
         Ok(ValidationReport { results })
     }
+}
+pub fn review_generation_digest(
+    task_id: &TaskId,
+    base_commit: &str,
+    worktree_revision: &str,
+    diff_digest: &str,
+    validation_evidence: &serde_json::Value,
+) -> Result<String, ValidationError> {
+    let canonical = serde_json::json!({
+        "task_id": task_id.to_string(), "base_commit": base_commit,
+        "worktree_revision": worktree_revision, "diff_digest": diff_digest,
+        "validations": validation_evidence,
+    });
+    serde_json::to_vec(&canonical)
+        .map(|value| format!("sha256:{:x}", Sha256::digest(value)))
+        .map_err(|_| ValidationError::Storage)
+}
+pub fn digest(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
 }
 fn redact_execution(mut execution: ValidationExecution) -> ValidationExecution {
     execution.command_json = redact_secrets(&execution.command_json);

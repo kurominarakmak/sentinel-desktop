@@ -42,6 +42,7 @@ v3_id!(SessionId);
 v3_id!(ApprovalId);
 v3_id!(ValidationResultId);
 v3_id!(ReviewFindingId);
+v3_id!(ReviewGenerationId);
 v3_id!(RepairRoundId);
 v3_id!(ArtifactId);
 v3_id!(EventId);
@@ -149,6 +150,7 @@ impl TaskLifecycle {
                         | Self::Cancelled
                         | Self::Failed
                 )
+                | (Self::Blocked, Self::Reviewing)
         );
         valid
             .then_some(next)
@@ -489,6 +491,7 @@ pub struct ReviewFinding {
     pub id: ReviewFindingId,
     pub task_id: TaskId,
     pub repair_round_id: Option<RepairRoundId>,
+    pub review_generation_id: Option<ReviewGenerationId>,
     pub severity: String,
     pub disposition: FindingDisposition,
     pub summary: String,
@@ -500,9 +503,30 @@ pub struct ReviewFinding {
 pub struct CreateReviewFinding {
     pub task_id: TaskId,
     pub repair_round_id: Option<RepairRoundId>,
+    pub review_generation_id: Option<ReviewGenerationId>,
     pub severity: String,
     pub summary: String,
     pub evidence: Value,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewGeneration {
+    pub id: ReviewGenerationId,
+    pub task_id: TaskId,
+    pub digest: String,
+    pub base_commit: String,
+    pub worktree_revision: String,
+    pub diff_digest: String,
+    pub validation_evidence: Value,
+    pub created_at_ms: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateReviewGeneration {
+    pub task_id: TaskId,
+    pub digest: String,
+    pub base_commit: String,
+    pub worktree_revision: String,
+    pub diff_digest: String,
+    pub validation_evidence: Value,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Artifact {
@@ -1264,6 +1288,7 @@ impl V3Repository {
             id: ReviewFindingId::new(),
             task_id: input.task_id,
             repair_round_id: input.repair_round_id,
+            review_generation_id: input.review_generation_id,
             severity: input.severity,
             disposition: FindingDisposition::Reported,
             summary: input.summary,
@@ -1271,9 +1296,60 @@ impl V3Repository {
             created_at_ms: timestamp,
             updated_at_ms: timestamp,
         };
-        sqlx::query("INSERT INTO v3_review_findings (id,task_id,repair_round_id,severity,disposition,summary,evidence_json,created_at_ms,updated_at_ms) VALUES (?,?,?,?, 'reported',?,?,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(result.repair_round_id.as_ref().map(ToString::to_string)).bind(&result.severity).bind(&result.summary).bind(evidence).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
+        sqlx::query("INSERT INTO v3_review_findings (id,task_id,repair_round_id,review_generation_id,severity,disposition,summary,evidence_json,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,'reported',?,?,?,?)").bind(result.id.to_string()).bind(result.task_id.to_string()).bind(result.repair_round_id.as_ref().map(ToString::to_string)).bind(result.review_generation_id.as_ref().map(ToString::to_string)).bind(&result.severity).bind(&result.summary).bind(evidence).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_|CoreError::Storage)?;
         self.changes.changed();
         Ok(result)
+    }
+    pub async fn create_review_generation(
+        &self,
+        input: CreateReviewGeneration,
+        timestamp: i64,
+    ) -> Result<ReviewGeneration, CoreError> {
+        if input.digest.len() != 71
+            || input.diff_digest.len() != 71
+            || input.base_commit.len() != 40
+            || input.worktree_revision.len() != 40
+        {
+            return Err(CoreError::InvalidV3Record);
+        }
+        let evidence = serde_json::to_string(&input.validation_evidence)
+            .map_err(|_| CoreError::InvalidV3Record)?;
+        let result = ReviewGeneration {
+            id: ReviewGenerationId::new(),
+            task_id: input.task_id,
+            digest: input.digest,
+            base_commit: input.base_commit,
+            worktree_revision: input.worktree_revision,
+            diff_digest: input.diff_digest,
+            validation_evidence: input.validation_evidence,
+            created_at_ms: timestamp,
+        };
+        sqlx::query("INSERT INTO v3_review_generations (id,task_id,digest,base_commit,worktree_revision,diff_digest,validation_evidence_json,created_at_ms) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(task_id,digest) DO NOTHING")
+            .bind(result.id.to_string()).bind(result.task_id.to_string()).bind(&result.digest).bind(&result.base_commit).bind(&result.worktree_revision).bind(&result.diff_digest).bind(evidence).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
+        self.get_review_generation_by_digest(&result.task_id, &result.digest)
+            .await
+    }
+    pub async fn latest_review_generation(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<ReviewGeneration, CoreError> {
+        sqlx::query("SELECT * FROM v3_review_generations WHERE task_id=? ORDER BY created_at_ms DESC,id DESC LIMIT 1").bind(task_id.to_string()).fetch_optional(&self.pool).await.map_err(|_| CoreError::Storage)?.map(|row| review_generation_from(&row)).transpose()?.ok_or(CoreError::NotFound)
+    }
+    pub async fn get_review_generation_by_digest(
+        &self,
+        task_id: &TaskId,
+        digest: &str,
+    ) -> Result<ReviewGeneration, CoreError> {
+        sqlx::query("SELECT * FROM v3_review_generations WHERE task_id=? AND digest=?")
+            .bind(task_id.to_string())
+            .bind(digest)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .map(|row| review_generation_from(&row))
+            .transpose()?
+            .ok_or(CoreError::NotFound)
     }
     pub async fn get_review_finding(
         &self,
@@ -1590,6 +1666,9 @@ fn finding_from(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewFinding, CoreErro
         repair_round_id: row
             .get::<Option<String>, _>("repair_round_id")
             .map(RepairRoundId),
+        review_generation_id: row
+            .get::<Option<String>, _>("review_generation_id")
+            .map(ReviewGenerationId),
         severity: row.get("severity"),
         disposition: enum_parse(&row.get::<String, _>("disposition"))?,
         summary: row.get("summary"),
@@ -1597,6 +1676,21 @@ fn finding_from(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewFinding, CoreErro
             .map_err(|_| CoreError::CorruptV3State)?,
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
+    })
+}
+fn review_generation_from(row: &sqlx::sqlite::SqliteRow) -> Result<ReviewGeneration, CoreError> {
+    Ok(ReviewGeneration {
+        id: ReviewGenerationId(row.get("id")),
+        task_id: TaskId(row.get("task_id")),
+        digest: row.get("digest"),
+        base_commit: row.get("base_commit"),
+        worktree_revision: row.get("worktree_revision"),
+        diff_digest: row.get("diff_digest"),
+        validation_evidence: serde_json::from_str(
+            &row.get::<String, _>("validation_evidence_json"),
+        )
+        .map_err(|_| CoreError::CorruptV3State)?,
+        created_at_ms: row.get("created_at_ms"),
     })
 }
 fn artifact_from(row: &sqlx::sqlite::SqliteRow) -> Result<Artifact, CoreError> {

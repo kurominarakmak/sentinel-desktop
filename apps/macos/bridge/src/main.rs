@@ -53,6 +53,10 @@ enum Request {
         task_id: String,
         prompt: String,
     },
+    RetryReview {
+        request_id: String,
+        task_id: String,
+    },
     AttentionAction {
         request_id: String,
         action: String,
@@ -129,6 +133,7 @@ struct TaskDto {
 #[serde(rename_all = "camelCase")]
 struct AttentionActionsDto {
     stop: bool,
+    retry_review: bool,
     approve: bool,
     reject: bool,
     approval_id: Option<String>,
@@ -432,6 +437,7 @@ async fn attention_state(
             .then(|| format!("{blockers} blocker{}", if blockers == 1 { "" } else { "s" })),
         actions: AttentionActionsDto {
             stop: actions.stop,
+            retry_review: actions.retry_review,
             approve: actions.approve,
             reject: actions.reject,
             approval_id: actions.approval_id.map(|approval| approval.to_string()),
@@ -658,6 +664,7 @@ async fn task_detail(
         .map(|state| state.actions)
         .unwrap_or(AttentionActionsDto {
             stop: false,
+            retry_review: false,
             approve: false,
             reject: false,
             approval_id: None,
@@ -1213,6 +1220,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            Ok(BridgeInput::Request(Request::RetryReview {
+                request_id,
+                task_id,
+            })) => {
+                let fingerprint = request_fingerprint(&json!({"task_id": task_id}));
+                let payload = match reserve_mutation(&runtime, &repository, &request_id, "retry_review", &fingerprint) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(|_| json!({"kind":"error","message":"stored review retry response is invalid"})));
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::Pending) | Err(()) => json!({"kind":"retry_review_result","requestId":request_id,"accepted":false,"message":"review retry is already pending or conflicts"}),
+                    Ok(SupervisorRequestReservation::New) => match supervisor.as_mut() {
+                        Some(supervisor) => match runtime.block_on(supervisor.retry_review(&TaskId(task_id.clone()))) {
+                            Ok(()) => runtime.block_on(supervisor.repository().v3().get_task(&TaskId(task_id))).map(|task| json!({"kind":"retry_review_result","requestId":request_id,"accepted":true,"task":task_dto(task)})).unwrap_or_else(|_| json!({"kind":"retry_review_result","requestId":request_id,"accepted":false,"message":"refreshed task state unavailable"})),
+                            Err(_) => json!({"kind":"retry_review_result","requestId":request_id,"accepted":false,"message":"review retry was rejected; revalidation may be required"}),
+                        },
+                        None => json!({"kind":"retry_review_result","requestId":request_id,"accepted":false,"message":"repository is unavailable or invalid"}),
+                    },
+                };
+                if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                    response(payload);
+                } else {
+                    response(
+                        json!({"kind":"error","message":"review retry response could not be durably confirmed"}),
+                    );
+                }
+            }
             Ok(BridgeInput::Request(Request::AttentionAction {
                 request_id,
                 action,
@@ -1529,6 +1563,12 @@ mod tests {
             Ok(Request::ActiveTask)
         ));
         assert!(serde_json::from_str::<Request>(r#"{"kind":"direct_sql"}"#).is_err());
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"retry_review","request_id":"request-1","task_id":"task-1"}"#
+            ),
+            Ok(Request::RetryReview { .. })
+        ));
     }
 
     #[test]

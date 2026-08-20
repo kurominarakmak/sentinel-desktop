@@ -95,6 +95,7 @@ pub struct StartTaskIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailableActions {
     pub stop: bool,
+    pub retry_review: bool,
     pub approve: bool,
     pub reject: bool,
     pub approval_id: Option<ApprovalId>,
@@ -667,6 +668,7 @@ impl SentinelSupervisor {
         if task.recovery_condition != RecoveryCondition::None {
             return Ok(AvailableActions {
                 stop: false,
+                retry_review: false,
                 approve: false,
                 reject: false,
                 approval_id: None,
@@ -693,10 +695,61 @@ impl SentinelSupervisor {
                     | TaskLifecycle::AwaitingApproval
                     | TaskLifecycle::Repairing
             ) && self.owned.contains_key(&task.id),
+            retry_review: task.lifecycle == TaskLifecycle::Blocked
+                && self.review_retry_allowed(&task.id).await?,
             approve: approval_id.is_some(),
             reject: approval_id.is_some(),
             approval_id,
         })
+    }
+
+    async fn review_retry_allowed(&self, task_id: &TaskId) -> Result<bool, SupervisorError> {
+        let artifacts = self
+            .repository
+            .v3()
+            .list_artifacts(task_id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        let failed_review = artifacts.iter().rev().any(|artifact| {
+            artifact.kind == "workflow_stage_failure" && artifact.display_name == "reviewing"
+        });
+        let attempts = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "review_retry_started")
+            .count();
+        Ok(failed_review && attempts < 3)
+    }
+
+    /// Performs one bounded, fresh read-only review attempt after a review-stage
+    /// failure. Evidence is rebuilt before the lifecycle changes, so stale
+    /// validation cannot be retried into review.
+    pub async fn retry_review(&mut self, task_id: &TaskId) -> Result<(), SupervisorError> {
+        let task = self
+            .repository
+            .v3()
+            .get_task(task_id)
+            .await
+            .map_err(|_| SupervisorError::NotAvailable)?;
+        if task.lifecycle != TaskLifecycle::Blocked
+            || task.recovery_condition != RecoveryCondition::None
+            || !self.review_retry_allowed(task_id).await?
+        {
+            return Err(SupervisorError::NotAvailable);
+        }
+        ReviewSupervisor::build_packet(
+            self.repository.clone(),
+            task_id.clone(),
+            &self.primary_root,
+        )
+        .await
+        .map_err(|_| SupervisorError::NotAvailable)?;
+        self.repository.v3().create_artifact(CreateArtifact { task_id: task_id.clone(), kind: "review_retry_started".into(), display_name: "fresh-read-only-review".into(), content_hash: None, metadata: serde_json::json!({"attempt": self.repository.v3().list_artifacts(task_id).await.map_err(|_| SupervisorError::Storage)?.iter().filter(|a| a.kind == "review_retry_started").count() + 1}), }, now_ms()).await.map_err(|_| SupervisorError::Storage)?;
+        self.repository
+            .v3()
+            .transition_task(&task, TaskLifecycle::Reviewing, now_ms())
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.reconcile_progress().await
     }
 
     pub async fn stop(&mut self, task_id: &TaskId) -> Result<(), SupervisorError> {
@@ -1453,8 +1506,10 @@ impl SentinelSupervisor {
                         task_id: task.id.clone(),
                         provider: reviewer.provider_id.to_string(),
                         provider_session_ref: format!(
-                            "sentinel-api-review:{}:{}",
-                            reviewer.provider_id, task.id
+                            "sentinel-api-review:{}:{}:{}",
+                            reviewer.provider_id,
+                            task.id,
+                            now_ms()
                         ),
                     },
                     now_ms(),
@@ -1463,7 +1518,7 @@ impl SentinelSupervisor {
                 .map_err(|_| SupervisorError::Storage)?;
             activate_session(&self.repository, &session.id).await?;
             let request = ProviderRequest {
-                request_id: format!("review-{}", task.id),
+                request_id: format!("review-{}-{}", task.id, now_ms()),
                 model_id: reviewer.model_id.clone(),
                 messages: vec![
                     ProviderMessage {

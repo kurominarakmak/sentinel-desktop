@@ -291,6 +291,7 @@ async fn sessions_approvals_validation_findings_rounds_and_artifacts_survive_reo
             CreateReviewFinding {
                 task_id: task.id.clone(),
                 repair_round_id: Some(round.id.clone()),
+                review_generation_id: None,
                 severity: "high".into(),
                 summary: "fixture finding".into(),
                 evidence: json!({"path":"src/lib.rs","line":1}),
