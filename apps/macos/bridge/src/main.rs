@@ -1081,6 +1081,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 subscribed = true;
                 last_snapshot = None;
                 last_status = None;
+                // A provider may have persisted progress before this client
+                // attaches. Reconcile that durable evidence now rather than
+                // waiting for an unrelated future repository notification.
+                if let Some(supervisor) = supervisor.as_mut() {
+                    let _ = runtime.block_on(supervisor.reconcile_progress());
+                }
                 response(json!({"kind":"subscribed"}));
             }
             Ok(BridgeInput::Request(Request::StartTask {
