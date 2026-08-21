@@ -1034,6 +1034,23 @@ impl SentinelSupervisor {
         Ok(())
     }
 
+    /// Called by a host that is about to relinquish all owned provider handles.
+    /// Persist recovery before those handles are dropped: in particular, OMP RPC
+    /// exits cleanly when its stdin is closed, which is never task completion.
+    pub async fn prepare_for_host_shutdown(&mut self) -> Result<(), SupervisorError> {
+        let owned = self.owned.keys().cloned().collect::<Vec<_>>();
+        for task_id in owned {
+            self.repository
+                .v3()
+                .restore_unfinished_task(&task_id, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            self.persist_reconciliation(&task_id, "host", "owner_shutdown_recovery")
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn reconcile_interrupted_omp_runs(&mut self) -> Result<(), SupervisorError> {
         let omp_tasks = self
             .owned
@@ -2827,6 +2844,188 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             claude,
             cwd_evidence,
         }
+    }
+
+    #[cfg(unix)]
+    fn fake_omp(root: &Path, exit_after_prompt: bool) -> OmpProgram {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.join(if exit_after_prompt {
+            "fake-omp-exit"
+        } else {
+            "fake-omp-live"
+        });
+        let tail = if exit_after_prompt {
+            "exit 0"
+        } else {
+            "while IFS= read -r _; do :; done"
+        };
+        fs::write(&executable, format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo omp-test; exit 0; fi\necho '{{\"type\":\"ready\"}}'\nIFS= read -r line\nid=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\necho \"{{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":true,\\\"data\\\":{{\\\"agentInvoked\\\":true}}}}\"\n{tail}\n"
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        OmpProgram::from_executable(&executable).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_shutdown_recovers_active_omp_without_false_completion_and_is_idempotent() {
+        let fixture = fixture().await;
+        let selection = ProviderSelection {
+            provider_id: ProviderId::new(OMP_PROVIDER_ID).unwrap(),
+            model_id: "zai/glm-5.2".into(),
+            reasoning_effort: None,
+        };
+        let mut supervisor = SentinelSupervisor::with_provider_runtime(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: None,
+                claude: None,
+                omp: Some(fake_omp(fixture._temp.path(), false)),
+            },
+            Arc::new(ProviderRegistry::with_managed_cli_providers(
+                Arc::new(MemoryCredentialStore::default()),
+                false,
+                false,
+                true,
+            )),
+            WorkflowProviderConfiguration {
+                implementer: selection.clone(),
+                reviewer: selection.clone(),
+                repair: Some(selection.clone()),
+            },
+        )
+        .unwrap();
+        let task = supervisor
+            .start_configured_task(None, "live".into(), "work".into())
+            .await
+            .unwrap();
+        supervisor.prepare_for_host_shutdown().await.unwrap();
+        supervisor.prepare_for_host_shutdown().await.unwrap();
+        let recovered = fixture.repository.v3().get_task(&task.id).await.unwrap();
+        assert_eq!(recovered.lifecycle, TaskLifecycle::Recovering);
+        assert_eq!(
+            recovered.recovery_condition,
+            RecoveryCondition::NoLiveProcessAssumed
+        );
+        assert!(!fixture
+            .repository
+            .v3()
+            .list_events(&task.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(provider_turn_completed));
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .list_tasks()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|value| value.lifecycle == TaskLifecycle::Recovering)
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn independently_exited_omp_recovers_without_false_completion() {
+        let fixture = fixture().await;
+        let selection = ProviderSelection {
+            provider_id: ProviderId::new(OMP_PROVIDER_ID).unwrap(),
+            model_id: "zai/glm-5.2".into(),
+            reasoning_effort: None,
+        };
+        let mut supervisor = SentinelSupervisor::with_provider_runtime(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: None,
+                claude: None,
+                omp: Some(fake_omp(fixture._temp.path(), true)),
+            },
+            Arc::new(ProviderRegistry::with_managed_cli_providers(
+                Arc::new(MemoryCredentialStore::default()),
+                false,
+                false,
+                true,
+            )),
+            WorkflowProviderConfiguration {
+                implementer: selection.clone(),
+                reviewer: selection.clone(),
+                repair: Some(selection.clone()),
+            },
+        )
+        .unwrap();
+        let task = supervisor
+            .start_configured_task(None, "exit".into(), "work".into())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        supervisor.reconcile_progress().await.unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            TaskLifecycle::Recovering
+        );
+        assert!(!fixture
+            .repository
+            .v3()
+            .list_events(&task.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(provider_turn_completed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_shutdown_leaves_non_owned_draft_tasks_unchanged() {
+        let fixture = fixture().await;
+        let mut supervisor = SentinelSupervisor::new(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: None,
+                claude: None,
+                omp: None,
+            },
+        )
+        .unwrap();
+        let draft = fixture
+            .repository
+            .v3()
+            .create_task(
+                CreateTask {
+                    project_id: None,
+                    workflow_id: "draft".into(),
+                    summary: "unowned".into(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        supervisor.prepare_for_host_shutdown().await.unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task(&draft.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            TaskLifecycle::Draft
+        );
     }
 
     fn git(root: &Path, args: &[&str]) {

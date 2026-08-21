@@ -1543,7 +1543,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Ok(BridgeInput::WorkflowChanged | BridgeInput::ProviderStatusChanged) => {}
-            Ok(BridgeInput::Shutdown) => break,
+            Ok(BridgeInput::Shutdown) => {
+                // EOF on the client stream is not provider completion. Persist
+                // recovery before dropping the supervisor (which closes OMP's
+                // stdin and makes RPC mode exit cleanly).
+                if let Some(supervisor) = supervisor.as_mut() {
+                    let _ = runtime.block_on(supervisor.prepare_for_host_shutdown());
+                }
+                break;
+            }
             Err(_) => break,
         }
     }
@@ -1645,7 +1653,7 @@ mod tests {
     #[test]
     fn provider_settings_requests_are_typed_and_never_return_plaintext_keys() {
         let request = serde_json::from_str::<Request>(
-            r#"{"kind":"provider_settings_mutation","request_id":"provider-1","mutation":{"action":"set_credential","provider_id":"glm","api_key":"super-secret-api-key"}}"#,
+            r#"{"kind":"provider_settings_mutation","request_id":"provider-1","mutation":{"action":"set_credential","provider_id":"gemini","api_key":"super-secret-api-key"}}"#,
         )
         .unwrap();
         let directory = tempfile::tempdir().unwrap();
@@ -1666,7 +1674,7 @@ mod tests {
         assert!(!snapshot.to_ascii_lowercase().contains("api_key"));
 
         let reference = sentinel_provider_api::CredentialReference::for_provider(
-            &ProviderId::new("glm").unwrap(),
+            &ProviderId::new("gemini").unwrap(),
         );
         assert_eq!(
             credentials.state(&reference),
