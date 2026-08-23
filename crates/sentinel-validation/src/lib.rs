@@ -112,6 +112,33 @@ impl ValidationRunner {
         profile: ValidationProfile,
         cancellation: &mut watch::Receiver<bool>,
     ) -> Result<ValidationReport, ValidationError> {
+        Self::run_profile_with_generation(repository, task_id, main, profile, cancellation, true)
+            .await
+    }
+
+    /// Runs the configured commands and persists their executions, without
+    /// advancing the review generation. This is for post-review final
+    /// verification: its evidence belongs to final approval, while the latest
+    /// review generation must remain the one the reviewer actually inspected.
+    pub async fn run_profile_for_final_approval(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &std::path::Path,
+        profile: ValidationProfile,
+        cancellation: &mut watch::Receiver<bool>,
+    ) -> Result<ValidationReport, ValidationError> {
+        Self::run_profile_with_generation(repository, task_id, main, profile, cancellation, false)
+            .await
+    }
+
+    async fn run_profile_with_generation(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &std::path::Path,
+        profile: ValidationProfile,
+        cancellation: &mut watch::Receiver<bool>,
+        create_review_generation: bool,
+    ) -> Result<ValidationReport, ValidationError> {
         if profile.id.trim().is_empty()
             || profile.steps.is_empty()
             || profile.steps.iter().any(invalid_step)
@@ -173,7 +200,7 @@ impl ValidationRunner {
                 .map_err(|_| ValidationError::Storage)?;
             results.push(execution);
         }
-        if results.iter().all(|result| result.outcome == "passed") {
+        if create_review_generation && results.iter().all(|result| result.outcome == "passed") {
             let evidence =
                 WorktreeTransaction::review_evidence(repository.clone(), task_id.clone(), main)
                     .await
@@ -538,6 +565,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["passed", "failed"]
         );
+    }
+    #[tokio::test]
+    async fn final_approval_validation_does_not_replace_the_review_generation() {
+        let (main, _db, repo, task) = fixture().await;
+        run(
+            repo.clone(),
+            task.clone(),
+            main.path(),
+            vec![step("pass", &["/usr/bin/true"])],
+        )
+        .await;
+        let reviewed = repo.v3().latest_review_generation(&task).await.unwrap();
+        let (_tx, mut cancellation) = watch::channel(false);
+        ValidationRunner::run_profile_for_final_approval(
+            repo.clone(),
+            task.clone(),
+            main.path(),
+            ValidationProfile {
+                id: "final".into(),
+                steps: vec![step("pass-again", &["/usr/bin/true"])],
+            },
+            &mut cancellation,
+        )
+        .await
+        .unwrap();
+        let latest = repo.v3().latest_review_generation(&task).await.unwrap();
+        assert_eq!(latest.id, reviewed.id);
     }
     #[tokio::test]
     async fn timeout_and_cancellation_are_explicit() {

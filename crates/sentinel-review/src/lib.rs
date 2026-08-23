@@ -775,7 +775,7 @@ impl FinalApprovalSupervisor {
             return Err(FinalApprovalError::UnresolvedBlocker);
         }
         let (_sender, mut cancellation) = tokio::sync::watch::channel(false);
-        let validation = ValidationRunner::run_profile(
+        let validation = ValidationRunner::run_profile_for_final_approval(
             repository.clone(),
             task_id.clone(),
             main,
