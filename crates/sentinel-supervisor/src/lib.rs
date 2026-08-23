@@ -17,12 +17,13 @@ use sentinel_core::{
     redact,
     v3::{
         ApprovalId, ApprovalLifecycle, CreateArtifact, CreateRepairRound, CreateSession,
-        CreateTask, EventId, EventKind, FindingDisposition, NormalizedEventEnvelope,
-        RecoveryCondition, RepairRoundLifecycle, SessionLifecycle, Task, TaskId, TaskLifecycle,
+        CreateTask, CreateTaskIntegration, EventId, EventKind, FindingDisposition,
+        NormalizedEventEnvelope, RecoveryCondition, RepairRoundLifecycle, SessionLifecycle, Task,
+        TaskId, TaskLifecycle, WorkflowMode,
     },
     RunRepository,
 };
-use sentinel_git::{inspect_repository, RepositoryState};
+use sentinel_git::{inspect_repository, resolve_exact_head, RepositoryState};
 use sentinel_omp::{OmpProcess, OmpProgram, OmpSession, PROVIDER as OMP_PROVIDER};
 use sentinel_provider_api::{
     agent::{run_agent_loop, AgentLoopRequest, AgentLoopResult},
@@ -303,8 +304,13 @@ impl SentinelSupervisor {
             ProviderKind::ClaudeCode => CLAUDE_PROVIDER_ID,
             ProviderKind::Omp => OMP_PROVIDER_ID,
         });
-        self.start_with_selection(selection, intent.summary, intent.prompt)
-            .await
+        self.start_with_selection(
+            selection,
+            intent.summary,
+            intent.prompt,
+            WorkflowMode::Manual,
+        )
+        .await
     }
 
     /// Starts a task with the configured implementer, or with an explicit
@@ -316,13 +322,30 @@ impl SentinelSupervisor {
         summary: String,
         prompt: String,
     ) -> Result<Task, SupervisorError> {
+        self.start_configured_task_with_mode(
+            provider_override,
+            summary,
+            prompt,
+            WorkflowMode::Manual,
+        )
+        .await
+    }
+
+    pub async fn start_configured_task_with_mode(
+        &mut self,
+        provider_override: Option<&str>,
+        summary: String,
+        prompt: String,
+        mode: WorkflowMode,
+    ) -> Result<Task, SupervisorError> {
         let selection = match provider_override {
             Some(provider) if !provider.is_empty() && provider != "configured" => {
                 self.selection_for_provider(provider, ProviderRole::Implementer)?
             }
             _ => self.provider_workflow.implementer.clone(),
         };
-        self.start_with_selection(selection, summary, prompt).await
+        self.start_with_selection(selection, summary, prompt, mode)
+            .await
     }
 
     /// Starts a new OMP turn/session in the existing owned worktree after an
@@ -416,6 +439,7 @@ impl SentinelSupervisor {
         selection: ProviderSelection,
         summary: String,
         prompt: String,
+        mode: WorkflowMode,
     ) -> Result<Task, SupervisorError> {
         self.provider_registry
             .validate_selection(&selection, ProviderRole::Implementer)
@@ -453,6 +477,12 @@ impl SentinelSupervisor {
                 },
                 now_ms(),
             )
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        let task = self
+            .repository
+            .v3()
+            .set_task_workflow_mode(&task, mode, now_ms())
             .await
             .map_err(|_| SupervisorError::Storage)?;
         let prepared = self
@@ -1212,7 +1242,7 @@ impl SentinelSupervisor {
             .branch
             .filter(|_| inspection.is_primary && inspection.state == RepositoryState::Valid)
             .ok_or(SupervisorError::Ownership)?;
-        WorktreeTransaction::prepare_merge(
+        let merge_preparation = WorktreeTransaction::prepare_merge(
             self.repository.clone(),
             task.id.clone(),
             &self.primary_root,
@@ -1306,17 +1336,93 @@ impl SentinelSupervisor {
         let profile = self.selected_profile()?;
         let fixed = FixedReviewer(candidates);
         let no_repair = NoRepair;
-        FinalApprovalSupervisor::prepare(
-            self.repository.clone(),
-            task.id.clone(),
-            &self.primary_root,
-            profile,
-            &fixed,
-            &no_repair,
-            3,
-        )
-        .await
-        .map_err(|_| SupervisorError::NotAvailable)?;
+        if task.workflow_mode == WorkflowMode::AutoIntegrate {
+            // An auto integration is permitted only against the exact target
+            // observed before review; never silently rebase it onto a moved
+            // primary branch.
+            if merge_preparation.persisted.target_advanced
+                || !merge_preparation.persisted.merge_ready
+            {
+                return self
+                    .block_auto_integration(
+                        &task,
+                        "target branch advanced or merge preflight failed",
+                    )
+                    .await;
+            }
+            let (context, _) = FinalApprovalSupervisor::prepare_auto_integration(
+                self.repository.clone(),
+                task.id.clone(),
+                &self.primary_root,
+                profile,
+                &fixed,
+                &no_repair,
+                3,
+            )
+            .await
+            .map_err(|_| SupervisorError::NotAvailable)?;
+            let current = self
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            let ready = self
+                .repository
+                .v3()
+                .transition_task(&current, TaskLifecycle::ReadyForHuman, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            let integrating = self
+                .repository
+                .v3()
+                .transition_task(&ready, TaskLifecycle::Integrating, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            if let Err(error) = self
+                .auto_integrate(
+                    &integrating,
+                    &context.evidence_digest,
+                    &merge_preparation.persisted.target_branch,
+                    &merge_preparation.persisted.target_commit,
+                )
+                .await
+            {
+                self.block_auto_integration(&task, &format!("{error:?}"))
+                    .await?;
+            }
+        } else {
+            FinalApprovalSupervisor::prepare(
+                self.repository.clone(),
+                task.id.clone(),
+                &self.primary_root,
+                profile,
+                &fixed,
+                &no_repair,
+                3,
+            )
+            .await
+            .map_err(|_| SupervisorError::NotAvailable)?;
+            let current = self
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            self.repository
+                .v3()
+                .transition_task(&current, TaskLifecycle::ReadyForHuman, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+        }
+        Ok(())
+    }
+
+    async fn block_auto_integration(
+        &self,
+        task: &Task,
+        reason: &str,
+    ) -> Result<(), SupervisorError> {
         let current = self
             .repository
             .v3()
@@ -1325,7 +1431,129 @@ impl SentinelSupervisor {
             .map_err(|_| SupervisorError::Storage)?;
         self.repository
             .v3()
-            .transition_task(&current, TaskLifecycle::ReadyForHuman, now_ms())
+            .create_artifact(
+                CreateArtifact {
+                    task_id: task.id.clone(),
+                    kind: "auto_integration_failed".into(),
+                    display_name: "auto-integrate".into(),
+                    content_hash: None,
+                    metadata: serde_json::json!({"reason": reason}),
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        if current.lifecycle == TaskLifecycle::Integrating {
+            self.repository
+                .v3()
+                .transition_task(&current, TaskLifecycle::Blocked, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+        }
+        Ok(())
+    }
+
+    async fn auto_integrate(
+        &self,
+        task: &Task,
+        evidence_digest: &str,
+        expected_branch: &str,
+        expected_target_head: &str,
+    ) -> Result<(), SupervisorError> {
+        let inspection = inspect_repository(&self.primary_root)
+            .await
+            .map_err(|_| SupervisorError::Ownership)?;
+        let branch = inspection
+            .branch
+            .filter(|branch| {
+                inspection.is_primary
+                    && inspection.state == RepositoryState::Valid
+                    && branch == expected_branch
+            })
+            .ok_or(SupervisorError::Ownership)?;
+        let target_head = resolve_exact_head(&self.primary_root)
+            .await
+            .map_err(|_| SupervisorError::Ownership)?;
+        if target_head != expected_target_head {
+            return Err(SupervisorError::NotAvailable);
+        }
+        let packet = ReviewSupervisor::build_packet(
+            self.repository.clone(),
+            task.id.clone(),
+            &self.primary_root,
+        )
+        .await
+        .map_err(|_| SupervisorError::NotAvailable)?;
+        let generation = self
+            .repository
+            .v3()
+            .latest_review_generation(&task.id)
+            .await
+            .map_err(|_| SupervisorError::NotAvailable)?;
+        if packet.review_generation_id != generation.id.to_string()
+            || packet.review_generation_digest != generation.digest
+        {
+            return Err(SupervisorError::NotAvailable);
+        }
+        match self.repository.v3().get_task_integration(&task.id).await {
+            Ok(_) => return Err(SupervisorError::NotAvailable),
+            Err(sentinel_core::CoreError::NotFound) => {}
+            Err(_) => return Err(SupervisorError::Storage),
+        }
+        if self
+            .repository
+            .v3()
+            .list_review_findings(&task.id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?
+            .iter()
+            .any(|finding| {
+                matches!(finding.severity.as_str(), "blocker" | "high")
+                    && finding.disposition != FindingDisposition::Repaired
+                    && finding.disposition != FindingDisposition::Dismissed
+            })
+        {
+            return Err(SupervisorError::NotAvailable);
+        }
+        let result = WorktreeTransaction::integrate_verified(
+            self.repository.clone(),
+            task.id.clone(),
+            &self.primary_root,
+            &branch,
+            &target_head,
+        )
+        .await
+        .map_err(|_| SupervisorError::Ownership)?;
+        self.repository
+            .v3()
+            .create_task_integration(
+                CreateTaskIntegration {
+                    task_id: task.id.clone(),
+                    review_generation_id: generation.id,
+                    evidence_digest: evidence_digest.into(),
+                    source_worktree_commit: result.source_commit,
+                    target_repository: self.primary_root.to_string_lossy().into(),
+                    target_branch: result.target_branch,
+                    target_head_before: result.target_head_before,
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.repository
+            .v3()
+            .complete_task_integration(&task.id, &result.resulting_target_commit, now_ms())
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        let current = self
+            .repository
+            .v3()
+            .get_task(&task.id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.repository
+            .v3()
+            .transition_task(&current, TaskLifecycle::Integrated, now_ms())
             .await
             .map_err(|_| SupervisorError::Storage)?;
         Ok(())
@@ -2021,6 +2249,28 @@ impl SentinelSupervisor {
                 } else {
                     self.persist_reconciliation(&task.id, "final_approval", "missing_evidence")
                         .await?;
+                }
+                continue;
+            }
+            if previous_lifecycle == TaskLifecycle::Integrating {
+                // Git integration is intentionally never replayed after a
+                // restart. A process may have died between the controlled
+                // commit and durable outcome write; requiring human attention
+                // is the only safe reconciliation in that ambiguous window.
+                self.persist_reconciliation(&task.id, "auto_integration", "interrupted_unproven")
+                    .await?;
+                let current = self
+                    .repository
+                    .v3()
+                    .get_task(&task.id)
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                if current.lifecycle == TaskLifecycle::Recovering {
+                    self.repository
+                        .v3()
+                        .transition_task(&current, TaskLifecycle::Blocked, now_ms())
+                        .await
+                        .map_err(|_| SupervisorError::Storage)?;
                 }
                 continue;
             }
@@ -3452,6 +3702,72 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
             fs::read_to_string(fixture.main.join("tracked.txt")).unwrap(),
             "primary\n"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_integrate_commits_and_cherry_picks_only_after_review_without_an_approval() {
+        let fixture = fixture().await;
+        fs::create_dir_all(fixture.main.join(".agent-sentinel")).unwrap();
+        fs::write(
+            fixture.main.join(".agent-sentinel/validation.json"),
+            r#"{"profiles":[{"id":"default","steps":[{"name":"implemented","argv":["/bin/test","-f","implemented.txt"],"kind":"test","cwd":".","env":{},"required":true,"timeout_ms":5000}]}]}"#,
+        )
+        .unwrap();
+        git(&fixture.main, &["add", ".agent-sentinel/validation.json"]);
+        git(&fixture.main, &["commit", "-qm", "validation profile"]);
+        let mut supervisor = SentinelSupervisor::new(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: Some(CodexProgram::from_executable(&fixture.codex).unwrap()),
+                claude: Some(ClaudeProgram::from_executable(&fixture.claude).unwrap()),
+                omp: None,
+            },
+        )
+        .unwrap();
+        let head_before = resolve_exact_head(&fixture.main).await.unwrap();
+        let task = supervisor
+            .start_configured_task_with_mode(
+                Some(CODEX_PROVIDER_ID),
+                "auto workflow".into(),
+                "implement it".into(),
+                WorkflowMode::AutoIntegrate,
+            )
+            .await
+            .unwrap();
+        for step in 0..4 {
+            if let Err(error) = supervisor.reconcile_progress().await {
+                panic!("reconcile step {step} failed: {error:?}");
+            }
+        }
+        let integrated = fixture.repository.v3().get_task(&task.id).await.unwrap();
+        assert_eq!(integrated.lifecycle, TaskLifecycle::Integrated);
+        assert!(fixture
+            .repository
+            .v3()
+            .list_approvals_for_task(&task.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let evidence = fixture
+            .repository
+            .v3()
+            .get_task_integration(&task.id)
+            .await
+            .unwrap();
+        assert_eq!(evidence.outcome, "integrated");
+        assert_eq!(evidence.target_head_before, head_before);
+        assert_eq!(
+            fs::read_to_string(fixture.main.join("implemented.txt")).unwrap(),
+            "implemented\n"
+        );
+        assert!(supervisor
+            .available_actions(&integrated)
+            .await
+            .unwrap()
+            .approval_id
+            .is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

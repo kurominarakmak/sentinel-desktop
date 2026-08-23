@@ -62,6 +62,8 @@ pub enum TaskLifecycle {
     Recovering,
     Blocked,
     Finalized,
+    Integrating,
+    Integrated,
     Cancelled,
     Failed,
 }
@@ -69,7 +71,7 @@ impl TaskLifecycle {
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            Self::Blocked | Self::Finalized | Self::Cancelled | Self::Failed
+            Self::Blocked | Self::Finalized | Self::Integrated | Self::Cancelled | Self::Failed
         )
     }
     pub fn transition(self, next: Self) -> Result<Self, CoreError> {
@@ -127,12 +129,21 @@ impl TaskLifecycle {
                 )
                 | (
                     Self::ReadyForHuman,
-                    Self::Finalized | Self::DiscardPending | Self::Blocked | Self::Recovering
+                    Self::Finalized
+                        | Self::Integrating
+                        | Self::DiscardPending
+                        | Self::Blocked
+                        | Self::Recovering
+                )
+                | (
+                    Self::Integrating,
+                    Self::Integrated | Self::Blocked | Self::Recovering
                 )
                 | (
                     Self::DiscardPending,
                     Self::Finalized
                         | Self::ReadyForHuman
+                        | Self::Integrating
                         | Self::Blocked
                         | Self::Cancelled
                         | Self::Recovering
@@ -155,6 +166,19 @@ impl TaskLifecycle {
         valid
             .then_some(next)
             .ok_or_else(|| CoreError::V3InvalidTransition(format!("{self:?} -> {next:?}")))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    Manual,
+    AutoIntegrate,
+}
+
+impl Default for WorkflowMode {
+    fn default() -> Self {
+        Self::Manual
     }
 }
 
@@ -385,6 +409,7 @@ pub struct Task {
     pub id: TaskId,
     pub project_id: Option<String>,
     pub workflow_id: String,
+    pub workflow_mode: WorkflowMode,
     pub summary: String,
     pub lifecycle: TaskLifecycle,
     pub recovery_condition: RecoveryCondition,
@@ -399,6 +424,29 @@ pub struct CreateTask {
     pub project_id: Option<String>,
     pub workflow_id: String,
     pub summary: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskIntegration {
+    pub task_id: TaskId,
+    pub review_generation_id: ReviewGenerationId,
+    pub evidence_digest: String,
+    pub source_worktree_commit: String,
+    pub target_repository: String,
+    pub target_branch: String,
+    pub target_head_before: String,
+    pub resulting_target_commit: Option<String>,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTaskIntegration {
+    pub task_id: TaskId,
+    pub review_generation_id: ReviewGenerationId,
+    pub evidence_digest: String,
+    pub source_worktree_commit: String,
+    pub target_repository: String,
+    pub target_branch: String,
+    pub target_head_before: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSession {
@@ -836,6 +884,7 @@ impl V3Repository {
             id: TaskId::new(),
             project_id: input.project_id,
             workflow_id: input.workflow_id,
+            workflow_mode: WorkflowMode::Manual,
             summary: input.summary,
             lifecycle: TaskLifecycle::Draft,
             recovery_condition: RecoveryCondition::None,
@@ -845,8 +894,8 @@ impl V3Repository {
             updated_at_ms: timestamp,
             terminal_at_ms: None,
         };
-        sqlx::query("INSERT INTO v3_tasks (id, project_id, workflow_id, summary, lifecycle, recovery_condition, recovery_previous_lifecycle, version, created_at_ms, updated_at_ms, terminal_at_ms) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL)")
-            .bind(task.id.to_string()).bind(&task.project_id).bind(&task.workflow_id).bind(&task.summary).bind(enum_name(&task.lifecycle)).bind(enum_name(&task.recovery_condition)).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        sqlx::query("INSERT INTO v3_tasks (id, project_id, workflow_id, workflow_mode, summary, lifecycle, recovery_condition, recovery_previous_lifecycle, version, created_at_ms, updated_at_ms, terminal_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, NULL)")
+            .bind(task.id.to_string()).bind(&task.project_id).bind(&task.workflow_id).bind(enum_name(&task.workflow_mode)).bind(&task.summary).bind(enum_name(&task.lifecycle)).bind(enum_name(&task.recovery_condition)).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
         self.changes.changed();
         Ok(task)
     }
@@ -859,6 +908,76 @@ impl V3Repository {
             .map(|r| task_from(&r))
             .transpose()?
             .ok_or(CoreError::NotFound)
+    }
+    pub async fn set_task_workflow_mode(
+        &self,
+        task: &Task,
+        mode: WorkflowMode,
+        timestamp: i64,
+    ) -> Result<Task, CoreError> {
+        let updated = sqlx::query("UPDATE v3_tasks SET workflow_mode=?,version=version+1,updated_at_ms=? WHERE id=? AND version=?")
+            .bind(enum_name(&mode)).bind(timestamp).bind(task.id.to_string()).bind(i64::try_from(task.version).map_err(|_| CoreError::V3Conflict)?)
+            .execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        if updated.rows_affected() != 1 {
+            return Err(CoreError::V3Conflict);
+        }
+        self.changes.changed();
+        self.get_task(&task.id).await
+    }
+    pub async fn create_task_integration(
+        &self,
+        input: CreateTaskIntegration,
+        timestamp: i64,
+    ) -> Result<TaskIntegration, CoreError> {
+        if input.evidence_digest.len() != 64
+            || input.source_worktree_commit.len() != 40
+            || input.target_head_before.len() != 40
+        {
+            return Err(CoreError::InvalidV3Record);
+        }
+        sqlx::query("INSERT INTO v3_task_integrations (task_id,review_generation_id,evidence_digest,source_worktree_commit,target_repository,target_branch,target_head_before,resulting_target_commit,outcome,failure_reason,created_at_ms,updated_at_ms) VALUES (?,?,?,?,?,?,?,NULL,'pending',NULL,?,?)")
+            .bind(input.task_id.to_string()).bind(input.review_generation_id.to_string()).bind(&input.evidence_digest).bind(&input.source_worktree_commit).bind(&input.target_repository).bind(&input.target_branch).bind(&input.target_head_before).bind(timestamp).bind(timestamp).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        self.changes.changed();
+        self.get_task_integration(&input.task_id).await
+    }
+    pub async fn get_task_integration(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<TaskIntegration, CoreError> {
+        sqlx::query("SELECT * FROM v3_task_integrations WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|_| CoreError::Storage)?
+            .map(|row| task_integration_from(&row))
+            .transpose()?
+            .ok_or(CoreError::NotFound)
+    }
+    pub async fn complete_task_integration(
+        &self,
+        task_id: &TaskId,
+        resulting_target_commit: &str,
+        timestamp: i64,
+    ) -> Result<TaskIntegration, CoreError> {
+        let result = sqlx::query("UPDATE v3_task_integrations SET outcome='integrated',resulting_target_commit=?,updated_at_ms=? WHERE task_id=? AND outcome='pending'").bind(resulting_target_commit).bind(timestamp).bind(task_id.to_string()).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        if result.rows_affected() != 1 {
+            return Err(CoreError::V3Conflict);
+        }
+        self.changes.changed();
+        self.get_task_integration(task_id).await
+    }
+    pub async fn fail_task_integration(
+        &self,
+        task_id: &TaskId,
+        reason: &str,
+        timestamp: i64,
+    ) -> Result<TaskIntegration, CoreError> {
+        let result = sqlx::query("UPDATE v3_task_integrations SET outcome='failed',failure_reason=?,updated_at_ms=? WHERE task_id=? AND outcome='pending'").bind(reason).bind(timestamp).bind(task_id.to_string()).execute(&self.pool).await.map_err(|_| CoreError::Storage)?;
+        if result.rows_affected() != 1 {
+            return Err(CoreError::V3Conflict);
+        }
+        self.changes.changed();
+        self.get_task_integration(task_id).await
     }
     pub async fn list_tasks(&self) -> Result<Vec<Task>, CoreError> {
         sqlx::query("SELECT * FROM v3_tasks ORDER BY updated_at_ms DESC, id DESC")
@@ -1581,6 +1700,7 @@ fn task_from(row: &sqlx::sqlite::SqliteRow) -> Result<Task, CoreError> {
         id: TaskId(row.get("id")),
         project_id: row.get("project_id"),
         workflow_id: row.get("workflow_id"),
+        workflow_mode: enum_parse(&row.get::<String, _>("workflow_mode"))?,
         summary: row.get("summary"),
         lifecycle: enum_parse(&row.get::<String, _>("lifecycle"))?,
         recovery_condition: enum_parse(&row.get::<String, _>("recovery_condition"))?,
@@ -1602,6 +1722,20 @@ fn task_from(row: &sqlx::sqlite::SqliteRow) -> Result<Task, CoreError> {
         return Err(CoreError::CorruptV3State);
     }
     Ok(task)
+}
+fn task_integration_from(row: &sqlx::sqlite::SqliteRow) -> Result<TaskIntegration, CoreError> {
+    Ok(TaskIntegration {
+        task_id: TaskId(row.get("task_id")),
+        review_generation_id: ReviewGenerationId(row.get("review_generation_id")),
+        evidence_digest: row.get("evidence_digest"),
+        source_worktree_commit: row.get("source_worktree_commit"),
+        target_repository: row.get("target_repository"),
+        target_branch: row.get("target_branch"),
+        target_head_before: row.get("target_head_before"),
+        resulting_target_commit: row.get("resulting_target_commit"),
+        outcome: row.get("outcome"),
+        failure_reason: row.get("failure_reason"),
+    })
 }
 fn session_from(row: &sqlx::sqlite::SqliteRow) -> Result<AgentSession, CoreError> {
     Ok(AgentSession {

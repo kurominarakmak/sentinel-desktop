@@ -59,7 +59,83 @@ pub struct MergePreparation {
 pub struct CleanupResult {
     pub outcome: TaskWorktreeCleanupOutcome,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationResult {
+    pub source_commit: String,
+    pub target_head_before: String,
+    pub resulting_target_commit: String,
+    pub target_branch: String,
+}
 impl WorktreeTransaction {
+    /// Sentinel-owned Git integration. Providers never receive this capability.
+    pub async fn integrate_verified(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        expected_branch: &str,
+        expected_target_head: &str,
+    ) -> Result<IntegrationResult, TransactionError> {
+        let worktree = Self::reopen(repository, task_id.clone(), main).await?;
+        let inspection = inspect_repository(main)
+            .await
+            .map_err(|_| TransactionError::PreflightRefused)?;
+        if !inspection.is_primary || inspection.branch.as_deref() != Some(expected_branch) {
+            return Err(TransactionError::PreflightRefused);
+        }
+        if !git_output(main, &["status", "--porcelain"])
+            .await?
+            .is_empty()
+        {
+            return Err(TransactionError::PreflightRefused);
+        }
+        let target_head_before =
+            git_output(main, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        if target_head_before != expected_target_head {
+            return Err(TransactionError::PreflightRefused);
+        }
+        let worktree_path = Path::new(&worktree.worktree_path);
+        if git_output(worktree_path, &["status", "--porcelain"])
+            .await?
+            .is_empty()
+        {
+            return Err(TransactionError::PreflightRefused);
+        }
+        git_success(worktree_path, &["add", "-A"]).await?;
+        let message = format!("sentinel: integrate task {}", task_id);
+        git_success(worktree_path, &["commit", "--no-verify", "-m", &message]).await?;
+        let source_commit =
+            git_output(worktree_path, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        if !git_output(main, &["status", "--porcelain"])
+            .await?
+            .is_empty()
+            || git_output(main, &["rev-parse", "--verify", "HEAD^{commit}"]).await?
+                != target_head_before
+        {
+            return Err(TransactionError::PreflightRefused);
+        }
+        let cherry_pick = Command::new("/usr/bin/git")
+            .current_dir(main)
+            .args(["cherry-pick", "--no-edit", &source_commit])
+            .output()
+            .await
+            .map_err(|_| TransactionError::Git)?;
+        if !cherry_pick.status.success() {
+            let _ = Command::new("/usr/bin/git")
+                .current_dir(main)
+                .args(["cherry-pick", "--abort"])
+                .output()
+                .await;
+            return Err(TransactionError::PreflightRefused);
+        }
+        let resulting_target_commit =
+            git_output(main, &["rev-parse", "--verify", "HEAD^{commit}"]).await?;
+        Ok(IntegrationResult {
+            source_commit,
+            target_head_before,
+            resulting_target_commit,
+            target_branch: expected_branch.into(),
+        })
+    }
     pub async fn diff(
         repository: RunRepository,
         task_id: TaskId,
@@ -535,6 +611,9 @@ async fn git_output_bytes(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Tr
         .then_some(output.stdout)
         .ok_or(TransactionError::Git)
 }
+async fn git_success(directory: &Path, args: &[&str]) -> Result<(), TransactionError> {
+    git_output_bytes(directory, args).await.map(|_| ())
+}
 async fn git_succeeds(directory: &Path, args: &[&str]) -> bool {
     Command::new("/usr/bin/git")
         .current_dir(directory)
@@ -639,6 +718,100 @@ mod tests {
             .trim(),
             created.branch
         );
+    }
+
+    #[tokio::test]
+    async fn verified_integration_commits_once_and_refuses_a_duplicate() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let created = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create worktree");
+        fs::write(
+            Path::new(&created.worktree_path).join("dashboard.txt"),
+            "verified\n",
+        )
+        .unwrap();
+        let branch = git(main.path(), &["branch", "--show-current"])
+            .trim()
+            .to_owned();
+        let result = WorktreeTransaction::integrate_verified(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            &branch,
+            &base,
+        )
+        .await
+        .expect("integrate");
+        assert_eq!(result.target_head_before, base);
+        assert_eq!(
+            git(main.path(), &["rev-parse", "HEAD"]).trim(),
+            result.resulting_target_commit
+        );
+        assert_eq!(
+            fs::read_to_string(main.path().join("dashboard.txt")).unwrap(),
+            "verified\n"
+        );
+        assert!(WorktreeTransaction::integrate_verified(
+            repository,
+            task_id,
+            main.path(),
+            &branch,
+            &result.target_head_before
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn verified_integration_fails_closed_for_dirty_or_moved_target() {
+        let (main, _database, repository, task_id, base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let created = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create worktree");
+        fs::write(
+            Path::new(&created.worktree_path).join("dashboard.txt"),
+            "verified\n",
+        )
+        .unwrap();
+        let branch = git(main.path(), &["branch", "--show-current"])
+            .trim()
+            .to_owned();
+        fs::write(main.path().join("local.txt"), "dirty\n").unwrap();
+        assert!(WorktreeTransaction::integrate_verified(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            &branch,
+            &base
+        )
+        .await
+        .is_err());
+        fs::remove_file(main.path().join("local.txt")).unwrap();
+        fs::write(main.path().join("target.txt"), "moved\n").unwrap();
+        git(main.path(), &["add", "target.txt"]);
+        git(main.path(), &["commit", "-m", "target moved"]);
+        assert!(WorktreeTransaction::integrate_verified(
+            repository,
+            task_id,
+            main.path(),
+            &branch,
+            &base
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

@@ -696,6 +696,63 @@ impl FinalApprovalSupervisor {
         implementer: &dyn RepairImplementer,
         max_rounds: u32,
     ) -> Result<FinalApproval, FinalApprovalError> {
+        let (context, repair_rounds) = Self::prepare_evidence(
+            repository.clone(),
+            task_id,
+            main,
+            profile,
+            reviewer,
+            implementer,
+            max_rounds,
+            "final_approval_packet",
+            "final_git_action",
+        )
+        .await?;
+        let approval = ActionAuthorizationGuard::issue(repository, context, now())
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        Ok(FinalApproval {
+            approval,
+            repair_rounds,
+        })
+    }
+
+    /// Runs the same final deterministic verification used by Manual mode,
+    /// but deliberately does not issue a human approval capability.
+    pub async fn prepare_auto_integration(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        profile: ValidationProfile,
+        reviewer: &dyn Reviewer,
+        implementer: &dyn RepairImplementer,
+        max_rounds: u32,
+    ) -> Result<(ActionApprovalContext, usize), FinalApprovalError> {
+        Self::prepare_evidence(
+            repository,
+            task_id,
+            main,
+            profile,
+            reviewer,
+            implementer,
+            max_rounds,
+            "final_integration_packet",
+            "auto_integrate",
+        )
+        .await
+    }
+
+    async fn prepare_evidence(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        profile: ValidationProfile,
+        reviewer: &dyn Reviewer,
+        implementer: &dyn RepairImplementer,
+        max_rounds: u32,
+        packet_kind: &str,
+        action: &str,
+    ) -> Result<(ActionApprovalContext, usize), FinalApprovalError> {
         if max_rounds == 0 {
             return Err(FinalApprovalError::RoundLimitReached);
         }
@@ -832,8 +889,8 @@ impl FinalApprovalSupervisor {
             .create_artifact(
                 CreateArtifact {
                     task_id: task_id.clone(),
-                    kind: "final_approval_packet".into(),
-                    display_name: "final-approval".into(),
+                    kind: packet_kind.into(),
+                    display_name: action.into(),
                     content_hash: None,
                     metadata: serde_json::json!({"evidence":evidence,"evidence_digest":digest}),
                 },
@@ -843,7 +900,7 @@ impl FinalApprovalSupervisor {
             .map_err(|_| FinalApprovalError::Storage)?;
         let context = ActionApprovalContext {
             task_id: task_id.to_string(),
-            action: "final_git_action".into(),
+            action: action.into(),
             worktree_path: worktree.worktree_path,
             repository_root: worktree.repository_root,
             branch: worktree.branch,
@@ -851,13 +908,7 @@ impl FinalApprovalSupervisor {
             base_commit: worktree.base_commit,
             evidence_digest: digest,
         };
-        let approval = ActionAuthorizationGuard::issue(repository, context, now())
-            .await
-            .map_err(|_| FinalApprovalError::Storage)?;
-        Ok(FinalApproval {
-            approval,
-            repair_rounds: rounds as usize,
-        })
+        Ok((context, rounds as usize))
     }
     pub async fn require_human_approval(
         repository: RunRepository,

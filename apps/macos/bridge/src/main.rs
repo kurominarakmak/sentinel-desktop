@@ -7,7 +7,7 @@ use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
 use sentinel_claude::ClaudeProgram;
 use sentinel_codex::{CodexAppServer, CodexProgram};
 use sentinel_core::{
-    v3::{ApprovalId, CreateTask, SupervisorRequestReservation, TaskId},
+    v3::{ApprovalId, CreateTask, SupervisorRequestReservation, TaskId, WorkflowMode},
     CoreError, RunRepository,
 };
 use sentinel_git::{inspect_repository, RepositoryState};
@@ -47,6 +47,8 @@ enum Request {
         provider: String,
         summary: String,
         prompt: String,
+        #[serde(default)]
+        workflow_mode: WorkflowMode,
     },
     RetryInterruptedOmp {
         request_id: String,
@@ -1094,6 +1096,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 provider,
                 summary,
                 prompt,
+                workflow_mode,
             })) => {
                 let (directive, prompt) = parse_provider_directive(
                     &prompt,
@@ -1106,7 +1109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 let provider = directive.unwrap_or(provider);
                 let fingerprint = request_fingerprint(
-                    &json!({"provider":provider,"summary":summary,"prompt":prompt}),
+                    &json!({"provider":provider,"summary":summary,"prompt":prompt,"workflow_mode":workflow_mode}),
                 );
                 match reserve_mutation(
                     &runtime,
@@ -1140,10 +1143,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("repository is unavailable or invalid")
                     .and_then(|supervisor| {
                         runtime
-                            .block_on(supervisor.start_configured_task(
+                            .block_on(supervisor.start_configured_task_with_mode(
                                 Some(&provider),
                                 summary,
                                 prompt,
+                                workflow_mode,
                             ))
                             .map(task_dto)
                             .map_err(|error| match error {
@@ -1596,6 +1600,15 @@ mod tests {
         assert!(
             serde_json::from_str::<Request>(r#"{"kind":"start_task","provider":"codex"}"#).is_err()
         );
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"start_task","request_id":"request-2","provider":"codex","summary":"Task","prompt":"Do it","workflow_mode":"auto_integrate"}"#
+            ),
+            Ok(Request::StartTask {
+                workflow_mode: WorkflowMode::AutoIntegrate,
+                ..
+            })
+        ));
     }
 
     #[test]
