@@ -16,6 +16,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var previousApplicationFocus = PreviousApplicationFocus()
     private var bridgeSubscriptions = Set<AnyCancellable>()
     private let shortcutController = GlobalShortcutController()
+    private let e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration
+    private var e2eQuickPromptLaunchCoordinator = E2EQuickPromptLaunchCoordinator()
+    private var e2eQuickPromptBridgeSubscription: AnyCancellable?
+
+    init(e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration = E2EQuickPromptLaunchConfiguration()) {
+        self.e2eQuickPromptLaunchConfiguration = e2eQuickPromptLaunchConfiguration
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -23,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installStatusItem()
         observeStatusItem()
         installPanels()
+        openQuickPromptForE2ELaunchIfRequested()
         installGlobalShortcut()
         observeGlobalShortcut()
         NotificationCenter.default.addObserver(
@@ -121,6 +130,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         attention = SentinelFloatingPanel(title: "Sentinel") { AttentionWidgetView(bridge: self.bridge, openDetail: { self.showTaskDetail() }) }
         quickPrompt?.onHide = { [weak self] in self?.restorePreviousApplication() }
         attention?.onHide = { [weak self] in self?.restorePreviousApplication() }
+    }
+
+    private func openQuickPromptForE2ELaunchIfRequested() {
+        switch e2eQuickPromptLaunchCoordinator.request(
+            configuration: e2eQuickPromptLaunchConfiguration,
+            bridgeConnected: bridge.bridgeConnected
+        ) {
+        case .none:
+            break
+        case .presentQuickPrompt:
+            // Defer until startup has installed the existing panel and bridge
+            // snapshots. This is exactly the same controller route as the
+            // status item and global shortcut.
+            DispatchQueue.main.async { [weak self] in self?.showQuickPrompt() }
+        case .waitForBridge:
+            e2eQuickPromptBridgeSubscription = bridge.$bridgeConnected
+                .filter { $0 }
+                .prefix(1)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in
+                    guard let self else { return }
+                    if self.e2eQuickPromptLaunchCoordinator.bridgeDidConnect() == .presentQuickPrompt {
+                        self.showQuickPrompt()
+                    }
+                    self.e2eQuickPromptBridgeSubscription = nil
+                }
+        }
     }
 
     @objc func showQuickPrompt() { present(quickPrompt) }

@@ -268,6 +268,50 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(registry.owned.count, 5)
     }
 
+    func testNormalLaunchDoesNotRequestQuickPrompt() {
+        var coordinator = E2EQuickPromptLaunchCoordinator()
+        let normal = E2EQuickPromptLaunchConfiguration(arguments: ["Agent Sentinel"], environment: [:])
+        XCTAssertFalse(normal.opensQuickPrompt)
+        XCTAssertEqual(coordinator.request(configuration: normal, bridgeConnected: true), .none)
+        XCTAssertEqual(coordinator.bridgeDidConnect(), .none)
+    }
+
+    func testE2ELaunchArgumentPresentsExistingQuickPromptOnlyAfterBridgeIsReady() {
+        var coordinator = E2EQuickPromptLaunchCoordinator()
+        let configuration = E2EQuickPromptLaunchConfiguration(
+            arguments: ["Agent Sentinel", E2EQuickPromptLaunchConfiguration.argument],
+            environment: [:]
+        )
+        XCTAssertTrue(configuration.opensQuickPrompt)
+        XCTAssertEqual(coordinator.request(configuration: configuration, bridgeConnected: false), .waitForBridge)
+        XCTAssertEqual(coordinator.bridgeDidConnect(), .presentQuickPrompt)
+    }
+
+    func testE2ELaunchEnvironmentPresentsAndRepeatedRequestsReuseTheExistingController() {
+        var coordinator = E2EQuickPromptLaunchCoordinator()
+        let configuration = E2EQuickPromptLaunchConfiguration(
+            arguments: ["Agent Sentinel"],
+            environment: [E2EQuickPromptLaunchConfiguration.environmentKey: "1"]
+        )
+        XCTAssertEqual(coordinator.request(configuration: configuration, bridgeConnected: true), .presentQuickPrompt)
+        XCTAssertEqual(coordinator.request(configuration: configuration, bridgeConnected: true), .none)
+        XCTAssertEqual(coordinator.bridgeDidConnect(), .none)
+
+        var registry = NativeSurfaceRegistry()
+        XCTAssertTrue(registry.requestOpen(.quickPrompt))
+        XCTAssertFalse(registry.requestOpen(.quickPrompt))
+    }
+
+    func testOmittingE2ELaunchFlagRestoresNormalBehaviorWithoutCreatingATask() {
+        var coordinator = E2EQuickPromptLaunchCoordinator()
+        let configuration = E2EQuickPromptLaunchConfiguration(
+            arguments: ["Agent Sentinel"],
+            environment: [E2EQuickPromptLaunchConfiguration.environmentKey: "0"]
+        )
+        XCTAssertEqual(coordinator.request(configuration: configuration, bridgeConnected: true), .none)
+        XCTAssertEqual(TaskSubmissionState.idle, .idle)
+    }
+
     func testFocusRestorationOnlyTargetsStillRunningPreviousApplication() {
         var focus = PreviousApplicationFocus()
         let sentinel: pid_t = 100

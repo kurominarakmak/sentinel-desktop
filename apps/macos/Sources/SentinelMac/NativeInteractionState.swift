@@ -8,6 +8,55 @@ enum NativeSurface: Hashable {
     case settings
 }
 
+/// Launch-only opt-in for native UI automation.  This deliberately accepts an
+/// exact argument/environment value so ordinary launches have no extra UI.
+struct E2EQuickPromptLaunchConfiguration: Equatable {
+    static let argument = "--e2e-open-quick-prompt"
+    static let environmentKey = "SENTINEL_E2E_OPEN_QUICK_PROMPT"
+
+    let opensQuickPrompt: Bool
+
+    init(
+        arguments: [String] = CommandLine.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        opensQuickPrompt = arguments.contains(Self.argument) || environment[Self.environmentKey] == "1"
+    }
+}
+
+enum E2EQuickPromptLaunchAction: Equatable {
+    case none
+    case waitForBridge
+    case presentQuickPrompt
+}
+
+/// Ensures a launch-time request is consumed once. The AppDelegate maps the
+/// presentation action to its existing `showQuickPrompt()` controller path.
+struct E2EQuickPromptLaunchCoordinator {
+    private var waitingForBridge = false
+    private var consumed = false
+
+    mutating func request(
+        configuration: E2EQuickPromptLaunchConfiguration,
+        bridgeConnected: Bool
+    ) -> E2EQuickPromptLaunchAction {
+        guard configuration.opensQuickPrompt, !consumed, !waitingForBridge else { return .none }
+        if bridgeConnected {
+            consumed = true
+            return .presentQuickPrompt
+        }
+        waitingForBridge = true
+        return .waitForBridge
+    }
+
+    mutating func bridgeDidConnect() -> E2EQuickPromptLaunchAction {
+        guard waitingForBridge, !consumed else { return .none }
+        waitingForBridge = false
+        consumed = true
+        return .presentQuickPrompt
+    }
+}
+
 /// Records native surface ownership independently from AppKit so repeated open
 /// requests can be tested without creating windows.
 struct NativeSurfaceRegistry {
