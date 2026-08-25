@@ -122,14 +122,33 @@ impl ProviderModelDiscovery for OmpModelDiscovery {
             )
             .await
             .map_err(|_| ProviderError::Timeout)?
-            .map_err(|_| ProviderError::Unavailable("OMP model discovery failed".into()))?;
+            .map_err(|error| {
+                ProviderError::Unavailable(format!(
+                    "OMP model discovery could not start: {}",
+                    error.kind()
+                ))
+            })?;
             if !output.status.success() {
-                return Err(ProviderError::Unavailable(
-                    "OMP model discovery failed".into(),
-                ));
+                return Err(ProviderError::Unavailable(discovery_command_failure(
+                    &output,
+                )));
             }
             parse_model_catalog(&output.stdout, &self.provider_id)
         })
+    }
+}
+
+fn discovery_command_failure(output: &std::process::Output) -> String {
+    let status = output
+        .status
+        .code()
+        .map(|code| format!("exit {code}"))
+        .unwrap_or_else(|| "terminated by signal".into());
+    let stderr = bounded(&output.stderr);
+    if stderr.is_empty() {
+        format!("OMP model discovery command failed ({status})")
+    } else {
+        format!("OMP model discovery command failed ({status}): {stderr}")
     }
 }
 
@@ -828,6 +847,27 @@ mod tests {
         let catalog = discovery.discover_models().await.unwrap();
         assert_eq!(catalog.models[0].model_id, "fixture/runtime");
         assert_eq!(catalog.models[0].supported_reasoning_efforts, ["medium"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn omp_discovery_surfaces_sanitized_command_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-omp-failure");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho 'authentication missing' >&2\nexit 17\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let discovery = OmpModelDiscovery::new(OmpProgram::from_executable(&executable).unwrap());
+        assert_eq!(
+            discovery.discover_models().await.unwrap_err(),
+            ProviderError::Unavailable(
+                "OMP model discovery command failed (exit 17): authentication missing".into()
+            )
+        );
     }
 
     #[test]

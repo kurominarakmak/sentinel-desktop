@@ -30,6 +30,25 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(catalog?.models.first?.supportedReasoningEfforts, ["medium", "ultra"])
     }
 
+    func testDecodesTypedDiscoveryCommandFailureWithoutLosingSafeDetail() throws {
+        let data = Data(#"{"kind":"discover_models_result","requestId":"models-omp","providerId":"omp","error":{"code":"discovery_command_failed","message":"OMP model discovery command failed (exit 17): authentication missing"}}"#.utf8)
+        guard case .discoverModelsResult(_, let providerID, let catalog, let error) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected discovery failure")
+        }
+        XCTAssertEqual(providerID, "omp")
+        XCTAssertNil(catalog)
+        XCTAssertEqual(error?.code, "discovery_command_failed")
+        XCTAssertEqual(error?.message, "OMP model discovery command failed (exit 17): authentication missing")
+    }
+
+    func testBridgeDatabasePathUsesDecodedFilesystemPath() {
+        let url = URL(string: "file:///Users/test/Library/Application%20Support/dev.agent-sentinel.spike/phase2.sqlite3")!
+        XCTAssertEqual(
+            url.path(percentEncoded: false),
+            "/Users/test/Library/Application Support/dev.agent-sentinel.spike/phase2.sqlite3"
+        )
+    }
+
     func testDiscoveryGateRejectsStaleProviderResponseAndKeepsRolesIndependent() {
         var gate = ModelDiscoveryGate()
         gate.begin(role: .implementer, providerID: "omp", requestID: "impl-old")

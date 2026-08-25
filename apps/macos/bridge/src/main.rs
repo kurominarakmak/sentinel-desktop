@@ -83,6 +83,7 @@ enum Request {
         request_id: String,
         mutation: ProviderSettingsMutation,
     },
+    RuntimeDiagnostics,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -311,19 +312,26 @@ fn valid_quick_prompt_preferences(preferences: &QuickPromptPreferences) -> bool 
             .is_none_or(valid_value)
 }
 
-fn discovery_error(error: &ProviderError) -> (&'static str, &'static str) {
+fn discovery_error(error: &ProviderError) -> (&'static str, String) {
     match error {
         ProviderError::Credential(_) | ProviderError::Authentication => {
-            ("authentication_required", "Authentication required")
+            ("authentication_required", "Authentication required".into())
         }
         ProviderError::UnsupportedCapability(_) => (
             "enumeration_unsupported",
-            "Model enumeration is unsupported",
+            "Model enumeration is unsupported".into(),
         ),
-        ProviderError::MalformedResponse => {
-            ("invalid_response", "Provider returned invalid model data")
-        }
-        _ => ("provider_unavailable", "Provider unavailable"),
+        ProviderError::MalformedResponse => (
+            "invalid_response",
+            "Provider returned invalid model data".into(),
+        ),
+        ProviderError::Timeout => ("discovery_timed_out", "Model discovery timed out".into()),
+        ProviderError::Unavailable(message) => ("discovery_command_failed", message.clone()),
+        ProviderError::ProviderUnavailable(provider_id) => (
+            "provider_unavailable",
+            format!("Provider is unavailable: {provider_id}"),
+        ),
+        _ => ("provider_unavailable", "Provider unavailable".into()),
     }
 }
 
@@ -349,6 +357,53 @@ fn discovery_response(
             })
         }
     }
+}
+
+fn runtime_diagnostics(
+    programs: &SupervisorPrograms,
+    provider_settings: &ProviderSettingsStore,
+) -> Value {
+    let executable = programs.omp.as_ref().map(|program| program.executable());
+    let executable_metadata = executable.and_then(|path| std::fs::metadata(path).ok());
+    let environment_value =
+        |key: &str| std::env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    json!({
+        "kind":"runtime_diagnostics",
+        "providerId":"omp",
+        "providerEnabled":provider_settings.snapshot().providers.iter()
+            .find(|provider| provider.id.as_str() == OMP_PROVIDER_ID)
+            .map(|provider| provider.enabled),
+        "command":"omp models --json",
+        "workingDirectory":std::env::current_dir().ok().map(|path| path.display().to_string()),
+        "environment":{
+            "PATH":environment_value("PATH"),
+            "HOME":environment_value("HOME"),
+            "USER":environment_value("USER"),
+            "SHELL":environment_value("SHELL"),
+            "XDG_CONFIG_HOME":environment_value("XDG_CONFIG_HOME"),
+            "XDG_DATA_HOME":environment_value("XDG_DATA_HOME"),
+            "OMP_CONFIG_DIR":environment_value("OMP_CONFIG_DIR"),
+        },
+        "executable":{
+            "resolvedPath":executable.map(|path| path.display().to_string()),
+            "exists":executable_metadata.is_some(),
+            "isFile":executable_metadata.as_ref().is_some_and(|metadata| metadata.is_file()),
+            "isExecutable":executable.map(is_executable_file).unwrap_or(false),
+        }
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// A native-shell-only account usage reader. Its provider protocol events live
@@ -1062,6 +1117,7 @@ fn complete_mutation(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let e2e_diagnostics = std::env::args().any(|argument| argument == "--e2e-diagnostics");
     let database_path = PathBuf::from(
         std::env::args()
             .nth(1)
@@ -1151,6 +1207,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_status = None;
     loop {
         match receiver.recv() {
+            Ok(BridgeInput::Request(Request::RuntimeDiagnostics)) if e2e_diagnostics => {
+                let diagnostics = runtime_diagnostics(&programs, &provider_settings);
+                let path = database_path.with_file_name("e2e-runtime-diagnostics.json");
+                let _ = std::fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&diagnostics).unwrap_or_default(),
+                );
+                response(diagnostics);
+            }
+            Ok(BridgeInput::Request(Request::RuntimeDiagnostics)) => {
+                response(json!({"kind":"error","message":"runtime diagnostics are disabled"}));
+            }
             Ok(BridgeInput::Request(Request::Capabilities)) => response(json!({
                 "kind":"capabilities",
                 "repository":root.as_ref().map(|root| root.display().to_string()),
@@ -1900,7 +1968,8 @@ mod tests {
             provider_id,
             Err(ProviderError::Unavailable("fixture".into())),
         );
-        assert_eq!(failed["error"]["code"], "provider_unavailable");
+        assert_eq!(failed["error"]["code"], "discovery_command_failed");
+        assert_eq!(failed["error"]["message"], "fixture");
         assert!(failed.get("catalog").is_none());
     }
 

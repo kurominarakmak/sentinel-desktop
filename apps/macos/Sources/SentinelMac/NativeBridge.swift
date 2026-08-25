@@ -438,6 +438,7 @@ enum BridgeMessage: Decodable, Equatable {
     case settings(NativeSettings)
     case settingsMutationResult(requestID: String, accepted: Bool, settings: NativeSettings?, message: String?)
     case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
+    case runtimeDiagnostics
     case unavailable(String)
 
     private enum CodingKeys: String, CodingKey { case kind, task, message, repository, providers, requestId, providerId, accepted, attention, detail, status, settings, catalog, error, quickPromptPreferences, quickPromptDefaults }
@@ -460,6 +461,7 @@ enum BridgeMessage: Decodable, Equatable {
         case "settings": self = .settings(try values.decode(NativeSettings.self, forKey: .settings))
         case "settings_mutation_result": self = .settingsMutationResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), settings: try values.decodeIfPresent(NativeSettings.self, forKey: .settings), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "task_start_result": self = .taskStartResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), task: try values.decodeIfPresent(NativeTask.self, forKey: .task), message: try values.decodeIfPresent(String.self, forKey: .message))
+        case "runtime_diagnostics": self = .runtimeDiagnostics
         default: self = .unavailable(try values.decodeIfPresent(String.self, forKey: .message) ?? "Native bridge unavailable")
         }
     }
@@ -517,7 +519,11 @@ final class NativeBridge: ObservableObject {
         codexUsageRetryGate.reset()
         let process = Process()
         process.executableURL = executable
-        process.arguments = [appDataDirectory().appending(path: "phase2.sqlite3").path()]
+        var arguments = [bridgeDatabasePath()]
+        if CommandLine.arguments.contains(E2EQuickPromptLaunchConfiguration.argument) {
+            arguments.append("--e2e-diagnostics")
+        }
+        process.arguments = arguments
         let input = Pipe()
         let output = Pipe()
         process.standardInput = input
@@ -539,6 +545,9 @@ final class NativeBridge: ObservableObject {
                 DispatchQueue.main.async { self?.receivedOutput(data, generation: generation) }
             }
             refreshSnapshots(generation: generation)
+            if CommandLine.arguments.contains(E2EQuickPromptLaunchConfiguration.argument) {
+                _ = send(["kind": "runtime_diagnostics"])
+            }
         } catch {
             bridgeConnected = false
             availabilityMessage = "Native bridge could not start."
@@ -829,6 +838,8 @@ final class NativeBridge: ObservableObject {
                     message: error?.message ?? "Provider returned invalid model data"
                 )
             }
+        case .runtimeDiagnostics:
+            break
         case .quickPromptPreferencesResult(_, let accepted, let message):
             quickPromptPreferencesMessage = accepted
                 ? nil
@@ -987,5 +998,11 @@ final class NativeBridge: ObservableObject {
         let directory = base.appending(path: "dev.agent-sentinel.spike")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         return directory
+    }
+
+    private func bridgeDatabasePath() -> String {
+        appDataDirectory()
+            .appending(path: "phase2.sqlite3")
+            .path(percentEncoded: false)
     }
 }
