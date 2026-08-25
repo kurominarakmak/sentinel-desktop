@@ -8,9 +8,13 @@ final class SentinelFloatingPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
-    convenience init<Content: View>(title: String, @ViewBuilder content: () -> Content) {
+    convenience init<Content: View>(
+        title: String,
+        height: CGFloat = 240,
+        @ViewBuilder content: () -> Content
+    ) {
         self.init(
-            contentRect: NSRect(x: 0, y: 0, width: SentinelTokens.panelWidth, height: 240),
+            contentRect: NSRect(x: 0, y: 0, width: SentinelTokens.panelWidth, height: height),
             styleMask: [.nonactivatingPanel, .fullSizeContentView, .titled],
             backing: .buffered,
             defer: false

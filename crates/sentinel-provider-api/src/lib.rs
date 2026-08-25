@@ -184,6 +184,88 @@ pub struct ProviderSelection {
     pub reasoning_effort: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDiscoveryKind {
+    Enumerated,
+    CurrentConfiguration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderModel {
+    pub provider_id: ProviderId,
+    pub model_id: String,
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub default_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+    pub availability: ProviderModelAvailability,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderModelCatalog {
+    pub provider_id: ProviderId,
+    pub discovery_kind: ModelDiscoveryKind,
+    pub models: Vec<ProviderModel>,
+}
+
+impl ProviderModelCatalog {
+    fn validate(&self, expected_provider: &ProviderId) -> Result<(), ProviderError> {
+        if &self.provider_id != expected_provider || self.models.len() > 2_048 {
+            return Err(ProviderError::MalformedResponse);
+        }
+        let mut model_ids = HashSet::new();
+        for model in &self.models {
+            if model.provider_id != self.provider_id
+                || !valid_discovered_value(&model.model_id)
+                || model
+                    .display_name
+                    .as_deref()
+                    .is_some_and(|name| name.trim().is_empty() || name.len() > 160)
+                || model.supported_reasoning_efforts.len() > 32
+                || !model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .all(|effort| valid_discovered_value(effort))
+                || model
+                    .default_reasoning_effort
+                    .as_ref()
+                    .is_some_and(|effort| !model.supported_reasoning_efforts.contains(effort))
+                || !model_ids.insert(model.model_id.clone())
+            {
+                return Err(ProviderError::MalformedResponse);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_discovered_value(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 128
+        && !value.contains('\0')
+        && !value.chars().any(char::is_control)
+}
+
+/// Provider-owned runtime model discovery. Implementations query their actual
+/// harness/account configuration and return normalized data to the registry.
+pub trait ProviderModelDiscovery: Send + Sync {
+    fn provider_id(&self) -> &ProviderId;
+    fn discover_models(&self) -> ProviderFuture<'_, ProviderModelCatalog>;
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkflowProviderConfiguration {
@@ -478,6 +560,7 @@ pub trait ProviderAdapter: Send + Sync {
 struct RegistryEntry {
     config: ProviderConfig,
     adapter: Option<Arc<dyn ProviderAdapter>>,
+    model_discovery: Option<Arc<dyn ProviderModelDiscovery>>,
 }
 
 pub struct ProviderRegistry {
@@ -540,8 +623,30 @@ impl ProviderRegistry {
         if self.entries.contains_key(&config.id) {
             return Err(ProviderError::DuplicateProvider(config.id.to_string()));
         }
-        self.entries
-            .insert(config.id.clone(), RegistryEntry { config, adapter });
+        self.entries.insert(
+            config.id.clone(),
+            RegistryEntry {
+                config,
+                adapter,
+                model_discovery: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn register_model_discovery(
+        &mut self,
+        discovery: Arc<dyn ProviderModelDiscovery>,
+    ) -> Result<(), ProviderError> {
+        let id = discovery.provider_id().clone();
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or_else(|| ProviderError::ProviderUnavailable(id.to_string()))?;
+        if entry.model_discovery.is_some() {
+            return Err(ProviderError::DuplicateProvider(id.to_string()));
+        }
+        entry.model_discovery = Some(discovery);
         Ok(())
     }
 
@@ -601,10 +706,10 @@ impl ProviderRegistry {
         let config = self
             .provider(&selection.provider_id)
             .ok_or_else(|| ProviderError::ProviderUnavailable(selection.provider_id.to_string()))?;
-        let model_override_supported =
-            config.capabilities.model_selection && matches!(role, ProviderRole::Reviewer);
-        let effort_override_supported =
-            model_override_supported && config.id.as_str() == CODEX_PROVIDER_ID;
+        let model_override_supported = config.transport == ProviderTransport::ManagedCli
+            && config.capabilities.model_selection;
+        let effort_override_supported = matches!(role, ProviderRole::Reviewer)
+            && matches!(config.id.as_str(), CODEX_PROVIDER_ID | OMP_PROVIDER_ID);
         if !config.enabled
             || (!model_override_supported && selection.model_id != config.model_id)
             || (selection.reasoning_effort.is_some() && !effort_override_supported)
@@ -625,6 +730,78 @@ impl ProviderRegistry {
             && self.credential_state(&config.id) != CredentialState::Configured
         {
             return Err(ProviderError::Credential(CredentialError::Missing));
+        }
+        Ok(())
+    }
+
+    pub async fn discover_models(
+        &self,
+        provider_id: &ProviderId,
+    ) -> Result<ProviderModelCatalog, ProviderError> {
+        let entry = self
+            .entries
+            .get(provider_id)
+            .ok_or_else(|| ProviderError::ProviderUnavailable(provider_id.to_string()))?;
+        if !entry.config.enabled {
+            return Err(ProviderError::ProviderUnavailable(provider_id.to_string()));
+        }
+        let discovery = entry
+            .model_discovery
+            .as_ref()
+            .ok_or(ProviderError::UnsupportedCapability("model_discovery"))?;
+        let catalog = discovery.discover_models().await?;
+        catalog.validate(provider_id)?;
+        Ok(catalog)
+    }
+
+    /// Execution preflight deliberately performs fresh provider discovery.
+    /// UI caches are presentation hints and never authorize a selection.
+    pub async fn preflight_selection(
+        &self,
+        selection: &ProviderSelection,
+        role: ProviderRole,
+    ) -> Result<(), ProviderError> {
+        self.validate_selection(selection, role)?;
+        let config = self
+            .provider(&selection.provider_id)
+            .ok_or_else(|| ProviderError::ProviderUnavailable(selection.provider_id.to_string()))?;
+        if config.transport != ProviderTransport::ManagedCli {
+            return Ok(());
+        }
+        let catalog = self.discover_models(&selection.provider_id).await?;
+        validate_discovered_selection(selection, &catalog)
+    }
+
+    pub async fn preflight_workflow_configuration(
+        &self,
+        configuration: &WorkflowProviderConfiguration,
+    ) -> Result<(), ProviderError> {
+        self.validate_workflow_configuration(configuration)?;
+        let selections = [
+            (&configuration.implementer, ProviderRole::Implementer),
+            (&configuration.reviewer, ProviderRole::Reviewer),
+            (configuration.repair_selection(), ProviderRole::Repair),
+        ];
+        let mut catalogs = HashMap::new();
+        for (selection, _) in selections {
+            let config = self.provider(&selection.provider_id).ok_or_else(|| {
+                ProviderError::ProviderUnavailable(selection.provider_id.to_string())
+            })?;
+            if config.transport != ProviderTransport::ManagedCli {
+                continue;
+            }
+            if !catalogs.contains_key(&selection.provider_id) {
+                catalogs.insert(
+                    selection.provider_id.clone(),
+                    self.discover_models(&selection.provider_id).await?,
+                );
+            }
+            validate_discovered_selection(
+                selection,
+                catalogs
+                    .get(&selection.provider_id)
+                    .expect("catalog inserted for selection"),
+            )?;
         }
         Ok(())
     }
@@ -666,6 +843,28 @@ impl ProviderRegistry {
             .map_err(ProviderError::Credential)?;
         adapter.start(request, credential, events).await
     }
+}
+
+fn validate_discovered_selection(
+    selection: &ProviderSelection,
+    catalog: &ProviderModelCatalog,
+) -> Result<(), ProviderError> {
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| {
+            model.model_id == selection.model_id
+                && model.availability == ProviderModelAvailability::Available
+        })
+        .ok_or_else(|| ProviderError::ProviderUnavailable(selection.provider_id.to_string()))?;
+    if selection
+        .reasoning_effort
+        .as_ref()
+        .is_some_and(|effort| !model.supported_reasoning_efforts.contains(effort))
+    {
+        return Err(ProviderError::UnsupportedCapability("reasoning_effort"));
+    }
+    Ok(())
 }
 
 pub fn managed_codex_config(available: bool) -> ProviderConfig {
@@ -728,8 +927,8 @@ pub fn managed_omp_config(available: bool) -> ProviderConfig {
     ProviderConfig {
         id: ProviderId::new(OMP_PROVIDER_ID).expect("constant provider ID"),
         display_name: "OMP (Oh My Pi)".into(),
-        // A model can be selected through settings (for example `zai/glm-5.2`
-        // or `moonshot/kimi-k2.7-code`); OMP resolves its own credentials.
+        // Existing settings default only; native picker options are always
+        // obtained from OMP's runtime catalog.
         model_id: "zai/glm-5.2".into(),
         base_url: None,
         enabled: available,
@@ -1241,6 +1440,43 @@ mod tests {
         starts: Arc<Mutex<Vec<String>>>,
     }
 
+    struct FakeDiscovery {
+        provider_id: ProviderId,
+        models: Vec<ProviderModel>,
+        fail: bool,
+    }
+
+    impl ProviderModelDiscovery for FakeDiscovery {
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider_id
+        }
+
+        fn discover_models(&self) -> ProviderFuture<'_, ProviderModelCatalog> {
+            Box::pin(async move {
+                if self.fail {
+                    return Err(ProviderError::Unavailable("fixture unavailable".into()));
+                }
+                Ok(ProviderModelCatalog {
+                    provider_id: self.provider_id.clone(),
+                    discovery_kind: ModelDiscoveryKind::Enumerated,
+                    models: self.models.clone(),
+                })
+            })
+        }
+    }
+
+    fn discovered_model(provider_id: &ProviderId, model_id: &str) -> ProviderModel {
+        ProviderModel {
+            provider_id: provider_id.clone(),
+            model_id: model_id.into(),
+            display_name: Some(format!("Display {model_id}")),
+            supported_reasoning_efforts: vec!["medium".into(), "high".into()],
+            default_reasoning_effort: Some("medium".into()),
+            is_default: true,
+            availability: ProviderModelAvailability::Available,
+        }
+    }
+
     impl ProviderAdapter for FakeAdapter {
         fn config(&self) -> &ProviderConfig {
             &self.config
@@ -1493,5 +1729,84 @@ mod tests {
             .validate_selection(&reviewer, ProviderRole::Implementer)
             .is_err());
         assert_ne!(reviewer, implementer);
+    }
+
+    #[tokio::test]
+    async fn provider_neutral_discovery_returns_adapter_data_exactly_and_preflights() {
+        let mut registry = ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            true,
+            false,
+            false,
+        );
+        let id = ProviderId::new(CODEX_PROVIDER_ID).unwrap();
+        let model = discovered_model(&id, "fixture-dynamic-model");
+        registry
+            .register_model_discovery(Arc::new(FakeDiscovery {
+                provider_id: id.clone(),
+                models: vec![model.clone()],
+                fail: false,
+            }))
+            .unwrap();
+        assert_eq!(registry.discover_models(&id).await.unwrap().models, [model]);
+        assert!(registry
+            .preflight_selection(
+                &ProviderSelection {
+                    provider_id: id.clone(),
+                    model_id: "fixture-dynamic-model".into(),
+                    reasoning_effort: Some("high".into()),
+                },
+                ProviderRole::Reviewer,
+            )
+            .await
+            .is_ok());
+        assert!(registry
+            .preflight_selection(
+                &ProviderSelection {
+                    provider_id: id,
+                    model_id: "missing-model".into(),
+                    reasoning_effort: None,
+                },
+                ProviderRole::Implementer,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_and_empty_catalog_remain_distinct() {
+        let id = ProviderId::new(OMP_PROVIDER_ID).unwrap();
+        let mut empty = ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            false,
+            false,
+            true,
+        );
+        empty
+            .register_model_discovery(Arc::new(FakeDiscovery {
+                provider_id: id.clone(),
+                models: Vec::new(),
+                fail: false,
+            }))
+            .unwrap();
+        assert!(empty.discover_models(&id).await.unwrap().models.is_empty());
+
+        let mut failed = ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            false,
+            false,
+            true,
+        );
+        failed
+            .register_model_discovery(Arc::new(FakeDiscovery {
+                provider_id: id.clone(),
+                models: Vec::new(),
+                fail: true,
+            }))
+            .unwrap();
+        assert!(matches!(
+            failed.discover_models(&id).await,
+            Err(ProviderError::Unavailable(_))
+        ));
     }
 }

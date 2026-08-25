@@ -9,7 +9,13 @@ struct QuickPromptView: View {
     @ObservedObject var bridge: NativeBridge
     let accepted: () -> Void
     @State private var prompt = ""
-    @State private var provider = "configured"
+    @State private var implementerProvider = ""
+    @State private var implementerModel = ""
+    @State private var reviewerProvider = ""
+    @State private var reviewerModel = ""
+    @State private var reviewerEffort = ""
+    @State private var workflowMode = NativeWorkflowMode.manual
+    @State private var restored = false
     @FocusState private var promptFocused: Bool
 
     private var sending: Bool {
@@ -26,6 +32,31 @@ struct QuickPromptView: View {
         }
     }
 
+    private var configuration: NativeTaskConfiguration? {
+        guard model(providerID: implementerProvider, modelID: implementerModel, role: .implementer) != nil,
+              let reviewer = model(providerID: reviewerProvider, modelID: reviewerModel, role: .reviewer)
+        else { return nil }
+        let effort: String?
+        if reviewer.supportedReasoningEfforts.isEmpty {
+            effort = nil
+        } else {
+            guard reviewer.supportedReasoningEfforts.contains(reviewerEffort) else { return nil }
+            effort = reviewerEffort
+        }
+        return NativeTaskConfiguration(
+            implementer: APIProviderSelection(
+                providerId: implementerProvider,
+                modelId: implementerModel
+            ),
+            reviewer: APIProviderSelection(
+                providerId: reviewerProvider,
+                modelId: reviewerModel,
+                reasoningEffort: effort
+            ),
+            workflowMode: workflowMode
+        )
+    }
+
     var body: some View {
         SentinelPanel(style: .floating) {
             VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
@@ -35,36 +66,72 @@ struct QuickPromptView: View {
                 } else {
                     Text("Repository unavailable").font(.caption).foregroundStyle(.orange)
                 }
-                HStack(spacing: SentinelTokens.compactSpacing) {
-                    Text("Implement with")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Picker("Implementer", selection: $provider) {
-                        ForEach(bridge.providers) { capability in
-                            Text(capability.label)
-                                .tag(capability.id)
-                                .disabled(!capability.available)
-                        }
-                    }
-                    .labelsHidden()
-                    .disabled(sending)
-                    .accessibilityLabel("Implementation provider")
-                }
                 TextField("Describe a task…", text: $prompt, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .lineLimit(3...6)
                     .focused($promptFocused)
                     .onSubmit(send)
+                selectionSection(
+                    title: "Implementer",
+                    role: .implementer,
+                    providerID: implementerProvider,
+                    modelID: implementerModel
+                )
+                selectionSection(
+                    title: "Reviewer",
+                    role: .reviewer,
+                    providerID: reviewerProvider,
+                    modelID: reviewerModel
+                )
+                if let reviewer = model(
+                    providerID: reviewerProvider,
+                    modelID: reviewerModel,
+                    role: .reviewer
+                ), !reviewer.supportedReasoningEfforts.isEmpty {
+                    HStack(spacing: SentinelTokens.compactSpacing) {
+                        Text("Reasoning").font(.caption).foregroundStyle(.secondary)
+                            .frame(width: 76, alignment: .leading)
+                        Picker("Reviewer reasoning effort", selection: Binding(
+                            get: { reviewerEffort },
+                            set: { reviewerEffort = $0; persistIfValid() }
+                        )) {
+                            ForEach(reviewer.supportedReasoningEfforts, id: \.self) { effort in
+                                Text(effort.capitalized).tag(effort)
+                            }
+                        }
+                        .labelsHidden()
+                        .disabled(sending)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Workflow").font(.caption.weight(.semibold))
+                    Picker("Workflow", selection: Binding(
+                        get: { workflowMode },
+                        set: { workflowMode = $0; persistIfValid() }
+                    )) {
+                        Text("Manual").tag(NativeWorkflowMode.manual)
+                        Text("Auto Integrate").tag(NativeWorkflowMode.autoIntegrate)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .disabled(sending)
+                    Text(workflowMode == .manual
+                         ? "Stops for your approval before finalizing changes."
+                         : "Automatically applies verified changes to the selected local branch after validation and a clean review. No automatic push.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 HStack {
-                    Text("⌘↩ send · Select OMP for GLM/Kimi · Esc hide")
+                    Text("⌘↩ run · Esc hide")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                     Spacer()
-                    Button(sending ? "Sending…" : "Send", action: send)
+                    Button(sending ? "Starting…" : "Run Task", action: send)
                         .keyboardShortcut(.return, modifiers: .command)
                         .sentinelPrimaryButtonStyle()
-                        .disabled(sending || bridge.repositoryContext == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bridge.providers.first(where: { $0.id == provider })?.available != true)
+                        .disabled(sending || bridge.repositoryContext == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || configuration == nil)
                 }
                 if let feedback {
                     if sending {
@@ -76,13 +143,19 @@ struct QuickPromptView: View {
             }
         }
         .frame(width: SentinelTokens.panelWidth)
-        .onAppear { promptFocused = true }
-        .onReceive(NotificationCenter.default.publisher(for: .sentinelQuickPromptShown)) { _ in promptFocused = true }
-        .onChange(of: bridge.providers) { _, providers in
-            if !providers.contains(where: { $0.id == provider && $0.available }),
-               let replacement = providers.first(where: \.available) {
-                provider = replacement.id
-            }
+        .onAppear {
+            promptFocused = true
+            restoreSelectionsIfPossible()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .sentinelQuickPromptShown)) { _ in
+            promptFocused = true
+            refreshMissingCatalogs()
+        }
+        .onChange(of: bridge.providers) { _, _ in
+            restoreSelectionsIfPossible()
+        }
+        .onChange(of: bridge.modelDiscovery) { _, _ in
+            reconcileDiscoveries()
         }
         .onChange(of: bridge.taskSubmission) { _, state in
             if case .accepted = state {
@@ -93,7 +166,207 @@ struct QuickPromptView: View {
     }
 
     private func send() {
-        bridge.submitTask(provider: provider, summary: prompt.trimmingCharacters(in: .whitespacesAndNewlines), prompt: prompt)
+        guard let configuration else { return }
+        bridge.submitTask(
+            configuration: configuration,
+            summary: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+            prompt: prompt
+        )
+    }
+
+    @ViewBuilder
+    private func selectionSection(
+        title: String,
+        role: QuickPromptRole,
+        providerID: String,
+        modelID: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold))
+            HStack(spacing: SentinelTokens.compactSpacing) {
+                Picker("\(title) provider", selection: Binding(
+                    get: { providerID },
+                    set: { selectProvider($0, role: role) }
+                )) {
+                    ForEach(bridge.providers) { capability in
+                        Text(capability.label).tag(capability.id).disabled(!capability.available)
+                    }
+                }
+                .labelsHidden()
+                .disabled(sending)
+                modelPicker(title: title, role: role, providerID: providerID, modelID: modelID)
+                Button {
+                    bridge.discoverModels(providerID: providerID, role: role)
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(sending || providerID.isEmpty)
+                .help("Refresh \(title.lowercased()) models")
+                .accessibilityLabel("Refresh \(title.lowercased()) models")
+            }
+            discoveryStatus(role: role, providerID: providerID, modelID: modelID)
+        }
+    }
+
+    @ViewBuilder
+    private func modelPicker(
+        title: String,
+        role: QuickPromptRole,
+        providerID: String,
+        modelID: String
+    ) -> some View {
+        let models = catalog(role: role, providerID: providerID)?.models ?? []
+        Picker("\(title) model", selection: Binding(
+            get: { modelID },
+            set: { selectModel($0, role: role) }
+        )) {
+            if !modelID.isEmpty && !models.contains(where: { $0.modelId == modelID && $0.available }) {
+                Text("\(modelID) (Unavailable)").tag(modelID)
+            }
+            ForEach(models.filter(\.available)) { model in
+                Text(model.label).tag(model.modelId)
+            }
+        }
+        .labelsHidden()
+        .disabled(sending || models.isEmpty)
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private func discoveryStatus(role: QuickPromptRole, providerID: String, modelID: String) -> some View {
+        switch bridge.modelDiscovery[role] ?? .idle {
+        case .idle:
+            EmptyView()
+        case .loading(let loadingProvider) where loadingProvider == providerID:
+            Label("Loading models…", systemImage: "progress.indicator")
+                .font(.caption2).foregroundStyle(.secondary)
+        case .loaded(let catalog) where catalog.providerId == providerID && catalog.models.isEmpty:
+            Text("No models available").font(.caption2).foregroundStyle(.orange)
+        case .loaded(let catalog) where catalog.providerId == providerID:
+            if !modelID.isEmpty && !catalog.models.contains(where: { $0.modelId == modelID && $0.available }) {
+                Text("Selected model is unavailable. Refresh or choose another model.")
+                    .font(.caption2).foregroundStyle(.orange)
+            } else if catalog.discoveryKind == "current_configuration" {
+                Text("Enumeration unsupported; using Claude Code's current/default configuration.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        case .failed(let failedProvider, let code, let message) where failedProvider == providerID:
+            Text(code == "authentication_required" ? "Authentication required" : message)
+                .font(.caption2).foregroundStyle(.orange)
+        default:
+            EmptyView()
+        }
+    }
+
+    private func restoreSelectionsIfPossible() {
+        guard !restored, !bridge.providers.isEmpty else { return }
+        if let preferences = bridge.quickPromptPreferences {
+            implementerProvider = preferences.implementer.providerId
+            implementerModel = preferences.implementer.modelId
+            reviewerProvider = preferences.reviewer.providerId
+            reviewerModel = preferences.reviewer.modelId
+            reviewerEffort = preferences.reviewer.reasoningEffort ?? ""
+            workflowMode = preferences.workflowMode
+        } else {
+            implementerProvider = bridge.quickPromptDefaults?.implementerProviderId
+                ?? bridge.providers.first(where: \.available)?.id
+                ?? bridge.providers.first?.id
+                ?? ""
+            reviewerProvider = bridge.quickPromptDefaults?.reviewerProviderId
+                ?? bridge.providers.first(where: \.available)?.id
+                ?? bridge.providers.first?.id
+                ?? ""
+            workflowMode = .manual
+        }
+        restored = true
+        refreshMissingCatalogs()
+    }
+
+    private func refreshMissingCatalogs() {
+        guard restored else { return }
+        if !implementerProvider.isEmpty {
+            bridge.discoverModels(providerID: implementerProvider, role: .implementer)
+        }
+        if !reviewerProvider.isEmpty {
+            bridge.discoverModels(providerID: reviewerProvider, role: .reviewer)
+        }
+    }
+
+    private func selectProvider(_ providerID: String, role: QuickPromptRole) {
+        switch role {
+        case .implementer:
+            implementerProvider = providerID
+            implementerModel = ""
+        case .reviewer:
+            reviewerProvider = providerID
+            reviewerModel = ""
+            reviewerEffort = ""
+        }
+        bridge.discoverModels(providerID: providerID, role: role)
+    }
+
+    private func selectModel(_ modelID: String, role: QuickPromptRole) {
+        switch role {
+        case .implementer:
+            implementerModel = modelID
+        case .reviewer:
+            reviewerModel = modelID
+            if let model = model(providerID: reviewerProvider, modelID: modelID, role: .reviewer) {
+                reviewerEffort = QuickPromptSelectionValidation.preferredReviewerEffort(for: model)
+                    ?? ""
+            } else {
+                reviewerEffort = ""
+            }
+        }
+        persistIfValid()
+    }
+
+    private func reconcileDiscoveries() {
+        if implementerModel.isEmpty,
+           let catalog = catalog(role: .implementer, providerID: implementerProvider),
+           let selected = catalog.models.first(where: { $0.available && $0.isDefault })
+                ?? catalog.models.first(where: \.available) {
+            implementerModel = selected.modelId
+        }
+        if reviewerModel.isEmpty,
+           let catalog = catalog(role: .reviewer, providerID: reviewerProvider),
+           let selected = catalog.models.first(where: { $0.available && $0.isDefault })
+                ?? catalog.models.first(where: \.available) {
+            reviewerModel = selected.modelId
+            reviewerEffort = QuickPromptSelectionValidation.preferredReviewerEffort(for: selected)
+                ?? ""
+        }
+        persistIfValid()
+    }
+
+    private func persistIfValid() {
+        guard let configuration else { return }
+        bridge.saveQuickPromptPreferences(NativeQuickPromptPreferences(
+            implementer: configuration.implementer,
+            reviewer: configuration.reviewer,
+            workflowMode: configuration.workflowMode
+        ))
+    }
+
+    private func catalog(role: QuickPromptRole, providerID: String) -> NativeProviderModelCatalog? {
+        guard case .loaded(let catalog) = bridge.modelDiscovery[role],
+              catalog.providerId == providerID else { return nil }
+        return catalog
+    }
+
+    private func model(
+        providerID: String,
+        modelID: String,
+        role: QuickPromptRole
+    ) -> NativeProviderModel? {
+        guard bridge.providers.first(where: { $0.id == providerID })?.available == true else {
+            return nil
+        }
+        return QuickPromptSelectionValidation.availableModel(
+            modelID: modelID,
+            catalog: catalog(role: role, providerID: providerID)
+        )
     }
 }
 
@@ -167,6 +440,9 @@ struct TaskDetailView: View {
                 if let detail = bridge.taskDetail {
                     VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
                         summary(detail)
+                        if let configuration = detail.configuration {
+                            taskConfiguration(configuration)
+                        }
                         if detail.task.recoveryRequired || detail.task.lifecycle == "failed" || detail.task.lifecycle == "blocked" {
                             Label(detail.task.recoveryReason?.replacingOccurrences(of: "_", with: " ") ?? "Task requires attention.", systemImage: "exclamationmark.triangle.fill")
                                 .font(.subheadline.weight(.semibold)).foregroundStyle(.red)
@@ -210,6 +486,39 @@ struct TaskDetailView: View {
                 }.font(.caption)
             }
             if let event = detail.activity.last { Label(event.kind.replacingOccurrences(of: "_", with: " "), systemImage: "waveform.path.ecg").font(.caption).foregroundStyle(.secondary) }
+        }
+    }
+
+    private func taskConfiguration(_ configuration: NativeTaskConfiguration) -> some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+            GridRow {
+                Text("Implementer").foregroundStyle(.secondary)
+                Text("\(providerName(configuration.implementer.providerId)) · \(configuration.implementer.modelId)")
+                    .lineLimit(1)
+            }
+            GridRow {
+                Text("Reviewer").foregroundStyle(.secondary)
+                Text([
+                    providerName(configuration.reviewer.providerId),
+                    configuration.reviewer.modelId,
+                    configuration.reviewer.reasoningEffort,
+                ].compactMap { $0 }.joined(separator: " · "))
+                    .lineLimit(1)
+            }
+            GridRow {
+                Text("Workflow").foregroundStyle(.secondary)
+                Text(configuration.workflowMode == .manual ? "Manual" : "Auto Integrate")
+            }
+        }
+        .font(.caption)
+    }
+
+    private func providerName(_ providerID: String) -> String {
+        switch providerID {
+        case "omp": return "OMP"
+        case "claude_code": return "Claude Code"
+        case "codex": return "Codex"
+        default: return providerID
         }
     }
 

@@ -28,9 +28,24 @@ impl StartedCodexTask {
     }
 
     pub async fn start_turn(&mut self, prompt: &str) -> Result<CodexTurn, CodexError> {
-        let turn = self.server.start_turn(&self.session, prompt).await?;
+        self.start_turn_with_model(prompt, None).await
+    }
+
+    pub async fn start_turn_with_model(
+        &mut self,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> Result<CodexTurn, CodexError> {
+        let turn = self
+            .server
+            .start_turn_with_model(&self.session, prompt, model)
+            .await?;
         self.turn = Some(turn.clone());
         Ok(turn)
+    }
+
+    pub async fn ensure_requested_selection_enforced(&self) -> Result<(), CodexError> {
+        self.server.ensure_requested_selection_enforced().await
     }
 
     pub async fn cancel(&mut self) -> Result<(), CodexError> {

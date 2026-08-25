@@ -15,6 +15,13 @@ struct APIProviderCapabilities: Codable, Equatable {
 struct APIProviderSelection: Codable, Equatable {
     let providerId: String
     let modelId: String
+    let reasoningEffort: String?
+
+    init(providerId: String, modelId: String, reasoningEffort: String? = nil) {
+        self.providerId = providerId
+        self.modelId = modelId
+        self.reasoningEffort = reasoningEffort
+    }
 }
 
 struct APIWorkflowProviderConfiguration: Codable, Equatable {

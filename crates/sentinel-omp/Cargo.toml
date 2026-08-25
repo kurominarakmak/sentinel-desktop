@@ -9,6 +9,7 @@ test-support = []
 
 [dependencies]
 sentinel-core = { path = "../sentinel-core" }
+sentinel-provider-api = { path = "../sentinel-provider-api" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -5,8 +5,14 @@
 
 use sentinel_core::{
     redact,
-    v3::{CreateSession, EventId, EventKind, NormalizedEventEnvelope, SessionId, TaskId},
+    v3::{
+        CreateSession, CreateTask, EventId, EventKind, NormalizedEventEnvelope, SessionId, TaskId,
+    },
     CoreError, RunRepository,
+};
+use sentinel_provider_api::{
+    ModelDiscoveryKind, ProviderError, ProviderFuture, ProviderId, ProviderModel,
+    ProviderModelAvailability, ProviderModelCatalog, ProviderModelDiscovery, CODEX_PROVIDER_ID,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -97,6 +103,80 @@ impl CodexProgram {
             return Err(CodexError::MissingExecutable);
         }
         Ok(&self.executable)
+    }
+}
+
+/// Model discovery uses the same authenticated App Server protocol as normal
+/// Codex work, but persists any unsolicited protocol diagnostics only in the
+/// caller-supplied query repository rather than the workflow repository.
+#[derive(Clone)]
+pub struct CodexModelDiscovery {
+    program: CodexProgram,
+    repository: RunRepository,
+    cwd: PathBuf,
+    provider_id: ProviderId,
+}
+
+impl CodexModelDiscovery {
+    pub fn new(program: CodexProgram, repository: RunRepository, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program,
+            repository,
+            cwd: cwd.into(),
+            provider_id: ProviderId::new(CODEX_PROVIDER_ID).expect("constant provider ID"),
+        }
+    }
+}
+
+impl ProviderModelDiscovery for CodexModelDiscovery {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    fn discover_models(&self) -> ProviderFuture<'_, ProviderModelCatalog> {
+        Box::pin(async move {
+            if !self.cwd.is_dir() {
+                return Err(ProviderError::Unavailable("Codex is unavailable".into()));
+            }
+            let task = self
+                .repository
+                .v3()
+                .create_task(
+                    CreateTask {
+                        project_id: None,
+                        workflow_id: "native-model-discovery".into(),
+                        summary: "Native Codex model discovery".into(),
+                    },
+                    now_ms(),
+                )
+                .await
+                .map_err(|_| ProviderError::Unavailable("Codex discovery storage failed".into()))?;
+            let mut server = CodexAppServer::start(
+                self.program.clone(),
+                self.repository.clone(),
+                task.id,
+                &self.cwd,
+            )
+            .await
+            .map_err(map_discovery_error)?;
+            let result = server.list_models(&self.provider_id).await;
+            let shutdown = server.shutdown().await;
+            match (result, shutdown) {
+                (Ok(catalog), Ok(())) => Ok(catalog),
+                (Ok(_), Err(error)) | (Err(error), _) => Err(map_discovery_error(error)),
+            }
+        })
+    }
+}
+
+fn map_discovery_error(error: CodexError) -> ProviderError {
+    match error {
+        CodexError::Timeout => ProviderError::Timeout,
+        CodexError::MalformedMessage | CodexError::UnexpectedResponse => {
+            ProviderError::MalformedResponse
+        }
+        CodexError::Unsupported => ProviderError::UnsupportedCapability("model_discovery"),
+        _ => ProviderError::Unavailable("Codex model discovery failed".into()),
     }
 }
 
@@ -424,6 +504,42 @@ impl CodexAppServer {
         Ok(snapshot)
     }
 
+    pub async fn list_models(
+        &self,
+        provider_id: &ProviderId,
+    ) -> Result<ProviderModelCatalog, CodexError> {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut models = Vec::new();
+        let mut complete = false;
+        for _ in 0..32 {
+            let result = self
+                .request(
+                    "model/list",
+                    json!({"cursor":cursor,"limit":100,"includeHidden":false}),
+                )
+                .await?;
+            let page = parse_model_page(&result, provider_id)?;
+            models.extend(page.0);
+            let Some(next) = page.1 else {
+                complete = true;
+                break;
+            };
+            if !seen_cursors.insert(next.clone()) {
+                return Err(CodexError::MalformedMessage);
+            }
+            cursor = Some(next);
+        }
+        if !complete {
+            return Err(CodexError::MalformedMessage);
+        }
+        Ok(ProviderModelCatalog {
+            provider_id: provider_id.clone(),
+            discovery_kind: ModelDiscoveryKind::Enumerated,
+            models,
+        })
+    }
+
     pub async fn start_thread(&self, cwd: &Path) -> Result<CodexSession, CodexError> {
         let result = self.request("thread/start", json!({"cwd":cwd})).await?;
         self.session_from_result(result, EventKind::SessionStarted)
@@ -532,20 +648,40 @@ impl CodexAppServer {
         session: &CodexSession,
         prompt: &str,
     ) -> Result<CodexTurn, CodexError> {
+        self.start_turn_with_model(session, prompt, None).await
+    }
+
+    pub async fn start_turn_with_model(
+        &self,
+        session: &CodexSession,
+        prompt: &str,
+        model: Option<&str>,
+    ) -> Result<CodexTurn, CodexError> {
         // The supervisor has already proved that this App Server's process
         // cwd is its owned task worktree.  Do not leave a native implementation
         // turn at Codex's interactive default: no UI is connected to answer
         // approval requests, which otherwise leaves a real task stalled after
         // it proposes its first edit.
-        self.start_turn_with_policy(
-            session,
-            prompt,
-            Some(json!({
-                "approvalPolicy": "never",
-                "sandboxPolicy": {"type": "workspaceWrite"}
-            })),
-        )
-        .await
+        if let Some(model) = model {
+            valid_selection_value(model)?;
+        }
+        {
+            let mut state = self.state.lock().await;
+            state.requested_model = model.map(str::to_owned);
+            state.selection_rerouted = false;
+        }
+        let mut policy = json!({
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "workspaceWrite"}
+        });
+        if let Some(model) = model {
+            policy
+                .as_object_mut()
+                .expect("turn policy is an object")
+                .insert("model".into(), Value::String(model.into()));
+        }
+        self.start_turn_with_policy(session, prompt, Some(policy))
+            .await
     }
 
     /// Starts a reviewer turn with an explicit provider read-only sandbox and
@@ -762,6 +898,69 @@ impl CodexAppServer {
         )
         .await
     }
+}
+
+fn parse_model_page(
+    value: &Value,
+    provider_id: &ProviderId,
+) -> Result<(Vec<ProviderModel>, Option<String>), CodexError> {
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or(CodexError::MalformedMessage)?;
+    let mut models = Vec::with_capacity(data.len());
+    for value in data {
+        if value
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let model_id = value
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or(CodexError::MalformedMessage)?;
+        let display_name = value
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let supported_reasoning_efforts = value
+            .get("supportedReasoningEfforts")
+            .and_then(Value::as_array)
+            .ok_or(CodexError::MalformedMessage)?
+            .iter()
+            .map(|option| {
+                option
+                    .get("reasoningEffort")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or(CodexError::MalformedMessage)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let default_reasoning_effort = value
+            .get("defaultReasoningEffort")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        models.push(ProviderModel {
+            provider_id: provider_id.clone(),
+            model_id: model_id.into(),
+            display_name,
+            supported_reasoning_efforts,
+            default_reasoning_effort,
+            is_default: value
+                .get("isDefault")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            availability: ProviderModelAvailability::Available,
+        });
+    }
+    let next_cursor = match value.get("nextCursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cursor)) if !cursor.is_empty() => Some(cursor.clone()),
+        _ => return Err(CodexError::MalformedMessage),
+    };
+    Ok((models, next_cursor))
 }
 
 fn classify_thread_snapshot(value: &Value, expected_id: &str) -> CodexThreadState {

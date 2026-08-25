@@ -20,6 +20,112 @@ struct ProviderCapability: Codable, Equatable, Identifiable {
     let available: Bool
 }
 
+enum QuickPromptRole: String, CaseIterable, Hashable {
+    case implementer
+    case reviewer
+}
+
+enum NativeWorkflowMode: String, Codable, CaseIterable, Equatable {
+    case manual
+    case autoIntegrate = "auto_integrate"
+}
+
+struct NativeProviderModel: Codable, Equatable, Identifiable {
+    let providerId: String
+    let modelId: String
+    let displayName: String?
+    let supportedReasoningEfforts: [String]
+    let defaultReasoningEffort: String?
+    let isDefault: Bool
+    let availability: String
+
+    var id: String { "\(providerId):\(modelId)" }
+    var available: Bool { availability == "available" }
+    var label: String { displayName ?? modelId }
+}
+
+struct NativeProviderModelCatalog: Codable, Equatable {
+    let providerId: String
+    let discoveryKind: String
+    let models: [NativeProviderModel]
+}
+
+struct NativeModelDiscoveryError: Codable, Equatable {
+    let code: String
+    let message: String
+}
+
+struct NativeQuickPromptPreferences: Codable, Equatable {
+    let implementer: APIProviderSelection
+    let reviewer: APIProviderSelection
+    let workflowMode: NativeWorkflowMode
+}
+
+struct NativeQuickPromptDefaults: Codable, Equatable {
+    let implementerProviderId: String
+    let reviewerProviderId: String
+}
+
+struct NativeTaskConfiguration: Codable, Equatable {
+    let implementer: APIProviderSelection
+    let reviewer: APIProviderSelection
+    let workflowMode: NativeWorkflowMode
+}
+
+enum ModelDiscoveryPhase: Equatable {
+    case idle
+    case loading(providerID: String)
+    case loaded(NativeProviderModelCatalog)
+    case failed(providerID: String, code: String, message: String)
+}
+
+struct ModelDiscoveryGate {
+    private(set) var pending: [QuickPromptRole: (requestID: String, providerID: String)] = [:]
+
+    mutating func begin(role: QuickPromptRole, providerID: String, requestID: String) {
+        pending[role] = (requestID, providerID)
+    }
+
+    mutating func apply(requestID: String, providerID: String) -> QuickPromptRole? {
+        guard let match = pending.first(where: {
+            $0.value.requestID == requestID && $0.value.providerID == providerID
+        }) else { return nil }
+        pending.removeValue(forKey: match.key)
+        return match.key
+    }
+
+    mutating func failToSend(requestID: String) -> QuickPromptRole? {
+        guard let match = pending.first(where: { $0.value.requestID == requestID }) else { return nil }
+        pending.removeValue(forKey: match.key)
+        return match.key
+    }
+}
+
+enum QuickPromptSelectionValidation {
+    static func availableModel(
+        modelID: String,
+        catalog: NativeProviderModelCatalog?
+    ) -> NativeProviderModel? {
+        catalog?.models.first(where: { $0.modelId == modelID && $0.available })
+    }
+
+    static func reviewerEffortIsValid(
+        _ effort: String?,
+        for model: NativeProviderModel
+    ) -> Bool {
+        if model.supportedReasoningEfforts.isEmpty { return effort == nil }
+        return effort.map { model.supportedReasoningEfforts.contains($0) } ?? false
+    }
+
+    static func preferredReviewerEffort(for model: NativeProviderModel) -> String? {
+        if let defaultEffort = model.defaultReasoningEffort,
+           model.supportedReasoningEfforts.contains(defaultEffort) {
+            return defaultEffort
+        }
+        return model.supportedReasoningEfforts.first
+    }
+}
+
 struct AttentionActions: Codable, Equatable {
     let stop: Bool
     let approve: Bool
@@ -56,6 +162,7 @@ struct NativeTaskDetail: Codable, Equatable {
     let repairRounds: [DetailRepairRound]
     let finalApprovalPacket: String?
     let actions: AttentionActions
+    var configuration: NativeTaskConfiguration? = nil
 }
 
 struct RateLimitWindow: Decodable, Equatable {
@@ -319,7 +426,9 @@ enum BridgeMessage: Decodable, Equatable {
     case activeTask(NativeTask?)
     case taskUpdate(NativeTask?)
     case subscribed
-    case capabilities(repository: String?, providers: [ProviderCapability])
+    case capabilities(repository: String?, providers: [ProviderCapability], preferences: NativeQuickPromptPreferences?, defaults: NativeQuickPromptDefaults?)
+    case discoverModelsResult(requestID: String, providerID: String, catalog: NativeProviderModelCatalog?, error: NativeModelDiscoveryError?)
+    case quickPromptPreferencesResult(requestID: String, accepted: Bool, message: String?)
     case attentionState(NativeAttention?)
     case attentionUpdate(NativeAttention?)
     case attentionActionResult(requestID: String, accepted: Bool, message: String?)
@@ -331,7 +440,7 @@ enum BridgeMessage: Decodable, Equatable {
     case taskStartResult(requestID: String, accepted: Bool, task: NativeTask?, message: String?)
     case unavailable(String)
 
-    private enum CodingKeys: String, CodingKey { case kind, task, message, repository, providers, requestId, accepted, attention, detail, status, settings }
+    private enum CodingKeys: String, CodingKey { case kind, task, message, repository, providers, requestId, providerId, accepted, attention, detail, status, settings, catalog, error, quickPromptPreferences, quickPromptDefaults }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -339,7 +448,9 @@ enum BridgeMessage: Decodable, Equatable {
         case "active_task": self = .activeTask(try values.decodeIfPresent(NativeTask.self, forKey: .task))
         case "task_update": self = .taskUpdate(try values.decodeIfPresent(NativeTask.self, forKey: .task))
         case "subscribed": self = .subscribed
-        case "capabilities": self = .capabilities(repository: try values.decodeIfPresent(String.self, forKey: .repository), providers: try values.decodeIfPresent([ProviderCapability].self, forKey: .providers) ?? [])
+        case "capabilities": self = .capabilities(repository: try values.decodeIfPresent(String.self, forKey: .repository), providers: try values.decodeIfPresent([ProviderCapability].self, forKey: .providers) ?? [], preferences: try values.decodeIfPresent(NativeQuickPromptPreferences.self, forKey: .quickPromptPreferences), defaults: try values.decodeIfPresent(NativeQuickPromptDefaults.self, forKey: .quickPromptDefaults))
+        case "discover_models_result": self = .discoverModelsResult(requestID: try values.decode(String.self, forKey: .requestId), providerID: try values.decode(String.self, forKey: .providerId), catalog: try values.decodeIfPresent(NativeProviderModelCatalog.self, forKey: .catalog), error: try values.decodeIfPresent(NativeModelDiscoveryError.self, forKey: .error))
+        case "quick_prompt_preferences_result": self = .quickPromptPreferencesResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), message: try values.decodeIfPresent(String.self, forKey: .message))
         case "attention_state": self = .attentionState(try values.decodeIfPresent(NativeAttention.self, forKey: .attention))
         case "attention_update": self = .attentionUpdate(try values.decodeIfPresent(NativeAttention.self, forKey: .attention))
         case "attention_action_result": self = .attentionActionResult(requestID: try values.decode(String.self, forKey: .requestId), accepted: try values.decode(Bool.self, forKey: .accepted), message: try values.decodeIfPresent(String.self, forKey: .message))
@@ -359,6 +470,10 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var activeTask: NativeTask?
     @Published private(set) var availabilityMessage: String?
     @Published private(set) var providers: [ProviderCapability] = []
+    @Published private(set) var modelDiscovery: [QuickPromptRole: ModelDiscoveryPhase] = [:]
+    @Published private(set) var quickPromptPreferences: NativeQuickPromptPreferences?
+    @Published private(set) var quickPromptDefaults: NativeQuickPromptDefaults?
+    @Published private(set) var quickPromptPreferencesMessage: String?
     @Published private(set) var repositoryContext: String?
     @Published private(set) var taskSubmission = TaskSubmissionState.idle
     @Published private(set) var attention: NativeAttention?
@@ -379,6 +494,8 @@ final class NativeBridge: ObservableObject {
     private var stopped = false
     private var outputBuffer = BridgeLineBuffer()
     private var submissionGate = TaskSubmissionGate()
+    private var modelDiscoveryGate = ModelDiscoveryGate()
+    private var preferencesSaveWorkItem: DispatchWorkItem?
     private var attentionActionGate = AttentionActionGate()
     private var attentionUpdateGate = AttentionUpdateGate()
     private var detailUpdateGate = DetailUpdateGate()
@@ -432,6 +549,8 @@ final class NativeBridge: ObservableObject {
     func stop() {
         stopped = true
         reconnectScheduled = false
+        preferencesSaveWorkItem?.cancel()
+        preferencesSaveWorkItem = nil
         _ = connectionState.began()
         output?.readabilityHandler = nil
         input?.closeFile()
@@ -487,6 +606,49 @@ final class NativeBridge: ObservableObject {
 
     func loadStatus() { _ = send(["kind": "status"]) }
     func loadSettings() { _ = send(["kind": "settings"]) }
+
+    func discoverModels(providerID: String, role: QuickPromptRole) {
+        let requestID = UUID().uuidString.lowercased()
+        modelDiscoveryGate.begin(role: role, providerID: providerID, requestID: requestID)
+        modelDiscovery[role] = .loading(providerID: providerID)
+        guard send([
+            "kind": "discover_models",
+            "request_id": requestID,
+            "provider_id": providerID,
+        ]) else {
+            guard let failedRole = modelDiscoveryGate.failToSend(requestID: requestID) else { return }
+            modelDiscovery[failedRole] = .failed(
+                providerID: providerID,
+                code: "bridge_unavailable",
+                message: "Provider unavailable"
+            )
+            return
+        }
+    }
+
+    func saveQuickPromptPreferences(_ preferences: NativeQuickPromptPreferences) {
+        preferencesSaveWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let requestID = UUID().uuidString.lowercased()
+            let payload: [String: Any] = [
+                "implementer": self.selectionPayload(preferences.implementer),
+                "reviewer": self.selectionPayload(preferences.reviewer),
+                "workflowMode": preferences.workflowMode.rawValue,
+            ]
+            guard self.send([
+                "kind": "save_quick_prompt_preferences",
+                "request_id": requestID,
+                "preferences": payload,
+            ]) else {
+                self.quickPromptPreferencesMessage = "Preferences could not be saved."
+                return
+            }
+            self.quickPromptPreferences = preferences
+        }
+        preferencesSaveWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: workItem)
+    }
 
     func setRepository(_ path: String) {
         let requestID = UUID().uuidString.lowercased()
@@ -585,21 +747,46 @@ final class NativeBridge: ObservableObject {
         }
     }
 
-    func submitTask(provider: String, summary: String, prompt: String) {
+    func submitTask(configuration: NativeTaskConfiguration, summary: String, prompt: String) {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestID = UUID().uuidString.lowercased()
-        switch submissionGate.begin(prompt: trimmed, providerAvailable: providers.first(where: { $0.id == provider })?.available == true, requestID: requestID) {
+        let providersAvailable = [
+            configuration.implementer.providerId,
+            configuration.reviewer.providerId,
+        ].allSatisfy { providerID in
+            providers.first(where: { $0.id == providerID })?.available == true
+        }
+        switch submissionGate.begin(prompt: trimmed, providerAvailable: providersAvailable, requestID: requestID) {
         case .rejected(let message):
             taskSubmission = .rejected(message)
             return
         case .accepted: break
         }
         taskSubmission = .sending
-        guard send(["kind": "start_task", "request_id": requestID, "provider": provider, "summary": summary, "prompt": trimmed]) else {
+        guard send([
+            "kind": "start_task",
+            "request_id": requestID,
+            "summary": summary,
+            "prompt": trimmed,
+            "implementer": selectionPayload(configuration.implementer),
+            "reviewer": selectionPayload(configuration.reviewer),
+            "workflow_mode": configuration.workflowMode.rawValue,
+        ]) else {
             submissionGate.rejectPending()
             taskSubmission = .rejected("Native bridge is unavailable.")
             return
         }
+    }
+
+    private func selectionPayload(_ selection: APIProviderSelection) -> [String: Any] {
+        var payload: [String: Any] = [
+            "providerId": selection.providerId,
+            "modelId": selection.modelId,
+        ]
+        if let effort = selection.reasoningEffort {
+            payload["reasoningEffort"] = effort
+        }
+        return payload
     }
 
     private func receive(_ message: BridgeMessage, generation: UInt64) {
@@ -628,6 +815,24 @@ final class NativeBridge: ObservableObject {
             } else {
                 settingsMutationMessage = message ?? "Repository setting was rejected."
             }
+        case .discoverModelsResult(let requestID, let providerID, let catalog, let error):
+            guard let role = modelDiscoveryGate.apply(
+                requestID: requestID,
+                providerID: providerID
+            ) else { return }
+            if let catalog, catalog.providerId == providerID {
+                modelDiscovery[role] = .loaded(catalog)
+            } else {
+                modelDiscovery[role] = .failed(
+                    providerID: providerID,
+                    code: error?.code ?? "invalid_response",
+                    message: error?.message ?? "Provider returned invalid model data"
+                )
+            }
+        case .quickPromptPreferencesResult(_, let accepted, let message):
+            quickPromptPreferencesMessage = accepted
+                ? nil
+                : (message ?? "Preferences could not be saved.")
         case .attentionActionResult(let requestID, let accepted, let message):
             guard attentionActionGate.complete(requestID: requestID) else { return }
             attentionActionInFlight = false
@@ -639,9 +844,11 @@ final class NativeBridge: ObservableObject {
                 )
             }
             restoreFocusAfterAttentionAction = false
-        case .capabilities(let repository, let providers):
+        case .capabilities(let repository, let providers, let preferences, let defaults):
             repositoryContext = repository
             self.providers = providers
+            quickPromptPreferences = preferences
+            quickPromptDefaults = defaults
         case .taskStartResult(let requestID, let accepted, let task, let message):
             guard submissionGate.complete(requestID: requestID) else { return }
             if accepted, let task {
@@ -726,6 +933,8 @@ final class NativeBridge: ObservableObject {
     }
 
     private func resetUpdateGates() {
+        modelDiscoveryGate = ModelDiscoveryGate()
+        modelDiscovery = [:]
         attentionUpdateGate = AttentionUpdateGate()
         detailUpdateGate = DetailUpdateGate()
         statusUpdateGate = StatusUpdateGate()

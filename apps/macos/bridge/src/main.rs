@@ -4,19 +4,20 @@
 //! snapshots and forwards the already-existing final-approval supervisor call.
 
 use sentinel_agent_api::{detect_installation, AgentKind, InstallationStatus};
-use sentinel_claude::ClaudeProgram;
-use sentinel_codex::{CodexAppServer, CodexProgram};
+use sentinel_claude::{ClaudeModelDiscovery, ClaudeProgram};
+use sentinel_codex::{CodexAppServer, CodexModelDiscovery, CodexProgram};
 use sentinel_core::{
     v3::{ApprovalId, CreateTask, SupervisorRequestReservation, TaskId, WorkflowMode},
     CoreError, RunRepository,
 };
 use sentinel_git::{inspect_repository, RepositoryState};
-use sentinel_omp::OmpProgram;
+use sentinel_omp::{OmpModelDiscovery, OmpProgram};
 use sentinel_provider_api::{
     openai_compatible::CustomProviderSpec,
     settings::{ProviderSettingsSnapshot, ProviderSettingsStore},
-    CredentialState, MacOsKeychainCredentialStore, ProviderId, ProviderRole, SecretString,
-    WorkflowProviderConfiguration,
+    MacOsKeychainCredentialStore, ProviderError, ProviderId, ProviderRegistry, ProviderSelection,
+    SecretString, WorkflowProviderConfiguration, CLAUDE_PROVIDER_ID, CODEX_PROVIDER_ID,
+    OMP_PROVIDER_ID,
 };
 use sentinel_supervisor::{SentinelSupervisor, SupervisorPrograms};
 use sentinel_validation::load_repository_profiles;
@@ -42,11 +43,20 @@ enum Request {
         task_id: String,
     },
     Subscribe,
+    DiscoverModels {
+        request_id: String,
+        provider_id: ProviderId,
+    },
+    SaveQuickPromptPreferences {
+        request_id: String,
+        preferences: QuickPromptPreferences,
+    },
     StartTask {
         request_id: String,
-        provider: String,
         summary: String,
         prompt: String,
+        implementer: ProviderSelection,
+        reviewer: ProviderSelection,
         #[serde(default)]
         workflow_mode: WorkflowMode,
     },
@@ -117,6 +127,21 @@ struct ProviderDto {
     id: String,
     label: String,
     available: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QuickPromptPreferences {
+    implementer: ProviderSelection,
+    reviewer: ProviderSelection,
+    workflow_mode: WorkflowMode,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickPromptDefaultsDto {
+    implementer_provider_id: String,
+    reviewer_provider_id: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -215,12 +240,14 @@ struct SettingsDto {
     provider_settings: ProviderSettingsSnapshot,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct NativeConfig {
     #[serde(default)]
     version: u64,
     repository_root: Option<PathBuf>,
+    #[serde(default)]
+    quick_prompt_preferences: Option<QuickPromptPreferences>,
 }
 
 fn config_path(database_path: &Path) -> PathBuf {
@@ -253,6 +280,75 @@ fn save_config(path: &Path, config: &NativeConfig) -> Result<(), ()> {
     file.sync_all().map_err(|_| ())?;
     drop(file);
     std::fs::rename(temporary, path).map_err(|_| ())
+}
+
+fn valid_quick_prompt_preferences(preferences: &QuickPromptPreferences) -> bool {
+    let supported_provider = |id: &ProviderId| {
+        matches!(
+            id.as_str(),
+            CODEX_PROVIDER_ID | CLAUDE_PROVIDER_ID | OMP_PROVIDER_ID
+        )
+    };
+    let valid_value = |value: &str| {
+        !value.trim().is_empty()
+            && value.len() <= 128
+            && !value.contains('\0')
+            && !value.chars().any(char::is_control)
+    };
+    supported_provider(&preferences.implementer.provider_id)
+        && supported_provider(&preferences.reviewer.provider_id)
+        && valid_value(&preferences.implementer.model_id)
+        && valid_value(&preferences.reviewer.model_id)
+        && preferences
+            .implementer
+            .reasoning_effort
+            .as_deref()
+            .is_none()
+        && preferences
+            .reviewer
+            .reasoning_effort
+            .as_deref()
+            .is_none_or(valid_value)
+}
+
+fn discovery_error(error: &ProviderError) -> (&'static str, &'static str) {
+    match error {
+        ProviderError::Credential(_) | ProviderError::Authentication => {
+            ("authentication_required", "Authentication required")
+        }
+        ProviderError::UnsupportedCapability(_) => (
+            "enumeration_unsupported",
+            "Model enumeration is unsupported",
+        ),
+        ProviderError::MalformedResponse => {
+            ("invalid_response", "Provider returned invalid model data")
+        }
+        _ => ("provider_unavailable", "Provider unavailable"),
+    }
+}
+
+fn discovery_response(
+    request_id: String,
+    provider_id: ProviderId,
+    result: Result<sentinel_provider_api::ProviderModelCatalog, ProviderError>,
+) -> Value {
+    match result {
+        Ok(catalog) => json!({
+            "kind":"discover_models_result",
+            "requestId":request_id,
+            "providerId":provider_id,
+            "catalog":catalog
+        }),
+        Err(error) => {
+            let (code, message) = discovery_error(&error);
+            json!({
+                "kind":"discover_models_result",
+                "requestId":request_id,
+                "providerId":provider_id,
+                "error":{"code":code,"message":message}
+            })
+        }
+    }
 }
 
 /// A native-shell-only account usage reader. Its provider protocol events live
@@ -373,8 +469,14 @@ fn attention_display_state(task: &sentinel_core::v3::Task) -> &'static str {
     }
     match task.lifecycle {
         TaskLifecycle::AwaitingApproval => "waiting_for_approval",
-        TaskLifecycle::ReadyForHuman | TaskLifecycle::Reviewing => "ready_for_review",
-        TaskLifecycle::Failed | TaskLifecycle::Blocked => "failed",
+        TaskLifecycle::Implementing => "implementing",
+        TaskLifecycle::Validating => "validating",
+        TaskLifecycle::Reviewing => "reviewing",
+        TaskLifecycle::Integrating => "integrating",
+        TaskLifecycle::Integrated => "integrated",
+        TaskLifecycle::ReadyForHuman => "ready_for_review",
+        TaskLifecycle::Blocked => "blocked",
+        TaskLifecycle::Failed => "failed",
         TaskLifecycle::Cancelled => "cancelled",
         _ => "working",
     }
@@ -677,8 +779,23 @@ async fn task_detail(
         .rev()
         .find(|artifact| artifact.kind == "final_approval_packet")
         .map(|artifact| serde_json::to_string(&artifact.metadata).unwrap_or_default());
+    let pinned_configuration = artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.kind == "provider_role_configuration")
+        .and_then(|artifact| {
+            serde_json::from_value::<WorkflowProviderConfiguration>(artifact.metadata.clone()).ok()
+        })
+        .map(|roles| {
+            json!({
+                "implementer":roles.implementer,
+                "reviewer":roles.reviewer,
+                "workflowMode":task.workflow_mode
+            })
+        });
     Ok(json!({
         "task": task_dto(task),
+        "configuration": pinned_configuration,
         "sessions": sessions.into_iter().map(|session| json!({"provider":provider_identity(session.provider),"sessionRef":session.provider_session_ref,"state":format!("{:?}",session.lifecycle).to_lowercase(),"updatedAtMs":session.updated_at_ms})).collect::<Vec<_>>(),
         "activity": events.into_iter().map(|event| json!({"kind":format!("{:?}", event.kind).to_lowercase(),"provider":provider_identity(event.provider),"occurredAtMs":event.occurred_at_ms,"payload":serde_json::to_string(&event.payload).unwrap_or_default()})).collect::<Vec<_>>(),
         "worktree": worktree.map(|value| json!({"repositoryRoot":value.repository_root,"path":value.worktree_path,"branch":value.branch,"baseCommit":value.base_commit,"state":value.state})),
@@ -761,6 +878,7 @@ fn repository_root(config: &NativeConfig) -> Option<PathBuf> {
 fn build_supervisor(
     runtime: &tokio::runtime::Runtime,
     repository: &RunRepository,
+    query_repository: &RunRepository,
     root: &Path,
     worktree_root: &Path,
     programs: &SupervisorPrograms,
@@ -770,13 +888,7 @@ fn build_supervisor(
     if !inspection.is_primary || !matches!(inspection.state, RepositoryState::Valid) {
         return None;
     }
-    let registry = provider_settings
-        .build_registry(
-            programs.codex.is_some(),
-            programs.claude.is_some(),
-            programs.omp.is_some(),
-        )
-        .ok()?;
+    let registry = provider_registry(provider_settings, programs, query_repository, root).ok()?;
     let workflow = provider_settings.snapshot().workflow;
     let mut supervisor = SentinelSupervisor::with_provider_runtime(
         repository.clone(),
@@ -793,6 +905,35 @@ fn build_supervisor(
     Some(supervisor)
 }
 
+fn provider_registry(
+    settings: &ProviderSettingsStore,
+    programs: &SupervisorPrograms,
+    query_repository: &RunRepository,
+    cwd: &Path,
+) -> Result<ProviderRegistry, ProviderError> {
+    let mut registry = settings
+        .build_registry(
+            programs.codex.is_some(),
+            programs.claude.is_some(),
+            programs.omp.is_some(),
+        )
+        .map_err(|_| ProviderError::InvalidConfiguration("provider settings are invalid".into()))?;
+    if let Some(program) = programs.codex.clone() {
+        registry.register_model_discovery(Arc::new(CodexModelDiscovery::new(
+            program,
+            query_repository.clone(),
+            cwd,
+        )))?;
+    }
+    if let Some(program) = programs.claude.clone() {
+        registry.register_model_discovery(Arc::new(ClaudeModelDiscovery::new(program)))?;
+    }
+    if let Some(program) = programs.omp.clone() {
+        registry.register_model_discovery(Arc::new(OmpModelDiscovery::new(program)))?;
+    }
+    Ok(registry)
+}
+
 fn quick_prompt_providers(
     settings: &ProviderSettingsStore,
     codex_available: bool,
@@ -800,59 +941,38 @@ fn quick_prompt_providers(
     omp_available: bool,
 ) -> Vec<ProviderDto> {
     let snapshot = settings.snapshot();
-    let registry = settings
-        .build_registry(codex_available, claude_available, omp_available)
-        .ok();
-    let configured_available = registry.as_ref().is_some_and(|registry| {
-        registry
-            .validate_selection(&snapshot.workflow.implementer, ProviderRole::Implementer)
-            .is_ok()
-    });
-    let configured_label = snapshot
+    snapshot
         .providers
-        .iter()
-        .find(|provider| provider.id == snapshot.workflow.implementer.provider_id)
-        .map(|provider| format!("Configured · {}", provider.display_name))
-        .unwrap_or_else(|| "Configured provider".into());
-    let mut result = vec![ProviderDto {
-        id: "configured".into(),
-        label: configured_label,
-        available: configured_available,
-    }];
-    result.extend(snapshot.providers.into_iter().filter_map(|provider| {
-        if !provider.capabilities.implementation {
-            return None;
-        }
-        let transport_available = match provider.id.as_str() {
-            "codex" => codex_available,
-            "claude_code" => claude_available,
-            _ => matches!(provider.credential_state, CredentialState::Configured),
-        };
-        Some(ProviderDto {
-            id: provider.id.to_string(),
-            label: provider.display_name,
-            available: provider.enabled && transport_available,
+        .into_iter()
+        .filter_map(|provider| {
+            if !matches!(
+                provider.id.as_str(),
+                CODEX_PROVIDER_ID | CLAUDE_PROVIDER_ID | OMP_PROVIDER_ID
+            ) || (!provider.capabilities.implementation
+                && !provider.capabilities.read_only_review)
+            {
+                return None;
+            }
+            let transport_available = match provider.id.as_str() {
+                CODEX_PROVIDER_ID => codex_available,
+                CLAUDE_PROVIDER_ID => claude_available,
+                OMP_PROVIDER_ID => omp_available,
+                _ => false,
+            };
+            Some(ProviderDto {
+                id: provider.id.to_string(),
+                label: provider.display_name,
+                available: provider.enabled && transport_available,
+            })
         })
-    }));
-    result
+        .collect()
 }
 
-fn parse_provider_directive(prompt: &str, provider_ids: &[String]) -> (Option<String>, String) {
-    let trimmed = prompt.trim_start();
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let command = parts.next().unwrap_or_default();
-    let remainder = parts.next().unwrap_or_default();
-    let Some(raw) = command.strip_prefix('/') else {
-        return (None, prompt.to_owned());
-    };
-    let provider = match raw {
-        "claude" | "claude-code" => "claude_code",
-        value => value,
-    };
-    if provider_ids.iter().any(|candidate| candidate == provider) {
-        (Some(provider.to_owned()), remainder.trim_start().to_owned())
-    } else {
-        (None, prompt.to_owned())
+fn quick_prompt_defaults(settings: &ProviderSettingsStore) -> QuickPromptDefaultsDto {
+    let workflow = settings.snapshot().workflow;
+    QuickPromptDefaultsDto {
+        implementer_provider_id: workflow.implementer.provider_id.to_string(),
+        reviewer_provider_id: workflow.reviewer.provider_id.to_string(),
     }
 }
 
@@ -970,10 +1090,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("task-worktrees");
+    let _usage_directory = tempfile::Builder::new()
+        .prefix("agent-sentinel-provider-query-")
+        .tempdir()?;
+    let usage_database_url = format!(
+        "sqlite://{}",
+        _usage_directory.path().join("queries.sqlite3").display()
+    );
+    let usage_repository = runtime.block_on(RunRepository::open(&usage_database_url))?;
     let mut supervisor = root.as_deref().and_then(|root| {
         build_supervisor(
             &runtime,
             &repository,
+            &usage_repository,
             root,
             &worktree_root,
             &programs,
@@ -984,14 +1113,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map(|supervisor| supervisor.primary_root().to_owned());
     let (sender, receiver) = mpsc::channel();
-    let _usage_directory = tempfile::Builder::new()
-        .prefix("agent-sentinel-usage-")
-        .tempdir()?;
-    let usage_database_url = format!(
-        "sqlite://{}",
-        _usage_directory.path().join("usage.sqlite3").display()
-    );
-    let usage_repository = runtime.block_on(RunRepository::open(&usage_database_url))?;
     let mut usage = CodexUsageCollector::new(
         program.clone(),
         usage_repository.clone(),
@@ -1033,8 +1154,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(BridgeInput::Request(Request::Capabilities)) => response(json!({
                 "kind":"capabilities",
                 "repository":root.as_ref().map(|root| root.display().to_string()),
-                "providers":quick_prompt_providers(&provider_settings, program.is_some(), claude.is_some(), omp.is_some())
+                "providers":quick_prompt_providers(&provider_settings, program.is_some(), claude.is_some(), omp.is_some()),
+                "quickPromptPreferences":config.quick_prompt_preferences,
+                "quickPromptDefaults":quick_prompt_defaults(&provider_settings)
             })),
+            Ok(BridgeInput::Request(Request::DiscoverModels {
+                request_id,
+                provider_id,
+            })) => {
+                let cwd = root
+                    .as_deref()
+                    .or_else(|| database_path.parent())
+                    .unwrap_or_else(|| Path::new("."));
+                let result =
+                    provider_registry(&provider_settings, &programs, &usage_repository, cwd)
+                        .and_then(|registry| {
+                            runtime.block_on(registry.discover_models(&provider_id))
+                        });
+                response(discovery_response(request_id, provider_id, result));
+            }
+            Ok(BridgeInput::Request(Request::SaveQuickPromptPreferences {
+                request_id,
+                preferences,
+            })) => {
+                let fingerprint =
+                    request_fingerprint(&serde_json::to_value(&preferences).unwrap_or(Value::Null));
+                let payload = match reserve_mutation(
+                    &runtime,
+                    &repository,
+                    &request_id,
+                    "save_quick_prompt_preferences",
+                    &fingerprint,
+                ) {
+                    Ok(SupervisorRequestReservation::Completed(encoded)) => {
+                        response(serde_json::from_str(&encoded).unwrap_or_else(|_| {
+                            json!({"kind":"error","message":"stored preference response is invalid"})
+                        }));
+                        continue;
+                    }
+                    Ok(SupervisorRequestReservation::Pending) => {
+                        json!({"kind":"quick_prompt_preferences_result","requestId":request_id,"accepted":false,"message":"preference update is already pending"})
+                    }
+                    Ok(SupervisorRequestReservation::New) => {
+                        if valid_quick_prompt_preferences(&preferences) {
+                            let mut candidate = config.clone();
+                            candidate.version = candidate.version.saturating_add(1);
+                            candidate.quick_prompt_preferences = Some(preferences);
+                            if save_config(&native_config_path, &candidate).is_ok() {
+                                config = candidate;
+                                json!({"kind":"quick_prompt_preferences_result","requestId":request_id,"accepted":true})
+                            } else {
+                                json!({"kind":"quick_prompt_preferences_result","requestId":request_id,"accepted":false,"message":"preferences could not be persisted"})
+                            }
+                        } else {
+                            json!({"kind":"quick_prompt_preferences_result","requestId":request_id,"accepted":false,"message":"preferences are invalid"})
+                        }
+                    }
+                    Err(()) => {
+                        json!({"kind":"quick_prompt_preferences_result","requestId":request_id,"accepted":false,"message":"preference request conflicts with durable intent"})
+                    }
+                };
+                if complete_mutation(&runtime, &repository, &request_id, &payload) {
+                    response(payload);
+                } else {
+                    response(
+                        json!({"kind":"error","message":"preference response could not be durably confirmed"}),
+                    );
+                }
+            }
             Ok(BridgeInput::Request(Request::ActiveTask)) => match runtime
                 .block_on(active_task(supervisor.as_ref()))
             {
@@ -1093,23 +1280,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(BridgeInput::Request(Request::StartTask {
                 request_id,
-                provider,
                 summary,
                 prompt,
+                implementer,
+                reviewer,
                 workflow_mode,
             })) => {
-                let (directive, prompt) = parse_provider_directive(
-                    &prompt,
-                    &provider_settings
-                        .snapshot()
-                        .providers
-                        .iter()
-                        .map(|item| item.id.to_string())
-                        .collect::<Vec<_>>(),
-                );
-                let provider = directive.unwrap_or(provider);
+                let configuration = WorkflowProviderConfiguration {
+                    implementer: implementer.clone(),
+                    reviewer: reviewer.clone(),
+                    repair: None,
+                };
                 let fingerprint = request_fingerprint(
-                    &json!({"provider":provider,"summary":summary,"prompt":prompt,"workflow_mode":workflow_mode}),
+                    &json!({"implementer":implementer,"reviewer":reviewer,"summary":summary,"prompt":prompt,"workflow_mode":workflow_mode}),
                 );
                 match reserve_mutation(
                     &runtime,
@@ -1143,8 +1326,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("repository is unavailable or invalid")
                     .and_then(|supervisor| {
                         runtime
-                            .block_on(supervisor.start_configured_task_with_mode(
-                                Some(&provider),
+                            .block_on(supervisor.start_task_with_configuration(
+                                configuration,
                                 summary,
                                 prompt,
                                 workflow_mode,
@@ -1165,6 +1348,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 let payload = match result {
                     Ok(task) => {
+                        let preferences = QuickPromptPreferences {
+                            implementer,
+                            reviewer,
+                            workflow_mode,
+                        };
+                        let mut candidate = config.clone();
+                        candidate.version = candidate.version.saturating_add(1);
+                        candidate.quick_prompt_preferences = Some(preferences);
+                        if save_config(&native_config_path, &candidate).is_ok() {
+                            config = candidate;
+                        }
                         json!({"kind":"task_start_result","requestId":request_id,"accepted":true,"task":task})
                     }
                     Err(message) => {
@@ -1365,6 +1559,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     build_supervisor(
                         &runtime,
                         &repository,
+                        &usage_repository,
                         &requested,
                         &worktree_root,
                         &programs,
@@ -1461,21 +1656,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let runtime_update = supervisor
                             .as_mut()
                             .map(|supervisor| {
-                                provider_settings
-                                    .build_registry(
-                                        program.is_some(),
-                                        claude.is_some(),
-                                        omp.is_some(),
-                                    )
-                                    .map_err(|_| "provider registry could not be rebuilt")
-                                    .and_then(|registry| {
-                                        supervisor
-                                            .update_provider_runtime(
-                                                Arc::new(registry),
-                                                provider_settings.snapshot().workflow,
-                                            )
-                                            .map_err(|_| "provider routing could not be applied")
-                                    })
+                                provider_registry(
+                                    &provider_settings,
+                                    &programs,
+                                    &usage_repository,
+                                    supervisor.primary_root(),
+                                )
+                                .map_err(|_| "provider registry could not be rebuilt")
+                                .and_then(|registry| {
+                                    supervisor
+                                        .update_provider_runtime(
+                                            Arc::new(registry),
+                                            provider_settings.snapshot().workflow,
+                                        )
+                                        .map_err(|_| "provider routing could not be applied")
+                                })
                             })
                             .transpose();
                         match runtime_update {
@@ -1571,8 +1766,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_provider_api::{CredentialStore, MemoryCredentialStore};
+    use sentinel_core::v3::{RecoveryCondition, Task, TaskId, TaskLifecycle};
+    use sentinel_provider_api::{
+        CredentialStore, MemoryCredentialStore, ModelDiscoveryKind, ProviderModel,
+        ProviderModelAvailability, ProviderModelCatalog,
+    };
     use std::{fs, sync::Arc};
+
+    fn display_task(lifecycle: TaskLifecycle) -> Task {
+        Task {
+            id: TaskId("display-task".into()),
+            project_id: None,
+            workflow_id: "display-workflow".into(),
+            workflow_mode: WorkflowMode::Manual,
+            summary: "display state".into(),
+            lifecycle,
+            recovery_condition: RecoveryCondition::None,
+            recovery_previous_lifecycle: None,
+            version: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            terminal_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn workflow_attention_states_render_without_inventing_approval() {
+        assert_eq!(
+            attention_display_state(&display_task(TaskLifecycle::ReadyForHuman)),
+            "ready_for_review"
+        );
+        assert_eq!(
+            attention_display_state(&display_task(TaskLifecycle::Integrating)),
+            "integrating"
+        );
+        assert_eq!(
+            attention_display_state(&display_task(TaskLifecycle::Integrated)),
+            "integrated"
+        );
+        assert_eq!(
+            attention_display_state(&display_task(TaskLifecycle::Blocked)),
+            "blocked"
+        );
+    }
 
     #[test]
     fn bridge_requests_are_narrow_and_typed() {
@@ -1590,19 +1826,19 @@ mod tests {
     }
 
     #[test]
-    fn task_start_request_requires_provider_and_intent_fields() {
+    fn task_start_request_requires_pinned_selections_and_intent_fields() {
         assert!(matches!(
             serde_json::from_str::<Request>(
-                r#"{"kind":"start_task","request_id":"request-1","provider":"codex","summary":"Task","prompt":"Do it"}"#
+                r#"{"kind":"start_task","request_id":"request-1","summary":"Task","prompt":"Do it","implementer":{"providerId":"omp","modelId":"provider/model"},"reviewer":{"providerId":"codex","modelId":"review-model","reasoningEffort":"medium"}}"#
             ),
             Ok(Request::StartTask { .. })
         ));
         assert!(
-            serde_json::from_str::<Request>(r#"{"kind":"start_task","provider":"codex"}"#).is_err()
+            serde_json::from_str::<Request>(r#"{"kind":"start_task","summary":"Task"}"#).is_err()
         );
         assert!(matches!(
             serde_json::from_str::<Request>(
-                r#"{"kind":"start_task","request_id":"request-2","provider":"codex","summary":"Task","prompt":"Do it","workflow_mode":"auto_integrate"}"#
+                r#"{"kind":"start_task","request_id":"request-2","summary":"Task","prompt":"Do it","implementer":{"providerId":"omp","modelId":"provider/model"},"reviewer":{"providerId":"codex","modelId":"review-model","reasoningEffort":"medium"},"workflow_mode":"auto_integrate"}"#
             ),
             Ok(Request::StartTask {
                 workflow_mode: WorkflowMode::AutoIntegrate,
@@ -1612,25 +1848,60 @@ mod tests {
     }
 
     #[test]
-    fn provider_slash_directive_selects_configured_worker_and_strips_only_the_directive() {
-        let providers = vec![
-            "codex".to_owned(),
-            "claude_code".to_owned(),
-            "kimi".to_owned(),
-            "glm".to_owned(),
-        ];
-        assert_eq!(
-            parse_provider_directive("/kimi implement this", &providers),
-            (Some("kimi".into()), "implement this".into())
+    fn discovery_and_preferences_requests_are_typed_queries_and_mutations() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"discover_models","request_id":"models-1","provider_id":"omp"}"#
+            ),
+            Ok(Request::DiscoverModels { .. })
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"kind":"save_quick_prompt_preferences","request_id":"prefs-1","preferences":{"implementer":{"providerId":"omp","modelId":"provider/model"},"reviewer":{"providerId":"codex","modelId":"review-model","reasoningEffort":"medium"},"workflowMode":"manual"}}"#
+            ),
+            Ok(Request::SaveQuickPromptPreferences { .. })
+        ));
+    }
+
+    #[test]
+    fn discovery_response_preserves_mocked_omp_data_empty_and_error_states() {
+        let provider_id = ProviderId::new(OMP_PROVIDER_ID).unwrap();
+        let model = ProviderModel {
+            provider_id: provider_id.clone(),
+            model_id: "fixture/runtime-model".into(),
+            display_name: Some("Runtime Model".into()),
+            supported_reasoning_efforts: vec!["low".into(), "future-effort".into()],
+            default_reasoning_effort: Some("future-effort".into()),
+            is_default: false,
+            availability: ProviderModelAvailability::Available,
+        };
+        let catalog = ProviderModelCatalog {
+            provider_id: provider_id.clone(),
+            discovery_kind: ModelDiscoveryKind::Enumerated,
+            models: vec![model],
+        };
+        let expected_catalog = serde_json::to_value(&catalog).unwrap();
+        let payload = discovery_response("models-omp".into(), provider_id.clone(), Ok(catalog));
+        assert_eq!(payload["catalog"], expected_catalog);
+
+        let empty = discovery_response(
+            "models-empty".into(),
+            provider_id.clone(),
+            Ok(ProviderModelCatalog {
+                provider_id: provider_id.clone(),
+                discovery_kind: ModelDiscoveryKind::Enumerated,
+                models: Vec::new(),
+            }),
         );
-        assert_eq!(
-            parse_provider_directive("/claude review this", &providers),
-            (Some("claude_code".into()), "review this".into())
+        assert_eq!(empty["catalog"]["models"], json!([]));
+
+        let failed = discovery_response(
+            "models-failed".into(),
+            provider_id,
+            Err(ProviderError::Unavailable("fixture".into())),
         );
-        assert_eq!(
-            parse_provider_directive("/unknown remains task text", &providers),
-            (None, "/unknown remains task text".into())
-        );
+        assert_eq!(failed["error"]["code"], "provider_unavailable");
+        assert!(failed.get("catalog").is_none());
     }
 
     #[test]
@@ -1660,6 +1931,19 @@ mod tests {
         let config = NativeConfig {
             version: 4,
             repository_root: Some(PathBuf::from("/repo")),
+            quick_prompt_preferences: Some(QuickPromptPreferences {
+                implementer: ProviderSelection {
+                    provider_id: ProviderId::new(OMP_PROVIDER_ID).unwrap(),
+                    model_id: "fixture/runtime".into(),
+                    reasoning_effort: None,
+                },
+                reviewer: ProviderSelection {
+                    provider_id: ProviderId::new(CODEX_PROVIDER_ID).unwrap(),
+                    model_id: "fixture-review".into(),
+                    reasoning_effort: Some("medium".into()),
+                },
+                workflow_mode: WorkflowMode::AutoIntegrate,
+            }),
         };
         save_config(&path, &config).unwrap();
         let persisted = std::fs::read_to_string(&path).unwrap();
@@ -1667,6 +1951,10 @@ mod tests {
         assert!(!persisted.to_ascii_lowercase().contains("token"));
         assert_eq!(load_config(&path).version, 4);
         assert_eq!(load_config(&path).repository_root, config.repository_root);
+        assert_eq!(
+            load_config(&path).quick_prompt_preferences,
+            config.quick_prompt_preferences
+        );
     }
 
     #[test]

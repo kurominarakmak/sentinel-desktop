@@ -208,6 +208,47 @@ fn main() {
                 "account/rateLimits/read" => {
                     json!({"rateLimits":{"primary":{"usedPercent":42,"windowDurationMins":300,"resetsAt":"2026-08-06T12:00:00Z"}}})
                 }
+                "model/list" if scenario == "empty-models" => {
+                    json!({"data":[],"nextCursor":null})
+                }
+                "model/list" if scenario == "unsupported-model-list" => {
+                    println!(
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"unsupported"}})
+                    );
+                    let _ = output.flush();
+                    continue;
+                }
+                "model/list" => json!({
+                    "data":[
+                        {
+                            "id":"fixture-primary",
+                            "model":"fixture-primary",
+                            "displayName":"Fixture Primary",
+                            "description":"fixture",
+                            "hidden":false,
+                            "isDefault":true,
+                            "defaultReasoningEffort":"medium",
+                            "supportedReasoningEfforts":[
+                                {"reasoningEffort":"low","description":"Low"},
+                                {"reasoningEffort":"medium","description":"Medium"}
+                            ]
+                        },
+                        {
+                            "id":"fixture-fast",
+                            "model":"fixture-fast",
+                            "displayName":"Fixture Fast",
+                            "description":"fixture",
+                            "hidden":false,
+                            "isDefault":false,
+                            "defaultReasoningEffort":"low",
+                            "supportedReasoningEfforts":[
+                                {"reasoningEffort":"low","description":"Low"}
+                            ]
+                        }
+                    ],
+                    "nextCursor":null
+                }),
                 "thread/start" | "thread/resume" if scenario == "unsupported-payload" => {
                     json!({"thread":{}})
                 }

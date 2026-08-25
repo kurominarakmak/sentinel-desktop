@@ -348,6 +348,24 @@ impl SentinelSupervisor {
             .await
     }
 
+    /// Starts a task from a complete UI snapshot. Fresh provider discovery is
+    /// the execution preflight, so cached picker data can never authorize a
+    /// missing model or unsupported reviewer effort.
+    pub async fn start_task_with_configuration(
+        &mut self,
+        configuration: WorkflowProviderConfiguration,
+        summary: String,
+        prompt: String,
+        mode: WorkflowMode,
+    ) -> Result<Task, SupervisorError> {
+        self.provider_registry
+            .preflight_workflow_configuration(&configuration)
+            .await
+            .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        self.start_with_roles(configuration, summary, prompt, mode)
+            .await
+    }
+
     /// Starts a new OMP turn/session in the existing owned worktree after an
     /// interrupted run. It never resumes or replaces the prior OMP session.
     pub async fn retry_interrupted_omp(
@@ -449,6 +467,18 @@ impl SentinelSupervisor {
             reviewer: self.provider_workflow.reviewer.clone(),
             repair: self.provider_workflow.repair.clone(),
         };
+        self.start_with_roles(pinned_roles, summary, prompt, mode)
+            .await
+    }
+
+    async fn start_with_roles(
+        &mut self,
+        pinned_roles: WorkflowProviderConfiguration,
+        summary: String,
+        prompt: String,
+        mode: WorkflowMode,
+    ) -> Result<Task, SupervisorError> {
+        let selection = pinned_roles.implementer.clone();
         self.provider_registry
             .validate_workflow_configuration(&pinned_roles)
             .map_err(|_| SupervisorError::ProviderUnavailable)?;
@@ -536,7 +566,13 @@ impl SentinelSupervisor {
                         return Err(SupervisorError::Provider);
                     }
                 };
-                if let Err(error) = started.start_turn(&prompt).await {
+                if let Err(error) = started
+                    .start_turn_with_model(
+                        &prompt,
+                        (selection.model_id != "cli-owned").then_some(selection.model_id.as_str()),
+                    )
+                    .await
+                {
                     fail_task(&self.repository, &prepared).await;
                     return Err(match error {
                         sentinel_codex::CodexError::InvalidInput => SupervisorError::InvalidIntent,
@@ -1170,6 +1206,10 @@ impl SentinelSupervisor {
             return Ok(());
         };
         started
+            .ensure_requested_selection_enforced()
+            .await
+            .map_err(|_| SupervisorError::Provider)?;
+        started
             .complete()
             .await
             .map_err(|_| SupervisorError::Provider)
@@ -1723,12 +1763,13 @@ impl SentinelSupervisor {
                 .omp
                 .clone()
                 .ok_or(SupervisorError::ProviderUnavailable)?;
-            let (mut process, session) = OmpProcess::start(
+            let (mut process, session) = OmpProcess::start_with_reasoning(
                 program,
                 self.repository.clone(),
                 task.id.clone(),
                 &review_root,
                 &reviewer.model_id,
+                reviewer.reasoning_effort.as_deref(),
                 &prompt,
                 true,
             )
@@ -1967,16 +2008,18 @@ impl SentinelSupervisor {
         if selection.provider_id.as_str() == CODEX_PROVIDER_ID {
             if let Some(OwnedProvider::Codex(started)) = self.owned.get_mut(task_id) {
                 started
-                    .start_turn(&prompt)
+                    .start_turn_with_model(
+                        &prompt,
+                        (selection.model_id != "cli-owned").then_some(selection.model_id.as_str()),
+                    )
                     .await
                     .map_err(|_| SupervisorError::Provider)?;
-                return wait_for_provider_completion(
-                    &self.repository,
-                    task_id,
-                    CODEX_PROVIDER,
-                    before,
-                )
-                .await;
+                wait_for_provider_completion(&self.repository, task_id, CODEX_PROVIDER, before)
+                    .await?;
+                return started
+                    .ensure_requested_selection_enforced()
+                    .await
+                    .map_err(|_| SupervisorError::Provider);
             }
             let program = self
                 .programs
@@ -2000,10 +2043,18 @@ impl SentinelSupervisor {
                 .map_err(|_| SupervisorError::Provider)?;
             activate_session_if_needed(&self.repository, &session.session_id).await?;
             server
-                .start_turn(&session, &prompt)
+                .start_turn_with_model(
+                    &session,
+                    &prompt,
+                    (selection.model_id != "cli-owned").then_some(selection.model_id.as_str()),
+                )
                 .await
                 .map_err(|_| SupervisorError::Provider)?;
             wait_for_provider_completion(&self.repository, task_id, CODEX_PROVIDER, before).await?;
+            server
+                .ensure_requested_selection_enforced()
+                .await
+                .map_err(|_| SupervisorError::Provider)?;
             complete_session_if_active(&self.repository, &session.session_id).await?;
             return server
                 .shutdown()
@@ -2942,9 +2993,10 @@ mod tests {
     use super::*;
     use sentinel_core::v3::{CreateApproval, CreateTask};
     use sentinel_provider_api::{
-        CredentialReference, CredentialStore, ModelLimits, ProviderAdapter, ProviderCapabilities,
-        ProviderCompletion, ProviderConfig, ProviderFuture, ProviderRun, ProviderTransport,
-        SecretString, TokenUsage, ToolCall,
+        CredentialReference, CredentialStore, ModelDiscoveryKind, ModelLimits, ProviderAdapter,
+        ProviderCapabilities, ProviderCompletion, ProviderConfig, ProviderFuture, ProviderModel,
+        ProviderModelAvailability, ProviderModelCatalog, ProviderModelDiscovery, ProviderRun,
+        ProviderTransport, SecretString, TokenUsage, ToolCall,
     };
     use std::{collections::VecDeque, fs, process::Command, sync::Mutex};
     use tempfile::TempDir;
@@ -2995,6 +3047,39 @@ mod tests {
     struct ToolCallingAdapter {
         config: ProviderConfig,
         completions: Mutex<VecDeque<ProviderCompletion>>,
+    }
+
+    struct FixtureDiscovery {
+        provider_id: ProviderId,
+        models: Vec<ProviderModel>,
+    }
+
+    impl ProviderModelDiscovery for FixtureDiscovery {
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider_id
+        }
+
+        fn discover_models(&self) -> ProviderFuture<'_, ProviderModelCatalog> {
+            Box::pin(async move {
+                Ok(ProviderModelCatalog {
+                    provider_id: self.provider_id.clone(),
+                    discovery_kind: ModelDiscoveryKind::Enumerated,
+                    models: self.models.clone(),
+                })
+            })
+        }
+    }
+
+    fn fixture_model(provider_id: &ProviderId, model_id: &str, efforts: &[&str]) -> ProviderModel {
+        ProviderModel {
+            provider_id: provider_id.clone(),
+            model_id: model_id.into(),
+            display_name: Some(model_id.into()),
+            supported_reasoning_efforts: efforts.iter().map(|value| (*value).into()).collect(),
+            default_reasoning_effort: efforts.first().map(|value| (*value).into()),
+            is_default: false,
+            availability: ProviderModelAvailability::Available,
+        }
     }
 
     impl ProviderAdapter for ToolCallingAdapter {
@@ -3359,6 +3444,125 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
                 .lifecycle,
             SessionLifecycle::Completed
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_task_start_preflights_then_pins_roles_and_workflow_immutably() {
+        let fixture = fixture().await;
+        let provider_id = ProviderId::new(CODEX_PROVIDER_ID).unwrap();
+        let mut registry = ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            true,
+            false,
+            false,
+        );
+        registry
+            .register_model_discovery(Arc::new(FixtureDiscovery {
+                provider_id: provider_id.clone(),
+                models: vec![
+                    fixture_model(&provider_id, "fixture-implementer", &["low"]),
+                    fixture_model(&provider_id, "fixture-reviewer", &["medium", "high"]),
+                ],
+            }))
+            .unwrap();
+        let pinned = WorkflowProviderConfiguration {
+            implementer: ProviderSelection {
+                provider_id: provider_id.clone(),
+                model_id: "fixture-implementer".into(),
+                reasoning_effort: None,
+            },
+            reviewer: ProviderSelection {
+                provider_id: provider_id.clone(),
+                model_id: "fixture-reviewer".into(),
+                reasoning_effort: Some("medium".into()),
+            },
+            repair: None,
+        };
+        let mut supervisor = SentinelSupervisor::with_provider_runtime(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: Some(CodexProgram::from_executable(&fixture.codex).unwrap()),
+                claude: None,
+                omp: None,
+            },
+            Arc::new(registry),
+            WorkflowProviderConfiguration {
+                implementer: managed_selection(CODEX_PROVIDER_ID),
+                reviewer: managed_selection(CODEX_PROVIDER_ID),
+                repair: None,
+            },
+        )
+        .unwrap();
+        let before = fixture.repository.v3().list_tasks().await.unwrap().len();
+        let missing = WorkflowProviderConfiguration {
+            implementer: ProviderSelection {
+                provider_id: provider_id.clone(),
+                model_id: "disappeared".into(),
+                reasoning_effort: None,
+            },
+            reviewer: pinned.reviewer.clone(),
+            repair: None,
+        };
+        assert_eq!(
+            supervisor
+                .start_task_with_configuration(
+                    missing,
+                    "must not start".into(),
+                    "no worktree".into(),
+                    WorkflowMode::Manual,
+                )
+                .await,
+            Err(SupervisorError::ProviderUnavailable)
+        );
+        assert_eq!(
+            fixture.repository.v3().list_tasks().await.unwrap().len(),
+            before
+        );
+
+        let task = supervisor
+            .start_task_with_configuration(
+                pinned.clone(),
+                "pinned task".into(),
+                "implement it".into(),
+                WorkflowMode::AutoIntegrate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(task.workflow_mode, WorkflowMode::AutoIntegrate);
+        assert_eq!(supervisor.roles_for_task(&task.id).await.unwrap(), pinned);
+
+        let changed_future_preference = WorkflowProviderConfiguration {
+            implementer: ProviderSelection {
+                provider_id: provider_id.clone(),
+                model_id: "fixture-reviewer".into(),
+                reasoning_effort: None,
+            },
+            reviewer: ProviderSelection {
+                provider_id,
+                model_id: "fixture-implementer".into(),
+                reasoning_effort: Some("low".into()),
+            },
+            repair: None,
+        };
+        assert_ne!(changed_future_preference, pinned);
+        assert_eq!(supervisor.roles_for_task(&task.id).await.unwrap(), pinned);
+        let second = supervisor
+            .start_task_with_configuration(
+                changed_future_preference.clone(),
+                "second pinned task".into(),
+                "implement another".into(),
+                WorkflowMode::Manual,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.workflow_mode, WorkflowMode::Manual);
+        assert_eq!(
+            supervisor.roles_for_task(&second.id).await.unwrap(),
+            changed_future_preference
+        );
+        assert_eq!(supervisor.roles_for_task(&task.id).await.unwrap(), pinned);
     }
 
     #[tokio::test(flavor = "current_thread")]

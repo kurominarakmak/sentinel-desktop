@@ -1,11 +1,12 @@
 use sentinel_codex::{
-    detect_installation, CodexAppServer, CodexError, CodexInstallation, CodexProgram,
-    CodexTimeouts, CodexTurn,
+    detect_installation, CodexAppServer, CodexError, CodexInstallation, CodexModelDiscovery,
+    CodexProgram, CodexTimeouts, CodexTurn,
 };
 use sentinel_core::{
     v3::{CreateTask, EventKind},
     RunRepository,
 };
+use sentinel_provider_api::{ProviderError, ProviderModelDiscovery};
 use std::time::Duration;
 use std::{fs, process::Command, sync::Mutex};
 use tempfile::TempDir;
@@ -53,6 +54,61 @@ async fn detects_a_supported_explicit_executable_and_missing_file() {
         CodexInstallation::Missing
     ));
     assert!(CodexProgram::from_executable("/definitely/missing/codex").is_err());
+}
+
+#[tokio::test]
+async fn app_server_model_discovery_preserves_models_and_reasoning_capabilities() {
+    let _lock = fake_server_env_lock();
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
+    let directory = tempfile::tempdir().unwrap();
+    let repository = RunRepository::open(&url(&directory)).await.unwrap();
+    let discovery = CodexModelDiscovery::new(
+        CodexProgram::from_executable(fake()).unwrap(),
+        repository,
+        directory.path(),
+    );
+    let catalog = discovery.discover_models().await.unwrap();
+    assert_eq!(
+        catalog
+            .models
+            .iter()
+            .map(|model| model.model_id.as_str())
+            .collect::<Vec<_>>(),
+        ["fixture-primary", "fixture-fast"]
+    );
+    assert_eq!(
+        catalog.models[0].supported_reasoning_efforts,
+        ["low", "medium"]
+    );
+    assert_eq!(
+        catalog.models[0].default_reasoning_effort.as_deref(),
+        Some("medium")
+    );
+}
+
+#[tokio::test]
+async fn app_server_model_discovery_distinguishes_empty_and_failed_results() {
+    let _lock = fake_server_env_lock();
+    let directory = tempfile::tempdir().unwrap();
+    let repository = RunRepository::open(&url(&directory)).await.unwrap();
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "empty-models");
+    let empty = CodexModelDiscovery::new(
+        CodexProgram::from_executable(fake()).unwrap(),
+        repository.clone(),
+        directory.path(),
+    );
+    assert!(empty.discover_models().await.unwrap().models.is_empty());
+    std::env::set_var("SENTINEL_FAKE_CODEX_SCENARIO", "unsupported-model-list");
+    let failed = CodexModelDiscovery::new(
+        CodexProgram::from_executable(fake()).unwrap(),
+        repository,
+        directory.path(),
+    );
+    assert!(matches!(
+        failed.discover_models().await,
+        Err(ProviderError::Unavailable(_))
+    ));
+    std::env::remove_var("SENTINEL_FAKE_CODEX_SCENARIO");
 }
 
 #[tokio::test]

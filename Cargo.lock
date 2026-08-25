@@ -3413,6 +3413,7 @@ name = "sentinel-claude"
 version = "0.1.0"
 dependencies = [
  "sentinel-core",
+ "sentinel-provider-api",
  "serde_json",
  "sha2",
  "tempfile",
@@ -3425,6 +3426,7 @@ name = "sentinel-codex"
 version = "0.1.0"
 dependencies = [
  "sentinel-core",
+ "sentinel-provider-api",
  "serde",
  "serde_json",
  "sha2",
@@ -3495,6 +3497,7 @@ name = "sentinel-omp"
 version = "0.1.0"
 dependencies = [
  "sentinel-core",
+ "sentinel-provider-api",
  "serde_json",
  "sha2",
  "tempfile",

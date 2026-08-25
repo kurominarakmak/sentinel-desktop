@@ -9,6 +9,10 @@ use sentinel_core::{
     v3::{CreateSession, EventKind, NormalizedEventEnvelope, SessionId, TaskId},
     RunRepository,
 };
+use sentinel_provider_api::{
+    ModelDiscoveryKind, ProviderError, ProviderFuture, ProviderId, ProviderModel,
+    ProviderModelAvailability, ProviderModelCatalog, ProviderModelDiscovery, OMP_PROVIDER_ID,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -39,6 +43,7 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_LINE_BYTES: usize = 512 * 1024;
 /// Frames beyond this boundary are never parsed as completion evidence.
 pub const HARD_MAX_LINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MODEL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OmpInstallation {
@@ -79,6 +84,114 @@ impl OmpProgram {
         }
         Ok(&self.executable)
     }
+}
+
+#[derive(Clone)]
+pub struct OmpModelDiscovery {
+    program: OmpProgram,
+    provider_id: ProviderId,
+}
+
+impl OmpModelDiscovery {
+    pub fn new(program: OmpProgram) -> Self {
+        Self {
+            program,
+            provider_id: ProviderId::new(OMP_PROVIDER_ID).expect("constant provider ID"),
+        }
+    }
+}
+
+impl ProviderModelDiscovery for OmpModelDiscovery {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    fn discover_models(&self) -> ProviderFuture<'_, ProviderModelCatalog> {
+        Box::pin(async move {
+            let output = time::timeout(
+                REQUEST_TIMEOUT,
+                Command::new(
+                    self.program
+                        .verified_executable()
+                        .map_err(|_| ProviderError::Unavailable("OMP is unavailable".into()))?,
+                )
+                .arg("models")
+                .arg("--json")
+                .stdin(Stdio::null())
+                .output(),
+            )
+            .await
+            .map_err(|_| ProviderError::Timeout)?
+            .map_err(|_| ProviderError::Unavailable("OMP model discovery failed".into()))?;
+            if !output.status.success() {
+                return Err(ProviderError::Unavailable(
+                    "OMP model discovery failed".into(),
+                ));
+            }
+            parse_model_catalog(&output.stdout, &self.provider_id)
+        })
+    }
+}
+
+fn parse_model_catalog(
+    bytes: &[u8],
+    provider_id: &ProviderId,
+) -> Result<ProviderModelCatalog, ProviderError> {
+    if bytes.is_empty() || bytes.len() > MAX_MODEL_CATALOG_BYTES {
+        return Err(ProviderError::MalformedResponse);
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| ProviderError::MalformedResponse)?;
+    let models = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or(ProviderError::MalformedResponse)?;
+    let mut discovered = Vec::with_capacity(models.len());
+    for value in models {
+        let selector = value
+            .get("selector")
+            .and_then(Value::as_str)
+            .ok_or(ProviderError::MalformedResponse)?;
+        let display_name = value.get("name").and_then(Value::as_str).map(str::to_owned);
+        let supported_reasoning_efforts = if value
+            .get("reasoning")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            value
+                .get("thinking")
+                .and_then(Value::as_array)
+                .map(|efforts| {
+                    efforts
+                        .iter()
+                        .map(|effort| {
+                            effort
+                                .as_str()
+                                .map(str::to_owned)
+                                .ok_or(ProviderError::MalformedResponse)
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        discovered.push(ProviderModel {
+            provider_id: provider_id.clone(),
+            model_id: selector.into(),
+            display_name,
+            supported_reasoning_efforts,
+            default_reasoning_effort: None,
+            is_default: false,
+            availability: ProviderModelAvailability::Available,
+        });
+    }
+    Ok(ProviderModelCatalog {
+        provider_id: provider_id.clone(),
+        discovery_kind: ModelDiscoveryKind::Enumerated,
+        models: discovered,
+    })
 }
 fn executable_digest(path: &Path) -> Option<[u8; 32]> {
     std::fs::metadata(path).ok()?.is_file().then_some(())?;
@@ -197,8 +310,25 @@ impl OmpProcess {
         prompt: &str,
         read_only: bool,
     ) -> Result<(Self, OmpSession), OmpError> {
+        Self::start_with_reasoning(
+            program, repository, task_id, cwd, model, None, prompt, read_only,
+        )
+        .await
+    }
+
+    pub async fn start_with_reasoning(
+        program: OmpProgram,
+        repository: RunRepository,
+        task_id: TaskId,
+        cwd: &Path,
+        model: &str,
+        reasoning_effort: Option<&str>,
+        prompt: &str,
+        read_only: bool,
+    ) -> Result<(Self, OmpSession), OmpError> {
         if !cwd.is_dir()
             || !valid(model)
+            || reasoning_effort.is_some_and(|effort| !valid(effort))
             || prompt.trim().is_empty()
             || prompt.len() > 8_000
             || prompt.contains('\0')
@@ -219,9 +349,13 @@ impl OmpProcess {
             .arg("rpc")
             .arg("--no-session")
             .arg("--no-lsp")
-            .arg("--no-pty")
-            .arg("--model")
-            .arg(model);
+            .arg("--no-pty");
+        if model != "cli-owned" {
+            command.arg("--model").arg(model);
+        }
+        if let Some(effort) = reasoning_effort {
+            command.arg("--thinking").arg(effort);
+        }
         if read_only {
             command.arg("--tools").arg("read,grep,find");
         }
@@ -641,6 +775,60 @@ fn bounded(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use sentinel_core::v3::CreateTask;
+
+    #[test]
+    fn structured_model_catalog_is_preserved_without_a_sentinel_catalog() {
+        let provider_id = ProviderId::new(OMP_PROVIDER_ID).unwrap();
+        let catalog = parse_model_catalog(
+            br#"{"models":[{"provider":"fixture","id":"alpha","selector":"fixture/alpha","name":"Alpha","reasoning":true,"thinking":["low","ultra"]},{"provider":"fixture","id":"plain","selector":"fixture/plain","name":"Plain","reasoning":false,"thinking":[]}]}"#,
+            &provider_id,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fixture/alpha", "fixture/plain"]
+        );
+        assert_eq!(
+            catalog.models[0].supported_reasoning_efforts,
+            ["low", "ultra"]
+        );
+        assert!(catalog.models[1].supported_reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn structured_model_catalog_handles_empty_and_rejects_malformed_output() {
+        let provider_id = ProviderId::new(OMP_PROVIDER_ID).unwrap();
+        assert!(parse_model_catalog(br#"{"models":[]}"#, &provider_id)
+            .unwrap()
+            .models
+            .is_empty());
+        assert_eq!(
+            parse_model_catalog(br#"{"models":[{"name":"missing selector"}]}"#, &provider_id),
+            Err(ProviderError::MalformedResponse)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn omp_discovery_adapter_uses_structured_models_command_exactly() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-omp-models");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\n[ \"$1\" = models ] && [ \"$2\" = --json ] || exit 9\necho '{\"models\":[{\"selector\":\"fixture/runtime\",\"name\":\"Runtime\",\"reasoning\":true,\"thinking\":[\"medium\"]}]}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let discovery = OmpModelDiscovery::new(OmpProgram::from_executable(&executable).unwrap());
+        let catalog = discovery.discover_models().await.unwrap();
+        assert_eq!(catalog.models[0].model_id, "fixture/runtime");
+        assert_eq!(catalog.models[0].supported_reasoning_efforts, ["medium"]);
+    }
 
     #[test]
     fn agent_end_is_turn_completion_while_tool_end_remains_tool_completion() {

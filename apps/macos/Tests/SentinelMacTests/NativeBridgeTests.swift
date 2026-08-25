@@ -18,6 +18,96 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(try JSONDecoder().decode(BridgeMessage.self, from: rejected), .taskStartResult(requestID: "request-2", accepted: false, task: nil, message: "repository is unavailable"))
     }
 
+    func testDecodesDynamicModelCatalogAndExactReasoningCapabilities() throws {
+        let data = Data(#"{"kind":"discover_models_result","requestId":"models-1","providerId":"codex","catalog":{"providerId":"codex","discoveryKind":"enumerated","models":[{"providerId":"codex","modelId":"runtime-model","displayName":"Runtime Model","supportedReasoningEfforts":["medium","ultra"],"defaultReasoningEffort":"medium","isDefault":true,"availability":"available"}]}}"#.utf8)
+        guard case .discoverModelsResult(let requestID, let providerID, let catalog, let error) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected model discovery result")
+        }
+        XCTAssertEqual(requestID, "models-1")
+        XCTAssertEqual(providerID, "codex")
+        XCTAssertNil(error)
+        XCTAssertEqual(catalog?.models.first?.modelId, "runtime-model")
+        XCTAssertEqual(catalog?.models.first?.supportedReasoningEfforts, ["medium", "ultra"])
+    }
+
+    func testDiscoveryGateRejectsStaleProviderResponseAndKeepsRolesIndependent() {
+        var gate = ModelDiscoveryGate()
+        gate.begin(role: .implementer, providerID: "omp", requestID: "impl-old")
+        gate.begin(role: .implementer, providerID: "codex", requestID: "impl-new")
+        gate.begin(role: .reviewer, providerID: "omp", requestID: "review")
+        XCTAssertNil(gate.apply(requestID: "impl-old", providerID: "omp"))
+        XCTAssertEqual(gate.apply(requestID: "review", providerID: "omp"), .reviewer)
+        XCTAssertEqual(gate.apply(requestID: "impl-new", providerID: "codex"), .implementer)
+    }
+
+    func testUnavailableSavedModelAndUnsupportedEffortRemainInvalid() {
+        let model = NativeProviderModel(
+            providerId: "codex",
+            modelId: "runtime-model",
+            displayName: nil,
+            supportedReasoningEfforts: ["low", "high"],
+            defaultReasoningEffort: "high",
+            isDefault: true,
+            availability: "available"
+        )
+        let catalog = NativeProviderModelCatalog(
+            providerId: "codex",
+            discoveryKind: "enumerated",
+            models: [model]
+        )
+        XCTAssertNil(QuickPromptSelectionValidation.availableModel(
+            modelID: "saved-but-gone",
+            catalog: catalog
+        ))
+        XCTAssertFalse(QuickPromptSelectionValidation.reviewerEffortIsValid("medium", for: model))
+        XCTAssertTrue(QuickPromptSelectionValidation.reviewerEffortIsValid("high", for: model))
+    }
+
+    func testChangingReviewerModelRecomputesEffortFromItsDynamicCapabilities() {
+        let first = NativeProviderModel(
+            providerId: "codex",
+            modelId: "runtime-one",
+            displayName: nil,
+            supportedReasoningEfforts: ["low", "high"],
+            defaultReasoningEffort: "high",
+            isDefault: true,
+            availability: "available"
+        )
+        let second = NativeProviderModel(
+            providerId: "codex",
+            modelId: "runtime-two",
+            displayName: nil,
+            supportedReasoningEfforts: ["future-effort"],
+            defaultReasoningEffort: nil,
+            isDefault: false,
+            availability: "available"
+        )
+        let unsupported = NativeProviderModel(
+            providerId: "claude_code",
+            modelId: "cli-owned",
+            displayName: nil,
+            supportedReasoningEfforts: [],
+            defaultReasoningEffort: nil,
+            isDefault: true,
+            availability: "available"
+        )
+        XCTAssertEqual(QuickPromptSelectionValidation.preferredReviewerEffort(for: first), "high")
+        XCTAssertEqual(QuickPromptSelectionValidation.preferredReviewerEffort(for: second), "future-effort")
+        XCTAssertNil(QuickPromptSelectionValidation.preferredReviewerEffort(for: unsupported))
+    }
+
+    func testCapabilitiesRestoreIndependentPreferencesAndManualWorkflow() throws {
+        let data = Data(#"{"kind":"capabilities","repository":"/repo","providers":[{"id":"omp","label":"OMP","available":true},{"id":"codex","label":"Codex","available":true}],"quickPromptPreferences":{"implementer":{"providerId":"omp","modelId":"runtime-a"},"reviewer":{"providerId":"codex","modelId":"runtime-b","reasoningEffort":"high"},"workflowMode":"manual"},"quickPromptDefaults":{"implementerProviderId":"codex","reviewerProviderId":"claude_code"}}"#.utf8)
+        guard case .capabilities(_, _, let preferences, let defaults) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected capabilities")
+        }
+        XCTAssertEqual(preferences?.implementer.modelId, "runtime-a")
+        XCTAssertEqual(preferences?.reviewer.modelId, "runtime-b")
+        XCTAssertEqual(preferences?.reviewer.reasoningEffort, "high")
+        XCTAssertEqual(preferences?.workflowMode, .manual)
+        XCTAssertEqual(defaults?.reviewerProviderId, "claude_code")
+    }
+
     func testSubmissionGateRejectsEmptyUnavailableAndDuplicateRequests() {
         var gate = TaskSubmissionGate()
         XCTAssertEqual(gate.begin(prompt: "  ", providerAvailable: true, requestID: "empty"), .rejected("Describe the task before sending."))
@@ -61,7 +151,7 @@ final class NativeBridgeTests: XCTestCase {
     }
 
     func testDecodesHealthyDurableTaskDetailWithApprovalAndEvidence() throws {
-        let data = Data(#"{"kind":"task_detail","detail":{"task":{"id":"task-1","summary":"Ship it","lifecycle":"ready_for_human","recoveryRequired":false,"recoveryReason":null,"version":4,"updatedAtMs":9},"sessions":[{"provider":"Codex","sessionRef":"thread-1","state":"active","updatedAtMs":8}],"activity":[{"kind":"task_prepared","provider":"Codex","occurredAtMs":1,"payload":"{}"},{"kind":"review_reported","provider":"Claude Code","occurredAtMs":2,"payload":"{}"}],"worktree":{"repositoryRoot":"/repo","path":"/worktree","branch":"agent/task","baseCommit":"abc","state":"ready"},"diff":{"targetBranch":"main","targetAdvanced":true,"mergeReady":false,"summary":"{\"filesChanged\":2}","conflicts":"[]"},"validations":[{"id":"check","profile":"test","check":"unit","required":true,"state":"failed","summary":"exit 1","updatedAtMs":3,"command":"[\"cargo\",\"test\"]","exitCode":1,"durationMs":12,"stdout":"safe output","stderr":"redacted output","outcome":"failed"}],"findings":[{"id":"finding","repairRoundId":"round-1","severity":"blocker","disposition":"confirmed_blocking","summary":"Fix me","evidence":"{\"file\":\"src/a.rs\",\"line\":3}"}],"repairRounds":[{"id":"round-1","round":1,"state":"completed","updatedAtMs":4}],"finalApprovalPacket":"{\"unresolved_risks\":[\"risk\"]}","actions":{"stop":false,"approve":true,"reject":true,"approvalID":"approval-1"}}}"#.utf8)
+        let data = Data(#"{"kind":"task_detail","detail":{"task":{"id":"task-1","summary":"Ship it","lifecycle":"ready_for_human","recoveryRequired":false,"recoveryReason":null,"version":4,"updatedAtMs":9},"configuration":{"implementer":{"providerId":"omp","modelId":"historical-implementation"},"reviewer":{"providerId":"codex","modelId":"historical-review","reasoningEffort":"medium"},"workflowMode":"auto_integrate"},"sessions":[{"provider":"Codex","sessionRef":"thread-1","state":"active","updatedAtMs":8}],"activity":[{"kind":"task_prepared","provider":"Codex","occurredAtMs":1,"payload":"{}"},{"kind":"review_reported","provider":"Claude Code","occurredAtMs":2,"payload":"{}"}],"worktree":{"repositoryRoot":"/repo","path":"/worktree","branch":"agent/task","baseCommit":"abc","state":"ready"},"diff":{"targetBranch":"main","targetAdvanced":true,"mergeReady":false,"summary":"{\"filesChanged\":2}","conflicts":"[]"},"validations":[{"id":"check","profile":"test","check":"unit","required":true,"state":"failed","summary":"exit 1","updatedAtMs":3,"command":"[\"cargo\",\"test\"]","exitCode":1,"durationMs":12,"stdout":"safe output","stderr":"redacted output","outcome":"failed"}],"findings":[{"id":"finding","repairRoundId":"round-1","severity":"blocker","disposition":"confirmed_blocking","summary":"Fix me","evidence":"{\"file\":\"src/a.rs\",\"line\":3}"}],"repairRounds":[{"id":"round-1","round":1,"state":"completed","updatedAtMs":4}],"finalApprovalPacket":"{\"unresolved_risks\":[\"risk\"]}","actions":{"stop":false,"approve":true,"reject":true,"approvalID":"approval-1"}}}"#.utf8)
         guard case .taskDetail(let detail) = try JSONDecoder().decode(BridgeMessage.self, from: data) else { return XCTFail("expected task detail") }
         XCTAssertEqual(detail.activity.map(\.occurredAtMs), [1, 2])
         XCTAssertEqual(detail.worktree?.branch, "agent/task")
@@ -69,6 +159,9 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(detail.findings.first?.severity, "blocker")
         XCTAssertEqual(detail.repairRounds.first?.round, 1)
         XCTAssertEqual(detail.actions.approvalID, "approval-1")
+        XCTAssertEqual(detail.configuration?.implementer.modelId, "historical-implementation")
+        XCTAssertEqual(detail.configuration?.reviewer.reasoningEffort, "medium")
+        XCTAssertEqual(detail.configuration?.workflowMode, .autoIntegrate)
     }
 
     func testDetailGateRejectsStaleUpdateAndAcceptsReplacement() {

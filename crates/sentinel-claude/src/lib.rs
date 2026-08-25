@@ -9,6 +9,10 @@ use sentinel_core::{
     v3::{CreateSession, EventKind, NormalizedEventEnvelope, SessionId, TaskId},
     CoreError, RunRepository,
 };
+use sentinel_provider_api::{
+    ModelDiscoveryKind, ProviderError, ProviderFuture, ProviderId, ProviderModel,
+    ProviderModelAvailability, ProviderModelCatalog, ProviderModelDiscovery, CLAUDE_PROVIDER_ID,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -68,6 +72,79 @@ impl ClaudeProgram {
             return Err(ClaudeError::MissingExecutable);
         }
         Ok(&self.executable)
+    }
+}
+
+/// Claude Code does not expose a supported model enumeration endpoint. This
+/// adapter verifies the installed CLI and honestly exposes its CLI-owned
+/// current/default configuration instead of fabricating a Claude catalog.
+#[derive(Clone)]
+pub struct ClaudeModelDiscovery {
+    program: ClaudeProgram,
+    provider_id: ProviderId,
+}
+
+impl ClaudeModelDiscovery {
+    pub fn new(program: ClaudeProgram) -> Self {
+        Self {
+            program,
+            provider_id: ProviderId::new(CLAUDE_PROVIDER_ID).expect("constant provider ID"),
+        }
+    }
+}
+
+impl ProviderModelDiscovery for ClaudeModelDiscovery {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    fn discover_models(&self) -> ProviderFuture<'_, ProviderModelCatalog> {
+        Box::pin(async move {
+            let executable = self
+                .program
+                .verified_executable()
+                .map_err(|_| ProviderError::Unavailable("Claude Code is unavailable".into()))?;
+            let output = time::timeout(
+                START_TIMEOUT,
+                Command::new(executable)
+                    .arg("auth")
+                    .arg("status")
+                    .arg("--json")
+                    .stdin(Stdio::null())
+                    .output(),
+            )
+            .await
+            .map_err(|_| ProviderError::Timeout)?
+            .map_err(|_| ProviderError::Unavailable("Claude Code is unavailable".into()))?;
+            let status = serde_json::from_slice::<Value>(&output.stdout);
+            if status.as_ref().ok().and_then(|value| value.get("loggedIn"))
+                == Some(&Value::Bool(false))
+            {
+                return Err(ProviderError::Authentication);
+            }
+            if !output.status.success() {
+                return Err(ProviderError::Unavailable(
+                    "Claude Code is unavailable".into(),
+                ));
+            }
+            let status = status.map_err(|_| ProviderError::MalformedResponse)?;
+            if status.get("loggedIn").and_then(Value::as_bool) != Some(true) {
+                return Err(ProviderError::MalformedResponse);
+            }
+            Ok(ProviderModelCatalog {
+                provider_id: self.provider_id.clone(),
+                discovery_kind: ModelDiscoveryKind::CurrentConfiguration,
+                models: vec![ProviderModel {
+                    provider_id: self.provider_id.clone(),
+                    model_id: "cli-owned".into(),
+                    display_name: Some("Default / currently configured model".into()),
+                    supported_reasoning_efforts: Vec::new(),
+                    default_reasoning_effort: None,
+                    is_default: true,
+                    availability: ProviderModelAvailability::Available,
+                }],
+            })
+        })
     }
 }
 
@@ -533,4 +610,65 @@ fn bounded(bytes: &[u8]) -> String {
         .chars()
         .take(512)
         .collect()
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unavailable_enumeration_is_represented_as_verified_current_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-claude");
+        std::fs::write(&executable, "#!/bin/sh\necho '{\"loggedIn\":true}'\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let discovery =
+            ClaudeModelDiscovery::new(ClaudeProgram::from_executable(&executable).unwrap());
+        let catalog = discovery.discover_models().await.unwrap();
+        assert_eq!(
+            catalog.discovery_kind,
+            ModelDiscoveryKind::CurrentConfiguration
+        );
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].model_id, "cli-owned");
+        assert!(catalog.models[0].supported_reasoning_efforts.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovery_failure_surfaces_provider_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-claude");
+        std::fs::write(&executable, "#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let discovery =
+            ClaudeModelDiscovery::new(ClaudeProgram::from_executable(&executable).unwrap());
+        assert!(matches!(
+            discovery.discover_models().await,
+            Err(ProviderError::Unavailable(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn structured_logged_out_status_is_authentication_even_with_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake-claude");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\necho '{\"loggedIn\":false,\"authMethod\":\"none\"}'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let discovery =
+            ClaudeModelDiscovery::new(ClaudeProgram::from_executable(&executable).unwrap());
+        assert_eq!(
+            discovery.discover_models().await,
+            Err(ProviderError::Authentication)
+        );
+    }
 }

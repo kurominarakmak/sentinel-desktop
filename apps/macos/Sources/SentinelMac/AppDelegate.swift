@@ -112,7 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func installPanels() {
         _ = surfaceRegistry.requestOpen(.quickPrompt)
-        quickPrompt = SentinelFloatingPanel(title: "Quick Prompt") {
+        quickPrompt = SentinelFloatingPanel(title: "Quick Prompt", height: 470) {
             QuickPromptView(bridge: self.bridge) { [weak self] in
                 self?.quickPrompt?.hide()
             }
