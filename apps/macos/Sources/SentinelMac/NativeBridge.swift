@@ -126,6 +126,18 @@ enum QuickPromptSelectionValidation {
     }
 }
 
+/// Keeps a Quick Prompt effort selection stable across asynchronous catalog
+/// updates. A model default is only a fallback; a supported current choice is
+/// authoritative until the user selects another model that cannot use it.
+enum ReviewerEffortSelection {
+    static func reconciled(current: String, for model: NativeProviderModel) -> String {
+        if model.supportedReasoningEfforts.contains(current) {
+            return current
+        }
+        return QuickPromptSelectionValidation.preferredReviewerEffort(for: model) ?? ""
+    }
+}
+
 struct AttentionActions: Codable, Equatable {
     let stop: Bool
     let approve: Bool

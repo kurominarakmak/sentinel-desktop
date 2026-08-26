@@ -115,6 +115,25 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertNil(QuickPromptSelectionValidation.preferredReviewerEffort(for: unsupported))
     }
 
+    func testReviewerEffortPreservesExplicitSupportedChoiceAcrossLateCapabilityUpdates() {
+        let luna = NativeProviderModel(
+            providerId: "codex", modelId: "gpt-5.6-luna", displayName: nil,
+            supportedReasoningEfforts: ["low", "medium", "high"],
+            defaultReasoningEffort: "medium", isDefault: false, availability: "available"
+        )
+        XCTAssertEqual(ReviewerEffortSelection.reconciled(current: "low", for: luna), "low")
+        XCTAssertEqual(ReviewerEffortSelection.reconciled(current: "medium", for: luna), "medium")
+    }
+
+    func testReviewerEffortUsesDynamicFallbackOnlyWhenCurrentChoiceIsUnsupported() {
+        let model = NativeProviderModel(
+            providerId: "codex", modelId: "runtime-model", displayName: nil,
+            supportedReasoningEfforts: ["low", "high"],
+            defaultReasoningEffort: "high", isDefault: false, availability: "available"
+        )
+        XCTAssertEqual(ReviewerEffortSelection.reconciled(current: "medium", for: model), "high")
+    }
+
     func testCapabilitiesRestoreIndependentPreferencesAndManualWorkflow() throws {
         let data = Data(#"{"kind":"capabilities","repository":"/repo","providers":[{"id":"omp","label":"OMP","available":true},{"id":"codex","label":"Codex","available":true}],"quickPromptPreferences":{"implementer":{"providerId":"omp","modelId":"runtime-a"},"reviewer":{"providerId":"codex","modelId":"runtime-b","reasoningEffort":"high"},"workflowMode":"manual"},"quickPromptDefaults":{"implementerProviderId":"codex","reviewerProviderId":"claude_code"}}"#.utf8)
         guard case .capabilities(_, _, let preferences, let defaults) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {

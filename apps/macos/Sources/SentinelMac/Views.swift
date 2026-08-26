@@ -313,8 +313,10 @@ struct QuickPromptView: View {
         case .reviewer:
             reviewerModel = modelID
             if let model = model(providerID: reviewerProvider, modelID: modelID, role: .reviewer) {
-                reviewerEffort = QuickPromptSelectionValidation.preferredReviewerEffort(for: model)
-                    ?? ""
+                reviewerEffort = ReviewerEffortSelection.reconciled(
+                    current: reviewerEffort,
+                    for: model
+                )
             } else {
                 reviewerEffort = ""
             }
@@ -336,6 +338,15 @@ struct QuickPromptView: View {
             reviewerModel = selected.modelId
             reviewerEffort = QuickPromptSelectionValidation.preferredReviewerEffort(for: selected)
                 ?? ""
+        } else if let selected = model(
+            providerID: reviewerProvider,
+            modelID: reviewerModel,
+            role: .reviewer
+        ) {
+            reviewerEffort = ReviewerEffortSelection.reconciled(
+                current: reviewerEffort,
+                for: selected
+            )
         }
         persistIfValid()
     }
