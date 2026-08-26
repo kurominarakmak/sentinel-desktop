@@ -1161,7 +1161,10 @@ impl V3Repository {
         timestamp: i64,
     ) -> Result<Approval, CoreError> {
         nonempty(&input.action_kind, 128)?;
-        nonempty(&input.summary, 512)?;
+        // Final-action authorization binds the exact owned-worktree identity.
+        // Isolated native profiles can legitimately produce a context longer
+        // than the old UI-summary-sized limit.
+        nonempty(&input.summary, 2_048)?;
         let result = Approval {
             id: ApprovalId::new(),
             task_id: input.task_id,
