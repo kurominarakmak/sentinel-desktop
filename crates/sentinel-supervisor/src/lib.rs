@@ -1432,7 +1432,7 @@ impl SentinelSupervisor {
                     .await?;
             }
         } else {
-            FinalApprovalSupervisor::prepare(
+            let (context, _) = FinalApprovalSupervisor::prepare_manual_context(
                 self.repository.clone(),
                 task.id.clone(),
                 &self.primary_root,
@@ -1449,11 +1449,23 @@ impl SentinelSupervisor {
                 .get_task(&task.id)
                 .await
                 .map_err(|_| SupervisorError::Storage)?;
-            self.repository
+            let ready = self
+                .repository
                 .v3()
                 .transition_task(&current, TaskLifecycle::ReadyForHuman, now_ms())
                 .await
                 .map_err(|_| SupervisorError::Storage)?;
+            if ActionAuthorizationGuard::issue(self.repository.clone(), context, now_ms())
+                .await
+                .is_err()
+            {
+                self.repository
+                    .v3()
+                    .transition_task(&ready, TaskLifecycle::Blocked, now_ms())
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                return Err(SupervisorError::NotAvailable);
+            }
         }
         Ok(())
     }

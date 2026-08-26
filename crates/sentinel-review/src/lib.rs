@@ -699,7 +699,38 @@ impl FinalApprovalSupervisor {
         implementer: &dyn RepairImplementer,
         max_rounds: u32,
     ) -> Result<FinalApproval, FinalApprovalError> {
-        let (context, repair_rounds) = Self::prepare_evidence(
+        let (context, repair_rounds) = Self::prepare_manual_context(
+            repository.clone(),
+            task_id,
+            main,
+            profile,
+            reviewer,
+            implementer,
+            max_rounds,
+        )
+        .await?;
+        let approval = ActionAuthorizationGuard::issue(repository, context, now())
+            .await
+            .map_err(|_| FinalApprovalError::Storage)?;
+        Ok(FinalApproval {
+            approval,
+            repair_rounds,
+        })
+    }
+
+    /// Builds the exact evidence that a Manual approval will bind. The caller
+    /// must transition the task to `ReadyForHuman` before issuing the durable
+    /// capability so approval eligibility and lifecycle agree.
+    pub async fn prepare_manual_context(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        profile: ValidationProfile,
+        reviewer: &dyn Reviewer,
+        implementer: &dyn RepairImplementer,
+        max_rounds: u32,
+    ) -> Result<(ActionApprovalContext, usize), FinalApprovalError> {
+        Self::prepare_evidence(
             repository.clone(),
             task_id,
             main,
@@ -710,14 +741,7 @@ impl FinalApprovalSupervisor {
             "final_approval_packet",
             "final_git_action",
         )
-        .await?;
-        let approval = ActionAuthorizationGuard::issue(repository, context, now())
-            .await
-            .map_err(|_| FinalApprovalError::Storage)?;
-        Ok(FinalApproval {
-            approval,
-            repair_rounds,
-        })
+        .await
     }
 
     /// Runs the same final deterministic verification used by Manual mode,
