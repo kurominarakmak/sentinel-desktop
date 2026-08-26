@@ -3008,7 +3008,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sentinel_core::v3::{CreateApproval, CreateTask};
+    use sentinel_core::v3::{CreateApproval, CreateSession, CreateTask};
     use sentinel_provider_api::{
         CredentialReference, CredentialStore, ModelDiscoveryKind, ModelLimits, ProviderAdapter,
         ProviderCapabilities, ProviderCompletion, ProviderConfig, ProviderFuture, ProviderModel,
@@ -3216,6 +3216,136 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
         )).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         OmpProgram::from_executable(&executable).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn fake_omp_completing(root: &Path) -> OmpProgram {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = root.join("fake-omp-completing");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo omp-test; exit 0; fi\necho '{\"type\":\"ready\"}'\nwhile IFS= read -r line; do\n id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p')\n echo \"{\\\"id\\\":\\\"$id\\\",\\\"type\\\":\\\"response\\\",\\\"command\\\":\\\"prompt\\\",\\\"success\\\":true}\"\n echo '{\"type\":\"agent_end\",\"isTerminal\":true,\"messages\":[]}'\ndone\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        OmpProgram::from_executable(&executable).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn omp_repair_starts_a_fresh_pinned_session_in_the_existing_worktree() {
+        let fixture = fixture().await;
+        let selection = ProviderSelection {
+            provider_id: ProviderId::new(OMP_PROVIDER_ID).unwrap(),
+            model_id: "zai/glm-4.5-flash".into(),
+            reasoning_effort: None,
+        };
+        let task = fixture
+            .repository
+            .v3()
+            .create_task(
+                CreateTask {
+                    project_id: None,
+                    workflow_id: "omp".into(),
+                    summary: "repair".into(),
+                },
+                1,
+            )
+            .await
+            .unwrap();
+        let worktree = WorktreeTransaction::create(
+            fixture.repository.clone(),
+            task.id.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+        )
+        .await
+        .unwrap();
+        let original = fixture
+            .repository
+            .v3()
+            .create_session(
+                CreateSession {
+                    task_id: task.id.clone(),
+                    provider: OMP_PROVIDER.into(),
+                    provider_session_ref: "initial-omp-session".into(),
+                },
+                2,
+            )
+            .await
+            .unwrap();
+        let mut supervisor = SentinelSupervisor::with_provider_runtime(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: None,
+                claude: None,
+                omp: Some(fake_omp_completing(fixture._temp.path())),
+            },
+            Arc::new(ProviderRegistry::with_managed_cli_providers(
+                Arc::new(MemoryCredentialStore::default()),
+                false,
+                false,
+                true,
+            )),
+            WorkflowProviderConfiguration {
+                implementer: selection.clone(),
+                reviewer: selection.clone(),
+                repair: None,
+            },
+        )
+        .unwrap();
+        let packet = RepairPacket {
+            repair_round_id: "round-1".into(),
+            task_id: task.id.to_string(),
+            findings: vec![RepairFinding {
+                id: "finding-1".into(),
+                summary: "repair".into(),
+                file: "tracked.txt".into(),
+                line: 1,
+                evidence: "evidence".into(),
+            }],
+            validations: vec![],
+            implementer_session_id: Some(original.id.to_string()),
+        };
+
+        supervisor.send_repair(&task.id, &packet).await.unwrap();
+
+        let sessions = fixture
+            .repository
+            .v3()
+            .list_sessions_for_task(&task.id)
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_ne!(sessions[1].id, original.id);
+        assert!(sessions[1].provider_session_ref.starts_with("omp-rpc:"));
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task_worktree(&task.id)
+                .await
+                .unwrap(),
+            worktree
+        );
+        assert!(fixture
+            .repository
+            .v3()
+            .list_events(&task.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(provider_turn_completed));
+        assert_eq!(
+            supervisor
+                .roles_for_task(&task.id)
+                .await
+                .unwrap()
+                .repair_selection(),
+            &selection
+        );
     }
 
     #[cfg(unix)]
