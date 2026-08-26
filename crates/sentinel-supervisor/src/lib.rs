@@ -2122,20 +2122,37 @@ impl SentinelSupervisor {
             return Ok(());
         }
         if selection.provider_id.as_str() == OMP_PROVIDER_ID {
-            if let Some(OwnedProvider::Omp { process, .. }) = self.owned.get_mut(task_id) {
-                process
-                    .send_prompt(&prompt)
-                    .await
-                    .map_err(|_| SupervisorError::Provider)?;
-                return wait_for_provider_completion(
-                    &self.repository,
-                    task_id,
-                    OMP_PROVIDER,
-                    before,
-                )
+            // An OMP agent_end is run-terminal. Repairs therefore need a
+            // fresh harness process and durable session, while retaining the
+            // task's owned worktree and pinned repair selection.
+            self.owned.remove(task_id);
+            let program = self
+                .programs
+                .omp
+                .clone()
+                .ok_or(SupervisorError::ProviderUnavailable)?;
+            let worktree = self
+                .repository
+                .v3()
+                .get_task_worktree(task_id)
+                .await
+                .map_err(|_| SupervisorError::Storage)?;
+            let (process, session) = OmpProcess::start(
+                program,
+                self.repository.clone(),
+                task_id.clone(),
+                Path::new(&worktree.worktree_path),
+                &selection.model_id,
+                &prompt,
+                false,
+            )
+            .await
+            .map_err(|_| SupervisorError::Provider)?;
+            activate_session_if_needed(&self.repository, &session.session_id).await?;
+            self.owned
+                .insert(task_id.clone(), OwnedProvider::Omp { process, session });
+            return wait_for_provider_completion(&self.repository, task_id, OMP_PROVIDER, before)
                 .await;
-            }
-            return Err(SupervisorError::ProviderUnavailable);
         }
 
         let worktree = self
