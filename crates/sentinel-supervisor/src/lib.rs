@@ -1675,13 +1675,35 @@ impl SentinelSupervisor {
             .validate_selection(&reviewer, ProviderRole::Reviewer)
             .map_err(|_| SupervisorError::ProviderUnavailable)?;
         let review_root = self.worktree_root.join(format!("review-{}", task.id));
-        std::fs::create_dir_all(&review_root).map_err(|_| SupervisorError::Ownership)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&review_root, std::fs::Permissions::from_mode(0o700))
-                .map_err(|_| SupervisorError::Ownership)?;
+        // A review root is a disposable projection of the durable generation,
+        // never a task worktree. Rebuild it for every review/re-review.
+        if review_root.exists() {
+            let parent = review_root
+                .parent()
+                .and_then(|value| value.canonicalize().ok())
+                .ok_or(SupervisorError::Ownership)?;
+            if parent != self.worktree_root
+                || review_root.file_name().and_then(|value| value.to_str())
+                    != Some(format!("review-{}", task.id).as_str())
+            {
+                return Err(SupervisorError::Ownership);
+            }
+            std::fs::remove_dir_all(&review_root).map_err(|_| SupervisorError::Ownership)?;
         }
+        let expected_evidence = sentinel_worktree::ReviewWorktreeEvidence {
+            base_commit: packet.base_commit.clone(),
+            revision: packet.worktree_revision.clone(),
+            diff_text: packet.diff.clone(),
+        };
+        WorktreeTransaction::materialize_review_snapshot(
+            self.repository.clone(),
+            task.id.clone(),
+            &self.primary_root,
+            &review_root,
+            &expected_evidence,
+        )
+        .await
+        .map_err(map_worktree)?;
         let review_root = review_root
             .canonicalize()
             .map_err(|_| SupervisorError::Ownership)?;

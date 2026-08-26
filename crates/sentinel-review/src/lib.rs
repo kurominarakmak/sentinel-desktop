@@ -38,6 +38,8 @@ pub struct ReviewPacket {
     pub task_id: String,
     pub task_summary: String,
     pub base_commit: String,
+    /// The owned worktree HEAD used when validation created this generation.
+    pub worktree_revision: String,
     /// Textual `git diff` against the pinned base. This is review evidence,
     /// not a filesystem capability.
     pub diff: String,
@@ -152,6 +154,7 @@ impl ReviewSupervisor {
             task_id: task_id.to_string(),
             task_summary: task.summary,
             base_commit: worktree.base_commit,
+            worktree_revision: evidence.revision,
             diff: evidence.diff_text,
             changed_files: diff.files,
             validations: facts,

@@ -9,6 +9,7 @@ use sentinel_git::{inspect_repository, resolve_exact_head, RepositoryState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -198,6 +199,71 @@ impl WorktreeTransaction {
             revision,
             diff_text,
         })
+    }
+    /// Materialize a read-only, filesystem-only view of one exact review
+    /// generation.  The view is built from the pinned base, the tracked diff,
+    /// and the captured contents of every untracked file.  It deliberately
+    /// contains no `.git` handle and is never the owned task worktree.
+    pub async fn materialize_review_snapshot(
+        repository: RunRepository,
+        task_id: TaskId,
+        main: &Path,
+        destination: &Path,
+        expected: &ReviewWorktreeEvidence,
+    ) -> Result<(), TransactionError> {
+        if destination.exists() {
+            return Err(TransactionError::Conflict);
+        }
+        let worktree = Self::reopen(repository.clone(), task_id.clone(), main).await?;
+        let source = Path::new(&worktree.worktree_path);
+        let before = Self::review_evidence(repository.clone(), task_id.clone(), main).await?;
+        if &before != expected {
+            return Err(TransactionError::Conflict);
+        }
+        let tracked_patch = git_output_bytes(
+            source,
+            &["diff", "--no-ext-diff", "--binary", &worktree.base_commit],
+        )
+        .await?;
+        let untracked = capture_untracked_files(source, &worktree.base_commit).await?;
+
+        fs::create_dir_all(destination).map_err(|_| TransactionError::Git)?;
+        // macOS commonly exposes /var as a symlink to /private/var. Git apply
+        // rejects paths passing through that symlink, so use the resolved root.
+        let destination = destination
+            .canonicalize()
+            .map_err(|_| TransactionError::Git)?;
+        let index = destination.with_extension(format!("snapshot-index-{}", now()));
+        let prefix = format!("{}/", destination.display());
+        git_with_index(source, &index, &["read-tree", &worktree.base_commit]).await?;
+        git_with_index(
+            source,
+            &index,
+            &["checkout-index", "-a", "--prefix", &prefix],
+        )
+        .await?;
+        let _ = fs::remove_file(&index);
+        if !tracked_patch.is_empty() {
+            apply_patch(source, &destination, &tracked_patch).await?;
+        }
+        for file in &untracked {
+            let path = safe_snapshot_path(&destination, &file.path)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|_| TransactionError::Git)?;
+            }
+            fs::write(&path, &file.bytes).map_err(|_| TransactionError::Git)?;
+            set_file_mode(&path, file.mode)?;
+        }
+
+        // Refuse to review a view derived while the owned tree changed.  The
+        // caller must revalidate and create a fresh generation instead.
+        let after = Self::review_evidence(repository, task_id, main).await?;
+        if &after != expected {
+            let _ = fs::remove_dir_all(&destination);
+            return Err(TransactionError::Conflict);
+        }
+        set_tree_read_only(&destination)?;
+        Ok(())
     }
     pub async fn create(
         repository: RunRepository,
@@ -635,6 +701,154 @@ async fn git_output_bytes(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Tr
 }
 async fn git_success(directory: &Path, args: &[&str]) -> Result<(), TransactionError> {
     git_output_bytes(directory, args).await.map(|_| ())
+}
+async fn git_with_index(
+    directory: &Path,
+    index: &Path,
+    args: &[&str],
+) -> Result<(), TransactionError> {
+    let output = Command::new("/usr/bin/git")
+        .current_dir(directory)
+        .env("GIT_INDEX_FILE", index)
+        .args(args)
+        .output()
+        .await
+        .map_err(|_| TransactionError::Git)?;
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or(TransactionError::Git)
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotFile {
+    path: String,
+    bytes: Vec<u8>,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+async fn capture_untracked_files(
+    source: &Path,
+    base_commit: &str,
+) -> Result<Vec<SnapshotFile>, TransactionError> {
+    let files = diff_at_base(source, base_commit).await?.files;
+    let mut captured = Vec::new();
+    for file in files.into_iter().filter(|file| file.untracked) {
+        let path = safe_snapshot_path(source, &file.path)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|_| TransactionError::Git)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(TransactionError::Git);
+        }
+        captured.push(SnapshotFile {
+            path: file.path,
+            bytes: fs::read(path).map_err(|_| TransactionError::Git)?,
+            #[cfg(unix)]
+            mode: {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            },
+        });
+    }
+    Ok(captured)
+}
+
+fn safe_snapshot_path(root: &Path, relative: &str) -> Result<std::path::PathBuf, TransactionError> {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(TransactionError::Git);
+    }
+    Ok(root.join(relative))
+}
+
+async fn apply_patch(
+    _source: &Path,
+    destination: &Path,
+    patch: &[u8],
+) -> Result<(), TransactionError> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new("/usr/bin/git")
+        // This is intentionally outside a Git worktree: the snapshot must
+        // not inherit a `.git` capability from the owned task tree.
+        .current_dir(destination)
+        .args(["apply", "--no-index", "--binary"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|_| TransactionError::Git)?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or(TransactionError::Git)?
+        .write_all(patch)
+        .await
+        .map_err(|_| TransactionError::Git)?;
+    child
+        .wait()
+        .await
+        .map_err(|_| TransactionError::Git)?
+        .success()
+        .then_some(())
+        .ok_or(TransactionError::Git)
+}
+
+#[cfg(unix)]
+fn set_file_mode(path: &Path, mode: u32) -> Result<(), TransactionError> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+        .map_err(|_| TransactionError::Git)
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_: &Path, _: u32) -> Result<(), TransactionError> {
+    Ok(())
+}
+
+fn set_tree_read_only(root: &Path) -> Result<(), TransactionError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fn visit(path: &Path) -> Result<(), TransactionError> {
+            for entry in fs::read_dir(path).map_err(|_| TransactionError::Git)? {
+                let entry = entry.map_err(|_| TransactionError::Git)?;
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).map_err(|_| TransactionError::Git)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(TransactionError::Git);
+                }
+                if metadata.is_dir() {
+                    visit(&path)?;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o555))
+                        .map_err(|_| TransactionError::Git)?;
+                } else if metadata.is_file() {
+                    let executable = metadata.permissions().mode() & 0o111 != 0;
+                    fs::set_permissions(
+                        &path,
+                        fs::Permissions::from_mode(if executable { 0o555 } else { 0o444 }),
+                    )
+                    .map_err(|_| TransactionError::Git)?;
+                } else {
+                    return Err(TransactionError::Git);
+                }
+            }
+            Ok(())
+        }
+        visit(root)?;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o555))
+            .map_err(|_| TransactionError::Git)?;
+    }
+    Ok(())
 }
 async fn git_succeeds(directory: &Path, args: &[&str]) -> bool {
     Command::new("/usr/bin/git")
@@ -1268,6 +1482,116 @@ mod tests {
         assert!(evidence.contains("# untracked file: src/status.js"));
         assert!(evidence.contains("# untracked file: src/status.test.js"));
         assert!(!evidence.contains("# untracked file: src/\n"));
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_materializes_the_exact_generation_in_read_only_tree() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create worktree");
+        let owned = Path::new(&worktree.worktree_path);
+        fs::write(owned.join("README.md"), "tracked modification\n").expect("tracked write");
+        fs::create_dir_all(owned.join("src/nested")).expect("nested directory");
+        fs::write(
+            owned.join("src/format.js"),
+            "export const format = () => 'AAPL';\n",
+        )
+        .expect("untracked source");
+        fs::write(
+            owned.join("src/nested/format.test.js"),
+            "test('format', () => {});\n",
+        )
+        .expect("untracked test");
+        let evidence =
+            WorktreeTransaction::review_evidence(repository.clone(), task_id.clone(), main.path())
+                .await
+                .expect("evidence");
+        assert!(evidence.diff_text.contains(&format!(
+            "# untracked file: src/format.js sha256:{:x}",
+            Sha256::digest("export const format = () => 'AAPL';\n")
+        )));
+        let snapshot_root = root.path().join("review");
+        WorktreeTransaction::materialize_review_snapshot(
+            repository,
+            task_id,
+            main.path(),
+            &snapshot_root,
+            &evidence,
+        )
+        .await
+        .expect("materialize snapshot");
+
+        assert_eq!(
+            fs::read_to_string(snapshot_root.join("README.md")).unwrap(),
+            "tracked modification\n"
+        );
+        assert_eq!(
+            fs::read_to_string(snapshot_root.join("src/format.js")).unwrap(),
+            "export const format = () => 'AAPL';\n"
+        );
+        assert_eq!(
+            fs::read_to_string(snapshot_root.join("src/nested/format.test.js")).unwrap(),
+            "test('format', () => {});\n"
+        );
+        assert!(!snapshot_root.join(".git").exists());
+        assert!(fs::write(snapshot_root.join("src/format.js"), "mutate").is_err());
+        assert_eq!(
+            fs::read_to_string(owned.join("src/format.js")).unwrap(),
+            "export const format = () => 'AAPL';\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_snapshot_rejects_a_stale_generation_and_preserves_deletions() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create worktree");
+        let owned = Path::new(&worktree.worktree_path);
+        fs::remove_file(owned.join("README.md")).expect("delete tracked file");
+        let evidence =
+            WorktreeTransaction::review_evidence(repository.clone(), task_id.clone(), main.path())
+                .await
+                .expect("evidence");
+        let snapshot_root = root.path().join("review-deletion");
+        WorktreeTransaction::materialize_review_snapshot(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            &snapshot_root,
+            &evidence,
+        )
+        .await
+        .expect("materialize deletion");
+        assert!(!snapshot_root.join("README.md").exists());
+
+        fs::write(owned.join("later.js"), "changed after validation\n").expect("stale mutation");
+        let stale_root = root.path().join("review-stale");
+        assert!(matches!(
+            WorktreeTransaction::materialize_review_snapshot(
+                repository,
+                task_id,
+                main.path(),
+                &stale_root,
+                &evidence,
+            )
+            .await,
+            Err(TransactionError::Conflict)
+        ));
+        assert!(!stale_root.exists());
     }
 
     #[tokio::test]
