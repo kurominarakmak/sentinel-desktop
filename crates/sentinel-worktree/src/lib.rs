@@ -539,12 +539,34 @@ async fn diff_at_base(
         }
         let status = std::str::from_utf8(&record[..2]).map_err(|_| TransactionError::Git)?;
         let path = std::str::from_utf8(&record[3..]).map_err(|_| TransactionError::Git)?;
-        let untracked = status == "??";
+        // `status --porcelain` collapses an untracked directory to one
+        // `?? directory/` record. Do not preserve that synthetic directory as
+        // review evidence: `diff_text` must hash individual files.
+        if status == "??" {
+            continue;
+        }
         files.push(ChangedFileState {
             path: path.into(),
-            index_status: (!untracked && &status[0..1] != " ").then(|| status[0..1].into()),
-            worktree_status: (!untracked && &status[1..2] != " ").then(|| status[1..2].into()),
-            untracked,
+            index_status: (&status[0..1] != " ").then(|| status[0..1].into()),
+            worktree_status: (&status[1..2] != " ").then(|| status[1..2].into()),
+            untracked: false,
+        });
+    }
+    let untracked = git_output_bytes(
+        worktree,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+    for path in untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let path = std::str::from_utf8(path).map_err(|_| TransactionError::Git)?;
+        files.push(ChangedFileState {
+            path: path.into(),
+            index_status: None,
+            worktree_status: None,
+            untracked: true,
         });
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
@@ -1220,6 +1242,32 @@ mod tests {
             .files
             .iter()
             .any(|file| file.untracked && file.path == "untracked.txt"));
+    }
+
+    #[tokio::test]
+    async fn review_evidence_hashes_files_inside_an_untracked_directory() {
+        let (main, _database, repository, task_id, _base) = fixture().await;
+        let root = tempfile::tempdir().expect("worktree root");
+        let worktree = WorktreeTransaction::create(
+            repository.clone(),
+            task_id.clone(),
+            main.path(),
+            root.path(),
+        )
+        .await
+        .expect("create");
+        let source = Path::new(&worktree.worktree_path).join("src");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::write(source.join("status.js"), "export const status = true;\n").expect("source file");
+        fs::write(source.join("status.test.js"), "test('status', () => {});\n").expect("test file");
+
+        let evidence = WorktreeTransaction::diff_text(repository, task_id, main.path())
+            .await
+            .expect("review evidence");
+
+        assert!(evidence.contains("# untracked file: src/status.js"));
+        assert!(evidence.contains("# untracked file: src/status.test.js"));
+        assert!(!evidence.contains("# untracked file: src/\n"));
     }
 
     #[tokio::test]
