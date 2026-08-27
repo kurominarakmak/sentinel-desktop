@@ -42,10 +42,30 @@ use sentinel_worktree::{TransactionError, WorktreeTransaction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    env, fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// TEST-only synchronization point for proving integration rejects a moved
+/// target. The marker path is supplied solely by an E2E launch environment;
+/// normal launches never enter this branch. It pauses before *any* integration
+/// preflight and grants no Git or provider capability.
+async fn pause_before_auto_integration_for_e2e() {
+    let Some(marker) = env::var_os("SENTINEL_E2E_PAUSE_BEFORE_AUTO_INTEGRATION") else {
+        return;
+    };
+    let marker = PathBuf::from(marker);
+    let resume = marker.with_extension("resume");
+    if fs::write(&marker, b"reached\n").is_err() {
+        return;
+    }
+    while !resume.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let _ = fs::remove_file(resume);
+}
 use thiserror::Error;
 use tokio::time;
 
@@ -1512,6 +1532,7 @@ impl SentinelSupervisor {
         expected_branch: &str,
         expected_target_head: &str,
     ) -> Result<(), SupervisorError> {
+        pause_before_auto_integration_for_e2e().await;
         let inspection = inspect_repository(&self.primary_root)
             .await
             .map_err(|_| SupervisorError::Ownership)?;
