@@ -518,6 +518,8 @@ final class NativeBridge: ObservableObject {
     private var connectionState = BridgeConnectionState()
     private var reconnectScheduled = false
     private var stopped = false
+    private var hostShutdownCompletion: (() -> Void)?
+    private var hostShutdownTimeout: DispatchWorkItem?
     private var outputBuffer = BridgeLineBuffer()
     private var e2eBufferedTraceThreshold = 64 * 1024
     private var submissionGate = TaskSubmissionGate()
@@ -598,6 +600,32 @@ final class NativeBridge: ObservableObject {
         }
         process = nil
         bridgeConnected = false
+    }
+
+    /// Closes the bridge input first so its normal EOF handler persists owned
+    /// tasks as recovering. A bounded fallback prevents app termination from
+    /// waiting indefinitely for an unhealthy sidecar.
+    func prepareForHostShutdown(completion: @escaping () -> Void) {
+        guard hostShutdownCompletion == nil else { return }
+        stopped = true
+        reconnectScheduled = false
+        preferencesSaveWorkItem?.cancel()
+        preferencesSaveWorkItem = nil
+        hostShutdownCompletion = completion
+        input?.closeFile()
+        input = nil
+
+        guard let process, process.isRunning else {
+            DispatchQueue.main.async { [weak self] in self?.completeHostShutdown() }
+            return
+        }
+        let timeout = DispatchWorkItem { [weak self, weak process] in
+            guard let self else { return }
+            if process?.isRunning == true { process?.terminate() }
+            self.completeHostShutdown()
+        }
+        hostShutdownTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: timeout)
     }
 
     func requestAttentionAction(_ action: String, restoreFocusAfterAcceptance: Bool = false) {
@@ -1005,7 +1033,16 @@ final class NativeBridge: ObservableObject {
         attentionActionGate = AttentionActionGate()
         settingsMutationGate = SettingsMutationGate()
         resetUpdateGates()
+        completeHostShutdown()
         scheduleReconnect()
+    }
+
+    private func completeHostShutdown() {
+        hostShutdownTimeout?.cancel()
+        hostShutdownTimeout = nil
+        let completion = hostShutdownCompletion
+        hostShutdownCompletion = nil
+        completion?()
     }
 
     private func scheduleReconnect() {

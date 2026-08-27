@@ -2,6 +2,20 @@ import XCTest
 @testable import SentinelMac
 
 final class NativeBridgeTests: XCTestCase {
+    func testApplicationTerminationGateRequestsAndRepliesExactlyOnce() {
+        var gate = ApplicationTerminationGate()
+
+        XCTAssertTrue(gate.begin())
+        XCTAssertFalse(gate.begin())
+        XCTAssertTrue(gate.finish())
+        XCTAssertFalse(gate.finish())
+    }
+
+    func testApplicationTerminationGateCannotReplyWithoutAQuitRequest() {
+        var gate = ApplicationTerminationGate()
+        XCTAssertFalse(gate.finish())
+    }
+
     private func attention(id: String = "task-1", version: UInt64 = 1, state: String = "working", actions: AttentionActions = AttentionActions(stop: true, approve: false, reject: false, approvalID: nil)) -> NativeAttention {
         NativeAttention(task: NativeTask(id: id, summary: "Ship it", lifecycle: "implementing", recoveryRequired: state == "recovery_required", recoveryReason: state == "recovery_required" ? "provider_missing" : nil, version: version, updatedAtMs: Int64(version)), displayState: state, provider: "Codex", activity: "tool_started", validation: "passed", review: nil, actions: actions)
     }

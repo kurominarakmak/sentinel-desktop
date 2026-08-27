@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let e2eApprovalLaunchConfiguration: E2EApprovalLaunchConfiguration
     private var e2eQuickPromptLaunchCoordinator = E2EQuickPromptLaunchCoordinator()
     private var e2eQuickPromptBridgeSubscription: AnyCancellable?
+    private var terminationGate = ApplicationTerminationGate()
 
     init(e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration = E2EQuickPromptLaunchConfiguration(), e2eApprovalLaunchConfiguration: E2EApprovalLaunchConfiguration = E2EApprovalLaunchConfiguration()) {
         self.e2eQuickPromptLaunchConfiguration = e2eQuickPromptLaunchConfiguration
@@ -111,7 +112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        .terminateNow
+        guard terminationGate.begin() else { return .terminateLater }
+        bridge.prepareForHostShutdown { [weak self] in
+            guard let self, self.terminationGate.finish() else { return }
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -140,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let settingsMenuItem = menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         settingsMenuItem.target = self
         menu.addItem(.separator())
-        let quitItem = menu.addItem(withTitle: "Quit Agent Sentinel", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = menu.addItem(withTitle: "Quit Agent Sentinel", action: #selector(quit(_:)), keyEquivalent: "q")
         quitItem.target = self
         item.menu = menu
         menu.delegate = self
@@ -226,7 +232,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             attention?.orderOut(nil)
         }
     }
-    @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func quit(_ sender: Any?) {
+        // Go through AppKit so applicationShouldTerminate owns the one safe,
+        // bounded shutdown path for menu, Dock, and system quit requests.
+        NSApp.terminate(sender)
+    }
 
     @objc func showStatus() {
         if statusWindow == nil {
