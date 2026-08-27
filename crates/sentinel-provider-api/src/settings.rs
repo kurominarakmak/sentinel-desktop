@@ -130,8 +130,13 @@ fn validate_selection(
         .iter()
         .find(|provider| provider.id == selection.provider_id)
         .ok_or(SettingsError::InvalidSelection)?;
+    let model_override_supported =
+        provider.capabilities.model_selection && matches!(role, ProviderRole::Reviewer);
+    let effort_override_supported =
+        model_override_supported && provider.id.as_str() == CODEX_PROVIDER_ID;
     let allowed = provider.enabled
-        && provider.model_id == selection.model_id
+        && (provider.model_id == selection.model_id || model_override_supported)
+        && (selection.reasoning_effort.is_none() || effort_override_supported)
         && match role {
             ProviderRole::Implementer => provider.capabilities.implementation,
             ProviderRole::Reviewer => provider.capabilities.read_only_review,
@@ -647,6 +652,32 @@ mod tests {
             ProviderSettingsStore::load(&path, Arc::new(MemoryCredentialStore::default())),
             Err(SettingsError::Corrupt)
         ));
+    }
+
+    #[test]
+    fn persists_pinned_codex_reviewer_model_and_effort() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = ProviderSettingsStore::load(
+            temporary.path().join("providers.json"),
+            Arc::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+        let codex = ProviderSelection {
+            provider_id: ProviderId::new(CODEX_PROVIDER_ID).unwrap(),
+            model_id: "gpt-5.6-terra".into(),
+            reasoning_effort: Some("medium".into()),
+        };
+        store
+            .set_enabled(&ProviderId::new(OMP_PROVIDER_ID).unwrap(), true)
+            .unwrap();
+        store
+            .set_workflow(WorkflowProviderConfiguration {
+                implementer: omp_selection(),
+                reviewer: codex.clone(),
+                repair: Some(omp_selection()),
+            })
+            .unwrap();
+        assert_eq!(store.snapshot().workflow.reviewer, codex);
     }
 
     fn omp_selection() -> ProviderSelection {
