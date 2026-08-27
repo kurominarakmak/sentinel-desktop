@@ -350,6 +350,40 @@ async fn sessions_approvals_validation_findings_rounds_and_artifacts_survive_reo
 }
 
 #[tokio::test]
+async fn durable_approval_accepts_the_full_authorization_context_bound() {
+    let (_directory, url, repository) = repository().await;
+    let schema: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'v3_approvals'",
+    )
+    .fetch_one(&SqlitePool::connect(&url).await.expect("inspect database"))
+    .await
+    .expect("approval schema");
+    let migrations: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&SqlitePool::connect(&url).await.expect("inspect migrations"))
+            .await
+            .expect("migrations");
+    assert_eq!(migrations.last(), Some(&19));
+    assert!(schema.contains("BETWEEN 1 AND 2048"));
+    let task = task(&repository).await;
+    let summary = "x".repeat(2_048);
+    let approval = repository
+        .v3()
+        .create_approval(
+            CreateApproval {
+                task_id: task.id.clone(),
+                session_id: None,
+                action_kind: "v3_action:final_git_action".into(),
+                summary: summary.clone(),
+            },
+            TIME,
+        )
+        .await
+        .expect("full durable authorization context");
+    assert_eq!(approval.summary, summary);
+}
+
+#[tokio::test]
 async fn restart_restores_active_tasks_without_assuming_a_live_provider() {
     let (_directory, _url, repository) = repository().await;
     let active_task = task(&repository).await;
