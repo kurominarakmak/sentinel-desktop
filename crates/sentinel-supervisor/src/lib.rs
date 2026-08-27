@@ -57,7 +57,7 @@ async fn pause_before_auto_integration_for_e2e() {
         return;
     };
     let marker = PathBuf::from(marker);
-    let resume = marker.with_extension("resume");
+    let resume = auto_integration_e2e_resume_path(&marker);
     if fs::write(&marker, b"reached\n").is_err() {
         return;
     }
@@ -65,6 +65,10 @@ async fn pause_before_auto_integration_for_e2e() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let _ = fs::remove_file(resume);
+}
+
+fn auto_integration_e2e_resume_path(marker: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.resume", marker.display()))
 }
 use thiserror::Error;
 use tokio::time;
@@ -3072,6 +3076,14 @@ mod tests {
     };
     use std::{collections::VecDeque, fs, process::Command, sync::Mutex};
     use tempfile::TempDir;
+
+    #[test]
+    fn auto_integration_e2e_resume_marker_appends_resume_suffix() {
+        assert_eq!(
+            auto_integration_e2e_resume_path(Path::new("/tmp/sentinel-auto-conflict.pause")),
+            PathBuf::from("/tmp/sentinel-auto-conflict.pause.resume")
+        );
+    }
 
     #[test]
     fn completion_detection_prefers_turn_completed_and_recovers_legacy_evidence() {
