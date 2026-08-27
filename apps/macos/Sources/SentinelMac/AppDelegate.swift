@@ -17,11 +17,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var bridgeSubscriptions = Set<AnyCancellable>()
     private let shortcutController = GlobalShortcutController()
     private let e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration
+    private let e2eApprovalLaunchConfiguration: E2EApprovalLaunchConfiguration
     private var e2eQuickPromptLaunchCoordinator = E2EQuickPromptLaunchCoordinator()
     private var e2eQuickPromptBridgeSubscription: AnyCancellable?
 
-    init(e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration = E2EQuickPromptLaunchConfiguration()) {
+    init(e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration = E2EQuickPromptLaunchConfiguration(), e2eApprovalLaunchConfiguration: E2EApprovalLaunchConfiguration = E2EApprovalLaunchConfiguration()) {
         self.e2eQuickPromptLaunchConfiguration = e2eQuickPromptLaunchConfiguration
+        self.e2eApprovalLaunchConfiguration = e2eApprovalLaunchConfiguration
         super.init()
     }
 
@@ -32,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         observeStatusItem()
         installPanels()
         openQuickPromptForE2ELaunchIfRequested()
+        openApprovalForE2ELaunchIfRequested()
         installGlobalShortcut()
         observeGlobalShortcut()
         NotificationCenter.default.addObserver(
@@ -46,6 +49,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
             object: nil
         )
+    }
+
+    private func openApprovalForE2ELaunchIfRequested() {
+        guard let taskID = e2eApprovalLaunchConfiguration.taskID, !taskID.isEmpty else { return }
+        bridge.traceE2E("e2e-approval.begin", fields: ["task": taskID])
+        // Register before sending: a local bridge can answer synchronously at
+        // startup, and this test-only navigator must not lose that detail.
+        bridge.$taskDetail
+            .handleEvents(receiveSubscription: { [weak bridge] _ in
+                bridge?.traceE2E("e2e-approval.observer.installed", fields: ["task": taskID])
+            }, receiveOutput: { [weak bridge] detail in
+                let matches = detail?.task.id == taskID
+                let ready = detail?.task.isReadyForHuman == true
+                let pending = detail?.actions.approve == true && detail?.actions.approvalID != nil
+                bridge?.traceE2E("e2e-approval.observer.value", fields: [
+                    "task": detail?.task.id ?? "nil",
+                    "matches": String(matches),
+                    "ready": String(ready),
+                    "pending": String(pending),
+                ])
+            }, receiveCancel: { [weak bridge] in
+                bridge?.traceE2E("e2e-approval.observer.cancelled")
+            })
+            .compactMap { $0 }
+            .filter { detail in
+                detail.task.id == taskID
+                    && detail.task.isReadyForHuman
+                    && detail.actions.approve
+                    && detail.actions.approvalID != nil
+            }
+            .prefix(1)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] detail in
+                self?.bridge.traceE2E("e2e-approval.observer.matched", fields: ["task": detail.task.id])
+                self?.showTaskDetail()
+            }
+            .store(in: &bridgeSubscriptions)
+        let requestDetail = { [weak bridge] in
+            bridge?.traceE2E("e2e-approval.requesting", fields: ["task": taskID])
+            bridge?.loadTaskDetail(taskID: taskID)
+        }
+        if bridge.bridgeConnected {
+            bridge.traceE2E("e2e-approval.bridge.ready", fields: ["task": taskID])
+            requestDetail()
+        }
+        else {
+            bridge.traceE2E("e2e-approval.bridge.waiting", fields: ["task": taskID])
+            bridge.$bridgeConnected.filter { $0 }.prefix(1).sink { [weak bridge] _ in
+                bridge?.traceE2E("e2e-approval.bridge.ready", fields: ["task": taskID])
+                requestDetail()
+            }.store(in: &bridgeSubscriptions)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -246,6 +301,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func showTaskDetail() {
+        bridge.traceE2E("task-detail.presentation.requested", fields: ["existing": String(detailWindow != nil)])
         if detailWindow == nil {
             _ = surfaceRegistry.requestOpen(.taskDetail)
             detailWindow = NSWindow(
@@ -256,9 +312,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             detailWindow?.isReleasedWhenClosed = false
             detailWindow?.contentView = NSHostingView(rootView: TaskDetailView(bridge: bridge))
             configureInspectionWindow(detailWindow)
+            bridge.traceE2E("task-detail.presentation.created", fields: ["windows": String(NSApp.windows.count)])
         }
         detailWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        bridge.traceE2E("task-detail.presentation.ordered", fields: [
+            "visible": String(detailWindow?.isVisible == true),
+            "key": String(detailWindow?.isKeyWindow == true),
+            "main": String(detailWindow?.isMainWindow == true),
+            "miniaturized": String(detailWindow?.isMiniaturized == true),
+            "screen": String(detailWindow?.screen != nil),
+            "windows": String(NSApp.windows.count),
+        ])
     }
 
     private func installGlobalShortcut() {

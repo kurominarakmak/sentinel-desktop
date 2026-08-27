@@ -12,6 +12,11 @@ struct NativeTask: Codable, Equatable {
     let recoveryReason: String?
     let version: UInt64
     let updatedAtMs: Int64
+
+    /// The native bridge emits durable Rust lifecycle names in lowercase
+    /// debug-form (`ReadyForHuman` -> `readyforhuman`). Keep that contract at
+    /// the boundary instead of making navigation infer lifecycle from UI state.
+    var isReadyForHuman: Bool { lifecycle == "readyforhuman" }
 }
 
 struct ProviderCapability: Codable, Equatable, Identifiable {
@@ -143,6 +148,13 @@ struct AttentionActions: Codable, Equatable {
     let approve: Bool
     let reject: Bool
     let approvalID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case stop
+        case approve
+        case reject
+        case approvalID = "approvalId"
+    }
 }
 
 struct NativeAttention: Codable, Equatable {
@@ -507,6 +519,7 @@ final class NativeBridge: ObservableObject {
     private var reconnectScheduled = false
     private var stopped = false
     private var outputBuffer = BridgeLineBuffer()
+    private var e2eBufferedTraceThreshold = 64 * 1024
     private var submissionGate = TaskSubmissionGate()
     private var modelDiscoveryGate = ModelDiscoveryGate()
     private var preferencesSaveWorkItem: DispatchWorkItem?
@@ -520,6 +533,7 @@ final class NativeBridge: ObservableObject {
     private var activeTaskUpdateGate = TaskUpdateGate()
     private var codexUsageRetryGate = CodexUsageRetryGate()
     private var restoreFocusAfterAttentionAction = false
+    private let e2eTrace = E2ERuntimeTrace()
 
     func start() {
         guard !stopped, process == nil else { return }
@@ -532,7 +546,7 @@ final class NativeBridge: ObservableObject {
         let process = Process()
         process.executableURL = executable
         var arguments = [bridgeDatabasePath()]
-        if CommandLine.arguments.contains(E2EQuickPromptLaunchConfiguration.argument) {
+        if CommandLine.arguments.contains(E2EQuickPromptLaunchConfiguration.argument) || CommandLine.arguments.contains(E2EApprovalLaunchConfiguration.argument) {
             arguments.append("--e2e-diagnostics")
         }
         process.arguments = arguments
@@ -547,7 +561,9 @@ final class NativeBridge: ObservableObject {
             self.input = input.fileHandleForWriting
             self.output = output.fileHandleForReading
             outputBuffer.reset()
+            e2eBufferedTraceThreshold = 64 * 1024
             bridgeConnected = true
+            e2eTrace.record("bridge.started", ["pid": String(process.processIdentifier), "generation": String(generation)])
             availabilityMessage = nil
             process.terminationHandler = { [weak self] _ in
                 DispatchQueue.main.async { self?.sidecarTerminated(generation: generation) }
@@ -557,7 +573,7 @@ final class NativeBridge: ObservableObject {
                 DispatchQueue.main.async { self?.receivedOutput(data, generation: generation) }
             }
             refreshSnapshots(generation: generation)
-            if CommandLine.arguments.contains(E2EQuickPromptLaunchConfiguration.argument) {
+            if CommandLine.arguments.contains(E2EQuickPromptLaunchConfiguration.argument) || CommandLine.arguments.contains(E2EApprovalLaunchConfiguration.argument) {
                 _ = send(["kind": "runtime_diagnostics"])
             }
         } catch {
@@ -621,8 +637,17 @@ final class NativeBridge: ObservableObject {
     }
 
     func loadTaskDetail(taskID: String? = nil) {
-        guard let taskID = taskID ?? attention?.task.id ?? activeTask?.id else { return }
-        _ = send(["kind": "task_detail", "task_id": taskID])
+        guard let taskID = taskID ?? attention?.task.id ?? activeTask?.id else {
+            e2eTrace.record("task-detail.request.skipped", ["reason": "missing_task_id"])
+            return
+        }
+        e2eTrace.record("task-detail.request", ["task": taskID, "connected": String(bridgeConnected)])
+        let sent = send(["kind": "task_detail", "task_id": taskID])
+        e2eTrace.record("task-detail.request.written", ["task": taskID, "success": String(sent)])
+    }
+
+    func traceE2E(_ event: String, fields: [String: String] = [:]) {
+        e2eTrace.record(event, fields)
     }
 
     func loadStatus() { _ = send(["kind": "status"]) }
@@ -816,8 +841,25 @@ final class NativeBridge: ObservableObject {
         case .activeTask(let task), .taskUpdate(let task): applyActiveTask(task)
         case .attentionState(let attention), .attentionUpdate(let attention): apply(attention)
         case .taskDetail(let detail):
-            guard detailUpdateGate.apply(detail) else { return }
+            e2eTrace.record("task-detail.router", ["task": detail.task.id])
+            let before = taskDetail?.task.id ?? "nil"
+            guard detailUpdateGate.apply(detail) else {
+                e2eTrace.record("task-detail.gate.rejected", ["task": detail.task.id, "before": before])
+                return
+            }
+            e2eTrace.record("task-detail.assign.before", [
+                "before": before,
+                "incoming": detail.task.id,
+                "lifecycle": detail.task.lifecycle,
+                "pending": String(detail.actions.approve && detail.actions.approvalID != nil),
+                "main": String(Thread.isMainThread),
+            ])
             taskDetail = detailUpdateGate.current
+            e2eTrace.record("task-detail.assign.after", [
+                "after": taskDetail?.task.id ?? "nil",
+                "lifecycle": taskDetail?.task.lifecycle ?? "nil",
+                "pending": String((taskDetail?.actions.approve == true) && taskDetail?.actions.approvalID != nil),
+            ])
         case .status(let status), .statusUpdate(let status):
             guard statusUpdateGate.apply(status) else { return }
             self.status = statusUpdateGate.current
@@ -908,10 +950,31 @@ final class NativeBridge: ObservableObject {
 
     private func receivedOutput(_ data: Data, generation: UInt64) {
         guard connectionState.accepts(generation) else { return }
-        for line in outputBuffer.append(data) where !line.isEmpty {
+        let frames = outputBuffer.append(data)
+        let bufferedBytes = outputBuffer.pendingByteCount
+        if !frames.isEmpty || bufferedBytes >= e2eBufferedTraceThreshold {
+            e2eTrace.record("bridge.stdout.buffer", [
+                "chunk": String(data.count),
+                "buffered": String(bufferedBytes),
+                "frames": String(frames.count),
+                "generation": String(generation),
+            ])
+            while e2eBufferedTraceThreshold <= bufferedBytes {
+                e2eBufferedTraceThreshold += 64 * 1024
+            }
+        }
+        for line in frames where !line.isEmpty {
+            let rawKind = (try? JSONSerialization.jsonObject(with: line))
+                .flatMap { $0 as? [String: Any] }
+                .flatMap { $0["kind"] as? String } ?? "unknown"
+            e2eTrace.record("bridge.frame", ["bytes": String(line.count), "kind": rawKind])
             guard let message = try? JSONDecoder().decode(BridgeMessage.self, from: line) else {
+                e2eTrace.record("bridge.decode.failed", ["kind": rawKind, "bytes": String(line.count)])
                 receivedMalformedMessage(generation: generation)
                 continue
+            }
+            if case .taskDetail(let detail) = message {
+                e2eTrace.record("bridge.decode.task-detail", ["task": detail.task.id])
             }
             receive(message, generation: generation)
         }

@@ -1,5 +1,53 @@
 import AppKit
 
+/// Bounded, opt-in diagnostic output for native E2E navigation.  It is never
+/// enabled in ordinary launches and intentionally records identifiers and
+/// state only (never prompts, approval contexts, or provider data).
+final class E2ERuntimeTrace {
+    static let argument = "--e2e-diagnostics"
+    static let pathEnvironmentKey = "SENTINEL_E2E_DIAGNOSTICS_PATH"
+
+    private let enabled: Bool
+    private let path: String?
+    private let lock = NSLock()
+    private var sequence: UInt64 = 0
+    private var writes = 0
+    private let maximumWrites = 300
+
+    init(
+        arguments: [String] = CommandLine.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        enabled = arguments.contains(Self.argument)
+        path = environment[Self.pathEnvironmentKey]
+        if enabled, let path {
+            FileManager.default.createFile(atPath: path, contents: nil)
+        }
+    }
+
+    func record(_ event: String, _ fields: [String: String] = [:]) {
+        guard enabled else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard writes < maximumWrites else { return }
+        writes += 1
+        sequence &+= 1
+        let renderedFields = fields
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+        let line = "sentinel-e2e-trace #\(sequence) \(event)\(renderedFields.isEmpty ? "" : " \(renderedFields)")\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let path, let handle = FileHandle(forWritingAtPath: path) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            FileHandle.standardError.write(data)
+        }
+    }
+}
+
 enum NativeSurface: Hashable {
     case quickPrompt
     case attention
@@ -21,6 +69,24 @@ struct E2EQuickPromptLaunchConfiguration: Equatable {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         opensQuickPrompt = arguments.contains(Self.argument) || environment[Self.environmentKey] == "1"
+    }
+}
+
+/// Test-only opt-in that names a durable task but never changes it. The app
+/// waits for the normal bridge snapshot, then presents the normal attention
+/// panel only when that snapshot advertises the real pending approval action.
+struct E2EApprovalLaunchConfiguration: Equatable {
+    static let argument = "--e2e-open-approval"
+    static let environmentKey = "SENTINEL_E2E_OPEN_APPROVAL_TASK"
+    let taskID: String?
+
+    init(arguments: [String] = CommandLine.arguments,
+         environment: [String: String] = ProcessInfo.processInfo.environment) {
+        if let index = arguments.firstIndex(of: Self.argument), arguments.indices.contains(index + 1) {
+            taskID = arguments[index + 1]
+        } else {
+            taskID = environment[Self.environmentKey]
+        }
     }
 }
 
@@ -90,6 +156,8 @@ struct BridgeConnectionState {
 
 struct BridgeLineBuffer {
     private var pending = Data()
+
+    var pendingByteCount: Int { pending.count }
 
     mutating func append(_ chunk: Data) -> [Data] {
         pending.append(chunk)
