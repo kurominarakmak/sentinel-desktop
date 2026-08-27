@@ -35,6 +35,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installPanels()
         openQuickPromptForE2ELaunchIfRequested()
         openApprovalForE2ELaunchIfRequested()
+        if CommandLine.arguments.contains("--e2e-open-settings") {
+            showSettings()
+        }
         installGlobalShortcut()
         observeGlobalShortcut()
         NotificationCenter.default.addObserver(
