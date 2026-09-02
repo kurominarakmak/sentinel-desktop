@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
     migrate::MigrateError,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
-    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions},
+    Connection, Row, SqlitePool,
 };
 use std::{
     str::FromStr,
@@ -394,6 +394,11 @@ fn approval_profile_name(v: ApprovalProfile) -> &'static str {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PublicRunReference(String);
+impl Default for PublicRunReference {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl PublicRunReference {
     pub fn new() -> Self {
         Self(format!("cr_{}", Uuid::new_v4().simple()))
@@ -997,13 +1002,39 @@ impl RunRepository {
             .foreign_keys(true)
             .busy_timeout(BUSY_TIMEOUT)
             .journal_mode(SqliteJournalMode::Wal);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
+        // Every SQLite `:memory:` connection owns a separate database. Keep
+        // migrations and the test pool on the same single connection there.
+        if url.contains(":memory:") {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .map_err(|_| CoreError::Storage)?;
+            sqlx::migrate!("./migrations")
+                .run(&pool)
+                .await
+                .map_err(|error| match error {
+                    MigrateError::VersionMismatch(_) | MigrateError::VersionMissing(_) => {
+                        CoreError::IncompatibleMigrations
+                    }
+                    _ => CoreError::Storage,
+                })?;
+            let (v3_changes, _) = tokio::sync::broadcast::channel(256);
+            return Ok(Self {
+                pool,
+                v3_changes,
+                v3_change_sequence: Arc::new(AtomicU64::new(0)),
+            });
+        }
+        // SQLite PRAGMAs (notably foreign_keys) are per connection. Run
+        // migrations, including no-transaction table rebuilds, through one
+        // dedicated connection before making the concurrent runtime pool.
+        let migration_options = options.clone().foreign_keys(false);
+        let mut migration_connection = SqliteConnection::connect_with(&migration_options)
             .await
             .map_err(|_| CoreError::Storage)?;
         sqlx::migrate!("./migrations")
-            .run(&pool)
+            .run(&mut migration_connection)
             .await
             .map_err(|error| match error {
                 MigrateError::VersionMismatch(_) | MigrateError::VersionMissing(_) => {
@@ -1011,6 +1042,15 @@ impl RunRepository {
                 }
                 _ => CoreError::Storage,
             })?;
+        migration_connection
+            .close()
+            .await
+            .map_err(|_| CoreError::Storage)?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .map_err(|_| CoreError::Storage)?;
         let (v3_changes, _) = tokio::sync::broadcast::channel(256);
         Ok(Self {
             pool,
@@ -1678,6 +1718,8 @@ impl RunRepository {
         )
         .await
     }
+    // Explicit authority and stale-evidence inputs remain visible at this boundary.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_approval_request_for_context(
         &self,
         project: &ProjectId,
@@ -1783,6 +1825,8 @@ impl RunRepository {
             version: 0,
         })
     }
+    // The audit row deliberately records each approval authority input explicitly.
+    #[allow(clippy::too_many_arguments)]
     async fn insert_approval_audit(
         &self,
         transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -2068,6 +2112,11 @@ impl RunRepository {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn workflow_mode_default_remains_manual() {
+        assert_eq!(v3::WorkflowMode::default(), v3::WorkflowMode::Manual);
+    }
 
     #[tokio::test]
     async fn open_identifies_previously_modified_migrations() {

@@ -41,9 +41,11 @@ use sentinel_validation::{load_repository_profiles, ValidationProfile, Validatio
 use sentinel_worktree::{TransactionError, WorktreeTransaction};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, HashMap},
     env, fs,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -75,6 +77,112 @@ use tokio::time;
 
 const PROVIDER_STAGE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_REPAIR_ROUNDS: usize = 3;
+
+/// Lightweight, non-mutating primary-checkout evidence for Direct Edit. The
+/// porcelain data preserves staged, unstaged, and untracked state without
+/// pretending a whole-file diff belongs to Sentinel.
+fn direct_edit_snapshot(root: &Path) -> Result<serde_json::Value, std::io::Error> {
+    let git = |args: &[&str]| -> Result<String, std::io::Error> {
+        let output = Command::new("git").args(args).current_dir(root).output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(std::io::Error::other("git repository inspection failed"))
+        }
+    };
+    let staged_name_status = git(&["diff", "--cached", "--name-status"])?;
+    let unstaged_name_status = git(&["diff", "--name-status"])?;
+    let untracked = git(&["ls-files", "--others", "--exclude-standard"])?;
+    let paths = snapshot_paths_from_values(&staged_name_status, &unstaged_name_status, &untracked);
+    let fingerprints = paths
+        .iter()
+        .map(|path| {
+            let value = match fs::read(root.join(path)) {
+                Ok(contents) => {
+                    let mut hasher = DefaultHasher::new();
+                    contents.hash(&mut hasher);
+                    format!("{:016x}", hasher.finish())
+                }
+                Err(_) => "missing".to_owned(),
+            };
+            (path.clone(), serde_json::Value::String(value))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Ok(serde_json::json!({
+        "repository_root": root,
+        "head": git(&["rev-parse", "HEAD"])? .trim(),
+        "branch": git(&["branch", "--show-current"])? .trim(),
+        "status_porcelain_v1_z": git(&["status", "--porcelain=v1", "-z"] )?,
+        "staged_name_status": staged_name_status,
+        "unstaged_name_status": unstaged_name_status,
+        "untracked": untracked,
+        "fingerprints": fingerprints,
+    }))
+}
+
+fn snapshot_paths(snapshot: &serde_json::Value) -> std::collections::HashSet<String> {
+    snapshot_paths_from_values(
+        snapshot
+            .get("staged_name_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .get("unstaged_name_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+        snapshot
+            .get("untracked")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default(),
+    )
+}
+
+fn snapshot_paths_from_values(
+    staged_name_status: &str,
+    unstaged_name_status: &str,
+    untracked: &str,
+) -> std::collections::HashSet<String> {
+    [staged_name_status, unstaged_name_status, untracked]
+        .into_iter()
+        .flat_map(str::lines)
+        .filter_map(|line| line.split_whitespace().last().map(str::to_owned))
+        .collect()
+}
+
+fn snapshot_fingerprint<'a>(snapshot: &'a serde_json::Value, path: &str) -> Option<&'a str> {
+    snapshot
+        .get("fingerprints")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|values| values.get(path))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn snapshot_operation(snapshot: &serde_json::Value, path: &str) -> &'static str {
+    let status = ["staged_name_status", "unstaged_name_status"]
+        .into_iter()
+        .filter_map(|key| snapshot.get(key).and_then(serde_json::Value::as_str))
+        .flat_map(str::lines)
+        .find(|line| line.split_whitespace().last() == Some(path))
+        .unwrap_or_default();
+    if status.starts_with('A') {
+        "added"
+    } else if status.starts_with('D') {
+        "deleted"
+    } else {
+        "modified"
+    }
+}
+
+fn direct_edit_prompt(user_prompt: &str) -> String {
+    format!(
+        "You are editing the user's currently selected repository directly. \
+         Make only the requested filesystem changes and preserve pre-existing user changes. \
+         You may inspect status/diff and run repository-local commands and tests. \
+         Do not git push, change remotes, delete branches, rewrite history, commit, merge, \
+         cherry-pick, reset, clean, or broadly restore files unless the user explicitly requests \
+         that exact Git action and Sentinel's normal safety policy permits it.\n\nUser request:\n{user_prompt}"
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +414,11 @@ impl SentinelSupervisor {
             if self.owned.contains_key(&task.id) {
                 return Ok(Some(task));
             }
+            // Direct Edit deliberately has no Sentinel worktree. Its primary
+            // checkout is the supervisor's selected repository instead.
+            if task.workflow_mode == WorkflowMode::DirectEdit {
+                return Ok(Some(task));
+            }
             if self
                 .repository
                 .v3()
@@ -382,10 +495,17 @@ impl SentinelSupervisor {
         prompt: String,
         mode: WorkflowMode,
     ) -> Result<Task, SupervisorError> {
-        self.provider_registry
-            .preflight_workflow_configuration(&configuration)
-            .await
-            .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        if mode == WorkflowMode::DirectEdit {
+            self.provider_registry
+                .preflight_selection(&configuration.implementer, ProviderRole::Implementer)
+                .await
+                .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        } else {
+            self.provider_registry
+                .preflight_workflow_configuration(&configuration)
+                .await
+                .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        }
         self.start_with_roles(configuration, summary, prompt, mode)
             .await
     }
@@ -503,9 +623,15 @@ impl SentinelSupervisor {
         mode: WorkflowMode,
     ) -> Result<Task, SupervisorError> {
         let selection = pinned_roles.implementer.clone();
-        self.provider_registry
-            .validate_workflow_configuration(&pinned_roles)
-            .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        if mode == WorkflowMode::DirectEdit {
+            self.provider_registry
+                .validate_selection(&selection, ProviderRole::Implementer)
+                .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        } else {
+            self.provider_registry
+                .validate_workflow_configuration(&pinned_roles)
+                .map_err(|_| SupervisorError::ProviderUnavailable)?;
+        }
         if summary.trim().is_empty()
             || prompt.trim().is_empty()
             || prompt.len() > 8_000
@@ -545,6 +671,9 @@ impl SentinelSupervisor {
             .transition_task(&task, TaskLifecycle::Preparing, now_ms())
             .await
             .map_err(|_| SupervisorError::Storage)?;
+        if mode == WorkflowMode::DirectEdit {
+            return self.start_direct_edit(prepared, pinned_roles, prompt).await;
+        }
         let worktree = match WorktreeTransaction::create(
             self.repository.clone(),
             prepared.id.clone(),
@@ -749,6 +878,128 @@ impl SentinelSupervisor {
             .get_task(&prepared.id)
             .await
             .map_err(|_| SupervisorError::Storage)
+    }
+
+    /// Starts only a real coding harness in the selected primary checkout.
+    /// There is deliberately no worktree, reviewer, approval, or integration
+    /// setup on this path.
+    async fn start_direct_edit(
+        &mut self,
+        prepared: Task,
+        pinned_roles: WorkflowProviderConfiguration,
+        prompt: String,
+    ) -> Result<Task, SupervisorError> {
+        let selection = pinned_roles.implementer.clone();
+        let cwd = fs::canonicalize(&self.primary_root).map_err(|_| SupervisorError::Ownership)?;
+        // Prove this is still a Git checkout without requiring it to be clean.
+        let baseline = direct_edit_snapshot(&cwd).map_err(|_| SupervisorError::Ownership)?;
+        self.repository
+            .v3()
+            .create_artifact(
+                CreateArtifact {
+                    task_id: prepared.id.clone(),
+                    kind: "provider_role_configuration".into(),
+                    display_name: "task-provider-roles".into(),
+                    content_hash: None,
+                    metadata: serde_json::to_value(&pinned_roles)
+                        .map_err(|_| SupervisorError::Storage)?,
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.repository
+            .v3()
+            .create_artifact(
+                CreateArtifact {
+                    task_id: prepared.id.clone(),
+                    kind: "direct_edit_baseline".into(),
+                    display_name: "primary-checkout-before".into(),
+                    content_hash: None,
+                    metadata: baseline,
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+
+        let direct_prompt = direct_edit_prompt(&prompt);
+        let codex_transitions_task = selection.provider_id.as_str() == CODEX_PROVIDER_ID;
+        let owned = match selection.provider_id.as_str() {
+            CODEX_PROVIDER_ID => {
+                let starter =
+                    CodexTaskStarter::new(self.programs.codex.clone(), self.repository.clone());
+                let mut started = starter
+                    .start_prepared_task(prepared.clone(), &cwd)
+                    .await
+                    .map_err(|_| SupervisorError::Provider)?;
+                started
+                    .start_turn_with_model(
+                        &direct_prompt,
+                        (selection.model_id != "cli-owned").then_some(selection.model_id.as_str()),
+                    )
+                    .await
+                    .map_err(|_| SupervisorError::Provider)?;
+                OwnedProvider::Codex(started)
+            }
+            CLAUDE_PROVIDER_ID => {
+                let program = self
+                    .programs
+                    .claude
+                    .clone()
+                    .ok_or(SupervisorError::ProviderUnavailable)?;
+                let (process, session) = ClaudeProcess::start(
+                    program,
+                    self.repository.clone(),
+                    prepared.id.clone(),
+                    &cwd,
+                    &direct_prompt,
+                )
+                .await
+                .map_err(|_| SupervisorError::Provider)?;
+                activate_session(&self.repository, &session.session_id).await?;
+                OwnedProvider::Claude { process, session }
+            }
+            OMP_PROVIDER_ID => {
+                let program = self
+                    .programs
+                    .omp
+                    .clone()
+                    .ok_or(SupervisorError::ProviderUnavailable)?;
+                let (process, session) = OmpProcess::start(
+                    program,
+                    self.repository.clone(),
+                    prepared.id.clone(),
+                    &cwd,
+                    &selection.model_id,
+                    &direct_prompt,
+                    false,
+                )
+                .await
+                .map_err(|_| SupervisorError::Provider)?;
+                activate_session(&self.repository, &session.session_id).await?;
+                OwnedProvider::Omp { process, session }
+            }
+            _ => return Err(SupervisorError::ProviderUnavailable),
+        };
+        // CodexTaskStarter owns the Preparing → Implementing transition as it
+        // creates the App Server session. Claude and OMP only create a session,
+        // so the supervisor records their transition here.
+        let started = if codex_transitions_task {
+            self.repository
+                .v3()
+                .get_task(&prepared.id)
+                .await
+                .map_err(|_| SupervisorError::Storage)?
+        } else {
+            self.repository
+                .v3()
+                .transition_task(&prepared, TaskLifecycle::Implementing, now_ms())
+                .await
+                .map_err(|_| SupervisorError::Storage)?
+        };
+        self.owned.insert(prepared.id.clone(), owned);
+        Ok(started)
     }
 
     pub async fn available_actions(
@@ -1082,12 +1333,16 @@ impl SentinelSupervisor {
         let result = match task.lifecycle {
             TaskLifecycle::Implementing if self.implementer_turn_completed(&task.id).await? => {
                 self.release_completed_codex_implementer(&task.id).await?;
-                self.repository
-                    .v3()
-                    .transition_task(&task, TaskLifecycle::Validating, now_ms())
-                    .await
-                    .map(|_| ())
-                    .map_err(|_| SupervisorError::Storage)
+                if task.workflow_mode == WorkflowMode::DirectEdit {
+                    self.complete_direct_edit(&task).await
+                } else {
+                    self.repository
+                        .v3()
+                        .transition_task(&task, TaskLifecycle::Validating, now_ms())
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| SupervisorError::Storage)
+                }
             }
             TaskLifecycle::Validating => self.run_validation_stage(task.clone()).await,
             TaskLifecycle::Reviewing => self.run_review_stage(task.clone()).await,
@@ -1122,6 +1377,77 @@ impl SentinelSupervisor {
             return Err(error);
         }
         Ok(())
+    }
+
+    async fn complete_direct_edit(&self, task: &Task) -> Result<(), SupervisorError> {
+        let cwd = fs::canonicalize(&self.primary_root).map_err(|_| SupervisorError::Ownership)?;
+        let after = direct_edit_snapshot(&cwd).map_err(|_| SupervisorError::Ownership)?;
+        let before = self
+            .repository
+            .v3()
+            .list_artifacts(&task.id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?
+            .into_iter()
+            .find(|artifact| artifact.kind == "direct_edit_baseline")
+            .map(|artifact| artifact.metadata)
+            .unwrap_or(serde_json::Value::Null);
+        let baseline_paths = snapshot_paths(&before);
+        let after_paths = snapshot_paths(&after);
+        let mut all_paths = baseline_paths.clone();
+        all_paths.extend(after_paths.iter().cloned());
+        let mut files = all_paths
+            .into_iter()
+            .map(|path| {
+                let pre_existing = baseline_paths.contains(&path);
+                let present_after = after_paths.contains(&path);
+                let task_touched = match (pre_existing, present_after) {
+                    (false, true) | (true, false) => true,
+                    (true, true) => {
+                        snapshot_fingerprint(&before, &path) != snapshot_fingerprint(&after, &path)
+                    }
+                    (false, false) => false,
+                };
+                let operation = if !present_after {
+                    "restored_or_removed"
+                } else {
+                    snapshot_operation(&after, &path)
+                };
+                serde_json::json!({
+                    "path": path,
+                    "operation": operation,
+                    "pre_existing": pre_existing,
+                    "task_touched": task_touched,
+                })
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+        self.repository
+            .v3()
+            .create_artifact(
+                CreateArtifact {
+                    task_id: task.id.clone(),
+                    kind: "direct_edit_change_summary".into(),
+                    display_name: "primary-checkout-after".into(),
+                    content_hash: None,
+                    metadata: serde_json::json!({"before":before,"after":after,"files":files}),
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        let current = self
+            .repository
+            .v3()
+            .get_task(&task.id)
+            .await
+            .map_err(|_| SupervisorError::Storage)?;
+        self.repository
+            .v3()
+            .transition_task(&current, TaskLifecycle::Completed, now_ms())
+            .await
+            .map(|_| ())
+            .map_err(|_| SupervisorError::Storage)
     }
 
     /// Called by a host that is about to relinquish all owned provider handles.
@@ -2309,6 +2635,24 @@ impl SentinelSupervisor {
             .collect::<Vec<_>>();
         for task in tasks {
             let previous_lifecycle = task.lifecycle;
+            // Direct Edit has no owned worktree to reopen. We never infer a
+            // provider resume after restart: preserve the primary checkout and
+            // make the interrupted task durably recoverable instead.
+            if task.workflow_mode == WorkflowMode::DirectEdit {
+                let restored = self
+                    .repository
+                    .v3()
+                    .restore_unfinished_task(&task.id, now_ms())
+                    .await
+                    .map_err(|_| SupervisorError::Storage)?;
+                self.persist_reconciliation(
+                    &restored.id,
+                    "direct_edit",
+                    "interrupted_no_implicit_resume",
+                )
+                .await?;
+                continue;
+            }
             let belongs_to_repository = self
                 .repository
                 .v3()
@@ -3657,6 +4001,162 @@ print(json.dumps({"type":"result","session_id":"claude-review","result":"{\"find
                 .unwrap()[0]
                 .lifecycle,
             SessionLifecycle::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_edit_uses_primary_checkout_without_worktree_or_integration() {
+        let fixture = fixture().await;
+        let registry = Arc::new(ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            true,
+            false,
+            false,
+        ));
+        let selection = managed_selection(CODEX_PROVIDER_ID);
+        let mut supervisor = SentinelSupervisor::with_provider_runtime(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: Some(CodexProgram::from_executable(&fixture.codex).unwrap()),
+                claude: None,
+                omp: None,
+            },
+            registry,
+            WorkflowProviderConfiguration {
+                implementer: selection.clone(),
+                reviewer: selection.clone(),
+                repair: None,
+            },
+        )
+        .unwrap();
+        fs::write(fixture.main.join("pre-existing.txt"), "keep\n").unwrap();
+        let direct_result = supervisor
+            .start_with_selection(
+                selection,
+                "direct".into(),
+                "write directly".into(),
+                WorkflowMode::DirectEdit,
+            )
+            .await;
+        if direct_result.is_err() {
+            eprintln!(
+                "direct tasks: {:?}",
+                fixture.repository.v3().list_tasks().await.unwrap()
+            );
+        }
+        let task = direct_result.unwrap();
+        assert_eq!(task.workflow_mode, WorkflowMode::DirectEdit);
+        assert!(fixture
+            .repository
+            .v3()
+            .get_task_worktree(&task.id)
+            .await
+            .is_err());
+        assert_eq!(
+            fs::read_to_string(&fixture.cwd_evidence).unwrap().trim(),
+            fixture.main.canonicalize().unwrap().to_string_lossy()
+        );
+        supervisor.reconcile_progress().await.unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.main.join("implemented.txt")).unwrap(),
+            "implemented\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.main.join("pre-existing.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            TaskLifecycle::Completed
+        );
+        assert!(fixture
+            .repository
+            .v3()
+            .list_approvals_for_task(&task.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fixture
+            .repository
+            .v3()
+            .get_task_integration(&task.id)
+            .await
+            .is_err());
+        let artifacts = fixture
+            .repository
+            .v3()
+            .list_artifacts(&task.id)
+            .await
+            .unwrap();
+        assert!(artifacts
+            .iter()
+            .any(|item| item.kind == "direct_edit_baseline"));
+        assert!(artifacts
+            .iter()
+            .find(|item| item.kind == "direct_edit_change_summary")
+            .is_some_and(|summary| {
+                summary.metadata["files"].as_array().is_some_and(|files| {
+                    files.iter().any(|file| {
+                        file["path"] == "pre-existing.txt"
+                            && file["pre_existing"] == true
+                            && file["task_touched"] == false
+                    }) && files.iter().any(|file| {
+                        file["path"] == "implemented.txt"
+                            && file["pre_existing"] == false
+                            && file["task_touched"] == true
+                    })
+                })
+            }));
+
+        // A terminal Direct Edit task is not replayed after a host restart;
+        // the primary-checkout change remains where the harness wrote it.
+        drop(supervisor);
+        let registry = Arc::new(ProviderRegistry::with_managed_cli_providers(
+            Arc::new(MemoryCredentialStore::default()),
+            true,
+            false,
+            false,
+        ));
+        let selection = managed_selection(CODEX_PROVIDER_ID);
+        let mut restarted = SentinelSupervisor::with_provider_runtime(
+            fixture.repository.clone(),
+            &fixture.main,
+            &fixture.worktrees,
+            SupervisorPrograms {
+                codex: Some(CodexProgram::from_executable(&fixture.codex).unwrap()),
+                claude: None,
+                omp: None,
+            },
+            registry,
+            WorkflowProviderConfiguration {
+                implementer: selection.clone(),
+                reviewer: selection,
+                repair: None,
+            },
+        )
+        .unwrap();
+        restarted.enter_recovery_after_restart().await.unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .v3()
+                .get_task(&task.id)
+                .await
+                .unwrap()
+                .lifecycle,
+            TaskLifecycle::Completed
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.main.join("implemented.txt")).unwrap(),
+            "implemented\n"
         );
     }
 

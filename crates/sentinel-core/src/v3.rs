@@ -64,6 +64,9 @@ pub enum TaskLifecycle {
     Finalized,
     Integrating,
     Integrated,
+    /// Direct-edit implementation completed in the user's primary checkout.
+    /// This never represents a review, approval, or integration boundary.
+    Completed,
     Cancelled,
     Failed,
 }
@@ -71,7 +74,12 @@ impl TaskLifecycle {
     pub fn terminal(self) -> bool {
         matches!(
             self,
-            Self::Blocked | Self::Finalized | Self::Integrated | Self::Cancelled | Self::Failed
+            Self::Blocked
+                | Self::Finalized
+                | Self::Integrated
+                | Self::Completed
+                | Self::Cancelled
+                | Self::Failed
         )
     }
     pub fn transition(self, next: Self) -> Result<Self, CoreError> {
@@ -90,6 +98,7 @@ impl TaskLifecycle {
                     Self::Implementing,
                     Self::AwaitingApproval
                         | Self::Validating
+                        | Self::Completed
                         | Self::Blocked
                         | Self::Failed
                         | Self::Cancelled
@@ -102,6 +111,7 @@ impl TaskLifecycle {
                 | (
                     Self::Validating,
                     Self::Reviewing
+                        | Self::Completed
                         | Self::Repairing
                         | Self::ReadyForHuman
                         | Self::Blocked
@@ -169,17 +179,13 @@ impl TaskLifecycle {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowMode {
+    #[default]
     Manual,
     AutoIntegrate,
-}
-
-impl Default for WorkflowMode {
-    fn default() -> Self {
-        Self::Manual
-    }
+    DirectEdit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -363,7 +363,7 @@ async fn durable_approval_accepts_the_full_authorization_context_bound() {
             .fetch_all(&SqlitePool::connect(&url).await.expect("inspect migrations"))
             .await
             .expect("migrations");
-    assert_eq!(migrations.last(), Some(&19));
+    assert_eq!(migrations.last(), Some(&20));
     assert!(schema.contains("BETWEEN 1 AND 2048"));
     let task = task(&repository).await;
     let summary = "x".repeat(2_048);
