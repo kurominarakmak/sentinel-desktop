@@ -2,6 +2,14 @@ import XCTest
 @testable import SentinelMac
 
 final class NativeBridgeTests: XCTestCase {
+    private func unavailableCodex() -> NativeProviderStatus {
+        NativeProviderStatus(name: "Codex", installation: "unavailable", runtime: "none", usage: "unavailable", rateLimits: nil)
+    }
+
+    private func unavailableClaude() -> NativeProviderStatus {
+        NativeProviderStatus(name: "Claude", installation: "unavailable", runtime: "none", usage: "unavailable", rateLimits: nil)
+    }
+
     func testApplicationTerminationGateRequestsAndRepliesExactlyOnce() {
         var gate = ApplicationTerminationGate()
 
@@ -42,6 +50,53 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertNil(error)
         XCTAssertEqual(catalog?.models.first?.modelId, "runtime-model")
         XCTAssertEqual(catalog?.models.first?.supportedReasoningEfforts, ["medium", "ultra"])
+    }
+
+    func testUnifiedModelMenuUsesRuntimeCatalogsAndRetainsOMPRoute() {
+        let glm = discoveredModel(provider: "omp", id: "zai/glm-4.5-flash", name: "GLM 4.5 Flash")
+        let codex = discoveredModel(provider: "codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna")
+        let options = UnifiedModelOption.make(catalogs: [
+            "omp": NativeProviderModelCatalog(providerId: "omp", discoveryKind: "enumerated", models: [glm]),
+            "codex": NativeProviderModelCatalog(providerId: "codex", discoveryKind: "enumerated", models: [codex]),
+        ])
+        XCTAssertEqual(options.map(\.presentationName), ["GLM 4.5 Flash", "GPT-5.6 Luna"])
+        XCTAssertEqual(options.first { $0.presentationName == "GLM 4.5 Flash" }?.model.providerId, "omp")
+        XCTAssertEqual(options.first { $0.presentationName == "GLM 4.5 Flash" }?.model.modelId, "zai/glm-4.5-flash")
+        XCTAssertEqual(options.first { $0.presentationName == "GPT-5.6 Luna" }?.model.providerId, "codex")
+    }
+
+    func testUnifiedModelMenuKeepsKimiOMPRouteAndDisambiguatesOnlyDuplicates() {
+        let kimi = discoveredModel(provider: "omp", id: "moonshot/kimi-k3", name: "Kimi K3")
+        let duplicateOMP = discoveredModel(provider: "omp", id: "same-omp", name: "Shared Model")
+        let duplicateCodex = discoveredModel(provider: "codex", id: "same-codex", name: "Shared Model")
+        let options = UnifiedModelOption.make(catalogs: [
+            "omp": NativeProviderModelCatalog(providerId: "omp", discoveryKind: "enumerated", models: [kimi, duplicateOMP]),
+            "codex": NativeProviderModelCatalog(providerId: "codex", discoveryKind: "enumerated", models: [duplicateCodex]),
+        ])
+        XCTAssertEqual(options.first { $0.presentationName == "Kimi K3" }?.model.providerId, "omp")
+        XCTAssertTrue(options.contains { $0.presentationName == "Shared Model · Provider" })
+        XCTAssertTrue(options.contains { $0.presentationName == "Shared Model · Codex" })
+    }
+
+    func testUnifiedModelRefreshDoesNotLoseExactSelectedRoute() {
+        let luna = discoveredModel(provider: "codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna")
+        let first = UnifiedModelOption.make(catalogs: ["codex": NativeProviderModelCatalog(providerId: "codex", discoveryKind: "enumerated", models: [luna])])
+        let refreshed = UnifiedModelOption.make(catalogs: ["codex": NativeProviderModelCatalog(providerId: "codex", discoveryKind: "enumerated", models: [luna])])
+        XCTAssertEqual(first.first?.model, refreshed.first?.model)
+        XCTAssertEqual(refreshed.first?.model.providerId, "codex")
+    }
+
+    func testModelCatalogDiscoveryGateKeepsConcurrentProvidersIndependent() {
+        var gate = ModelCatalogDiscoveryGate()
+        gate.begin(providerID: "omp", requestID: "omp-request")
+        gate.begin(providerID: "codex", requestID: "codex-request")
+        XCTAssertTrue(gate.apply(requestID: "omp-request", providerID: "omp"))
+        XCTAssertTrue(gate.apply(requestID: "codex-request", providerID: "codex"))
+        XCTAssertFalse(gate.apply(requestID: "omp-request", providerID: "omp"))
+    }
+
+    private func discoveredModel(provider: String, id: String, name: String) -> NativeProviderModel {
+        NativeProviderModel(providerId: provider, modelId: id, displayName: name, supportedReasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "medium", isDefault: false, availability: "available")
     }
 
     func testDecodesTypedDiscoveryCommandFailureWithoutLosingSafeDetail() throws {
@@ -160,6 +215,16 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(defaults?.reviewerProviderId, "claude_code")
     }
 
+    func testCapabilitiesDecodeDirectEditWorkflowWithExactModelRoute() throws {
+        let data = Data(#"{"kind":"capabilities","repository":"/repo","providers":[],"quickPromptPreferences":{"implementer":{"providerId":"omp","modelId":"zai/glm-4.5-flash"},"reviewer":{"providerId":"codex","modelId":"gpt-5.6-luna"},"workflowMode":"direct_edit"},"quickPromptDefaults":{"implementerProviderId":"codex","reviewerProviderId":"claude_code"}}"#.utf8)
+        guard case .capabilities(_, _, let preferences, _) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
+            return XCTFail("expected capabilities")
+        }
+        XCTAssertEqual(preferences?.workflowMode, .directEdit)
+        XCTAssertEqual(preferences?.implementer.providerId, "omp")
+        XCTAssertEqual(preferences?.implementer.modelId, "zai/glm-4.5-flash")
+    }
+
     func testSubmissionGateRejectsEmptyUnavailableAndDuplicateRequests() {
         var gate = TaskSubmissionGate()
         XCTAssertEqual(gate.begin(prompt: "  ", providerAvailable: true, requestID: "empty"), .rejected("Describe the task before sending."))
@@ -221,9 +286,9 @@ final class NativeBridgeTests: XCTestCase {
 
     func testDetailGateRejectsStaleUpdateAndAcceptsReplacement() {
         let action = AttentionActions(stop: false, approve: false, reject: false, approvalID: nil)
-        let first = NativeTaskDetail(task: NativeTask(id: "task-1", summary: "one", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 2, updatedAtMs: 2), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, actions: action)
-        let stale = NativeTaskDetail(task: NativeTask(id: "task-1", summary: "old", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 1), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, actions: action)
-        let replacement = NativeTaskDetail(task: NativeTask(id: "task-2", summary: "new", lifecycle: "recovering", recoveryRequired: true, recoveryReason: "missing_thread", version: 1, updatedAtMs: 3), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, actions: action)
+        let first = NativeTaskDetail(task: NativeTask(id: "task-1", summary: "one", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 2, updatedAtMs: 2), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, directEditChangeSummary: nil, actions: action)
+        let stale = NativeTaskDetail(task: NativeTask(id: "task-1", summary: "old", lifecycle: "implementing", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 1), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, directEditChangeSummary: nil, actions: action)
+        let replacement = NativeTaskDetail(task: NativeTask(id: "task-2", summary: "new", lifecycle: "recovering", recoveryRequired: true, recoveryReason: "missing_thread", version: 1, updatedAtMs: 3), sessions: [], activity: [], worktree: nil, diff: nil, validations: [], findings: [], repairRounds: [], finalApprovalPacket: nil, directEditChangeSummary: nil, actions: action)
         var gate = DetailUpdateGate()
         XCTAssertTrue(gate.apply(first))
         XCTAssertFalse(gate.apply(stale))
@@ -245,7 +310,7 @@ final class NativeBridgeTests: XCTestCase {
         guard case .status(let status) = try JSONDecoder().decode(BridgeMessage.self, from: data) else {
             return XCTFail("expected status")
         }
-        XCTAssertEqual(CodexTrayTitle.make(status), "39%")
+        XCTAssertEqual(status.modelUsage.count, 0)
         XCTAssertTrue(status.codex.rateLimits?["primary"]?.resetsAt?.contains("T") == true)
     }
 
@@ -316,11 +381,27 @@ final class NativeBridgeTests: XCTestCase {
         var registry = NativeSurfaceRegistry()
         XCTAssertTrue(registry.requestOpen(.quickPrompt))
         XCTAssertFalse(registry.requestOpen(.quickPrompt))
-        XCTAssertTrue(registry.requestOpen(.attention))
         XCTAssertTrue(registry.requestOpen(.taskDetail))
         XCTAssertTrue(registry.requestOpen(.status))
         XCTAssertTrue(registry.requestOpen(.settings))
-        XCTAssertEqual(registry.owned.count, 5)
+        XCTAssertEqual(registry.owned.count, 4)
+    }
+
+    func testNeedsAttentionPresentationRetainsDurableStateAndRoutesToExistingDetail() {
+        let ready = attention(
+            state: "ready_for_review",
+            actions: AttentionActions(stop: false, approve: true, reject: true, approvalID: "approval-1")
+        )
+        let blocked = attention(id: "task-blocked", state: "blocked")
+        let recovery = NativeAttention(
+            task: NativeTask(id: "task-recovery", summary: "Recover", lifecycle: "recovering", recoveryRequired: true, recoveryReason: "missing_thread", version: 1, updatedAtMs: 1),
+            displayState: "recovery_required", provider: nil, activity: nil, validation: nil, review: nil,
+            actions: AttentionActions(stop: false, approve: false, reject: false, approvalID: nil)
+        )
+        XCTAssertEqual(NeedsAttentionPresentation.stateLabel(ready), "Ready for approval")
+        XCTAssertEqual(NeedsAttentionPresentation.stateLabel(blocked), "Blocked")
+        XCTAssertEqual(NeedsAttentionPresentation.stateLabel(recovery), "Recovery required")
+        XCTAssertEqual(NeedsAttentionPresentation.opensExistingTaskDetail(taskID: ready.task.id), "task-1")
     }
 
     func testNormalLaunchDoesNotRequestQuickPrompt() {
@@ -379,12 +460,35 @@ final class NativeBridgeTests: XCTestCase {
         XCTAssertEqual(focus.takeRestoreCandidate(runningProcessIdentifiers: [42, sentinel], sentinelPID: sentinel), 42)
     }
 
-    func testFloatingPanelPlacementCentersOffScreenFrameWithoutMovingVisibleFrame() {
+    func testFloatingPanelPlacementAnchorsTopRightAndRecoversDisconnectedScreen() {
         let screen = NSRect(x: 0, y: 0, width: 1000, height: 800)
         let offScreen = NSRect(x: 4000, y: 4000, width: 320, height: 240)
-        let visible = NSRect(x: 100, y: 100, width: 320, height: 240)
-        XCTAssertEqual(FloatingPanelPlacement.correctedFrame(offScreen, visibleFrames: [screen], preferred: screen).midX, 500)
-        XCTAssertEqual(FloatingPanelPlacement.correctedFrame(visible, visibleFrames: [screen], preferred: screen), visible)
+        let anchored = FloatingPanelPlacement.topRightFrame(size: NSSize(width: 320, height: 240), preferred: screen)
+        XCTAssertEqual(anchored.origin.x, 662)
+        XCTAssertEqual(anchored.origin.y, 548)
+        XCTAssertTrue(screen.contains(anchored))
+        XCTAssertEqual(FloatingPanelPlacement.correctedFrame(offScreen, visibleFrames: [screen], preferred: screen), anchored)
+    }
+
+    func testQuickPromptExpansionKeepsTopRightAnchorAndGrowsDownward() {
+        let screen = NSRect(x: 1440, y: 0, width: 1440, height: 900)
+        let compact = FloatingPanelPlacement.topRightFrame(size: NSSize(width: 360, height: 76), preferred: screen)
+        let expanded = FloatingPanelPlacement.resizedFrameKeepingTop(compact, height: 410)
+        XCTAssertEqual(expanded.maxX, compact.maxX)
+        XCTAssertEqual(expanded.maxY, compact.maxY)
+        XCTAssertEqual(expanded.origin.y, compact.maxY - 410)
+        XCTAssertTrue(screen.contains(expanded))
+    }
+
+    func testStandardWindowPlacementDoesNotUseQuickPromptPolicy() {
+        let screen = NSRect(x: 1440, y: 0, width: 1440, height: 900)
+        let size = NSSize(width: 520, height: 470)
+        let quickPrompt = FloatingPanelPlacement.topRightFrame(size: size, preferred: screen)
+        let settings = NativeWindowPlacement.initialFrame(size: size, preferred: screen)
+        XCTAssertEqual(settings.midX, screen.midX)
+        XCTAssertEqual(settings.midY, screen.midY)
+        XCTAssertNotEqual(settings, quickPrompt)
+        XCTAssertTrue(screen.contains(settings))
     }
 
     func testActiveTaskGateRejectsStaleSameTaskAndAcceptsReplacementOrClear() {
@@ -423,15 +527,70 @@ final class NativeBridgeTests: XCTestCase {
         guard case .status(let status) = try JSONDecoder().decode(BridgeMessage.self, from: lines[0]) else {
             return XCTFail("expected complete status frame")
         }
-        XCTAssertEqual(CodexTrayTitle.make(status), "39%")
+        XCTAssertEqual(status.codex.rateLimits?["primary"]?.usedPercent, 39)
     }
 
-    func testCodexTrayTitleUsesOnlyVerifiedPrimaryUsage() {
-        let codex = NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: ["primary": RateLimitWindow(usedPercent: 24.6, resetsAt: nil, windowDurationMins: nil)])
-        let claude = NativeProviderStatus(name: "Claude Code", installation: "unavailable", runtime: "none", usage: "unavailable", rateLimits: nil)
-        XCTAssertEqual(CodexTrayTitle.make(NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: codex, claude: claude)), "25%")
-        XCTAssertEqual(CodexTrayTitle.make(nil), "—")
-        XCTAssertEqual(CodexTrayTitle.make(NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: NativeProviderStatus(name: "Codex", installation: "available", runtime: "active", usage: "live", rateLimits: ["primary": RateLimitWindow(usedPercent: 101, resetsAt: nil, windowDurationMins: nil)]), claude: claude)), "—")
+    func testProviderNeutralUsagePresentationDoesNotFabricatePercentages() {
+        let glm = discoveredModel(provider: "omp", id: "glm-5.2", name: "GLM 5.2")
+        let usage = ModelUsageStatus(modelDisplayName: "GLM 5.2", providerDisplayName: "GLM", modelId: "glm-5.2", providerId: "omp", usagePercent: nil, remainingPercent: nil, resetAt: nil, availability: "available", usageCapability: "unavailable", granularity: .model)
+        let presentation = ModelUsagePresentation.make(catalogs: ["omp": NativeProviderModelCatalog(providerId: "omp", discoveryKind: "enumerated", models: [glm])], selections: [], usage: [usage])
+        XCTAssertEqual(presentation.rows.first?.detail, "Usage unavailable")
+        XCTAssertEqual(presentation.idleItem(preferred: APIProviderSelection(providerId: "omp", modelId: "glm-5.2")), "✦ GLM 5.2 Ready")
+    }
+
+    func testLastUsedModelDrivesIdleAndActiveWorkflowOverridesUsage() {
+        let luna = discoveredModel(provider: "codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna")
+        let usage = ModelUsageStatus(modelDisplayName: "GPT-5.6 Luna", providerDisplayName: "Codex", modelId: "gpt-5.6-luna", providerId: "codex", usagePercent: 42, remainingPercent: nil, resetAt: nil, availability: "available", usageCapability: "model_quota", granularity: .model)
+        let usagePresentation = ModelUsagePresentation.make(catalogs: ["codex": NativeProviderModelCatalog(providerId: "codex", discoveryKind: "enumerated", models: [luna])], selections: [], usage: [usage])
+        let idle = usagePresentation.idleItem(preferred: APIProviderSelection(providerId: "codex", modelId: "gpt-5.6-luna"))
+        XCTAssertEqual(StatusBarPresentation.make(status: NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: unavailableCodex(), claude: unavailableClaude()), attention: nil, idleTitle: idle), "✦ GPT-5.6 Luna 42%")
+        let task = NativeTask(id: "task", summary: "Ship", lifecycle: "validating", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 1)
+        XCTAssertEqual(StatusBarPresentation.make(status: NativeStatus(version: 1, sentinel: "validating", activeTask: task, recoveryRequired: false, codex: unavailableCodex(), claude: unavailableClaude()), attention: nil, idleTitle: idle), "✦ Testing…")
+    }
+
+    func testCodexAccountQuotaUsesCodexIdentityNotTheSelectedModel() {
+        let models = [
+            discoveredModel(provider: "codex", id: "gpt-5.6-luna", name: "GPT-5.6 Luna"),
+            discoveredModel(provider: "codex", id: "gpt-5.6-sol", name: "GPT-5.6 Sol"),
+        ]
+        let shared = ModelUsageStatus(modelDisplayName: nil, providerDisplayName: "Codex", modelId: nil, providerId: "codex", usagePercent: 42, remainingPercent: nil, resetAt: nil, availability: "available", usageCapability: "account_quota", granularity: .providerAccount)
+        let presentation = ModelUsagePresentation.make(catalogs: ["codex": NativeProviderModelCatalog(providerId: "codex", discoveryKind: "enumerated", models: models)], selections: [], usage: [shared])
+        let luna = presentation.idleItem(preferred: APIProviderSelection(providerId: "codex", modelId: "gpt-5.6-luna"))
+        let sol = presentation.idleItem(preferred: APIProviderSelection(providerId: "codex", modelId: "gpt-5.6-sol"))
+        XCTAssertEqual(luna, "✦ Codex 42%")
+        XCTAssertEqual(sol, "✦ Codex 42%")
+        XCTAssertNotEqual(luna, "✦ GPT-5.6 Luna · 42% shared")
+        XCTAssertTrue(presentation.rows.allSatisfy { $0.detail == "Usage unavailable" })
+    }
+
+    func testClaudeAccountQuotaUsesClaudeIdentity() {
+        let claude = discoveredModel(provider: "claude_code", id: "claude-sonnet", name: "Claude Sonnet")
+        let shared = ModelUsageStatus(modelDisplayName: nil, providerDisplayName: "Claude", modelId: nil, providerId: "claude_code", usagePercent: 68, remainingPercent: nil, resetAt: nil, availability: "available", usageCapability: "account_quota", granularity: .providerAccount)
+        let presentation = ModelUsagePresentation.make(catalogs: ["claude_code": NativeProviderModelCatalog(providerId: "claude_code", discoveryKind: "enumerated", models: [claude])], selections: [], usage: [shared])
+        XCTAssertEqual(presentation.idleItem(preferred: APIProviderSelection(providerId: "claude_code", modelId: "claude-sonnet")), "✦ Claude 68%")
+    }
+
+    func testSharedQuotaIsNotDuplicatedAcrossModelsAndDoneReturnsToIdle() {
+        let models = [discoveredModel(provider: "omp", id: "glm-flash", name: "GLM 4.5 Flash"), discoveredModel(provider: "omp", id: "glm-5.2", name: "GLM 5.2"), discoveredModel(provider: "omp", id: "kimi-k3", name: "Kimi K3")]
+        let shared = ModelUsageStatus(modelDisplayName: nil, providerDisplayName: "GLM", modelId: nil, providerId: "omp", usagePercent: 31, remainingPercent: nil, resetAt: nil, availability: "available", usageCapability: "account_quota", granularity: .providerAccount)
+        let presentation = ModelUsagePresentation.make(catalogs: ["omp": NativeProviderModelCatalog(providerId: "omp", discoveryKind: "enumerated", models: models)], selections: [], usage: [shared])
+        XCTAssertTrue(presentation.rows.allSatisfy { $0.detail == "Usage unavailable" })
+        XCTAssertEqual(presentation.sharedQuotas.first?.percentageLabel, "31%")
+        let idle = presentation.idleItem(preferred: APIProviderSelection(providerId: "omp", modelId: "glm-5.2"))
+        XCTAssertEqual(StatusBarPresentation.make(status: NativeStatus(version: 1, sentinel: "ready", activeTask: nil, recoveryRequired: false, codex: unavailableCodex(), claude: unavailableClaude()), attention: nil, idleTitle: idle), "✦ GLM 31%")
+        let done = NativeTask(id: "task", summary: "Done", lifecycle: "done", recoveryRequired: false, recoveryReason: nil, version: 1, updatedAtMs: 1)
+        XCTAssertEqual(StatusBarPresentation.make(status: NativeStatus(version: 1, sentinel: "done", activeTask: done, recoveryRequired: false, codex: unavailableCodex(), claude: unavailableClaude()), attention: nil, idleTitle: idle), "✦ Done")
+        XCTAssertEqual(StatusBarPresentation.make(status: NativeStatus(version: 1, sentinel: "done", activeTask: done, recoveryRequired: false, codex: unavailableCodex(), claude: unavailableClaude()), attention: nil, idleTitle: idle, showDone: false), "✦ GLM 31%")
+    }
+
+    func testModelDiscoveryRefreshPreservesUsageMappingForTheSameOwnedModel() {
+        let initial = discoveredModel(provider: "omp", id: "glm-5.2", name: "GLM 5.2")
+        let refreshed = discoveredModel(provider: "omp", id: "glm-5.2", name: "GLM 5.2")
+        let usage = ModelUsageStatus(modelDisplayName: "GLM 5.2", providerDisplayName: "GLM", modelId: "glm-5.2", providerId: "omp", usagePercent: 31, remainingPercent: nil, resetAt: nil, availability: "available", usageCapability: "model_quota", granularity: .model)
+        let first = ModelUsagePresentation.make(catalogs: ["omp": NativeProviderModelCatalog(providerId: "omp", discoveryKind: "enumerated", models: [initial])], selections: [], usage: [usage])
+        let second = ModelUsagePresentation.make(catalogs: ["omp": NativeProviderModelCatalog(providerId: "omp", discoveryKind: "enumerated", models: [refreshed])], selections: [], usage: [usage])
+        XCTAssertEqual(first.rows.first?.detail, "31%")
+        XCTAssertEqual(second.rows.first?.detail, "31%")
     }
 
     func testMissingCodexUsageRetriesAreBoundedAndStopAfterVerifiedSnapshot() {

@@ -189,7 +189,25 @@ struct ProviderStatusDto {
     rate_limits: Option<Value>,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+/// Runtime-owned quota information. `model_id` is deliberately absent for an
+/// account quota: consumers must render it as shared rather than duplicating a
+/// percentage across models that happen to use the same harness.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ModelUsageStatusDto {
+    model_display_name: Option<String>,
+    provider_display_name: String,
+    model_id: Option<String>,
+    provider_id: String,
+    usage_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    reset_at: Option<String>,
+    availability: String,
+    usage_capability: String,
+    granularity: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct StatusDto {
     version: u64,
@@ -198,6 +216,8 @@ struct StatusDto {
     recovery_required: bool,
     codex: ProviderStatusDto,
     claude: ProviderStatusDto,
+    #[serde(default)]
+    model_usage: Vec<ModelUsageStatusDto>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -529,6 +549,7 @@ fn attention_display_state(task: &sentinel_core::v3::Task) -> &'static str {
         TaskLifecycle::Reviewing => "reviewing",
         TaskLifecycle::Integrating => "integrating",
         TaskLifecycle::Integrated => "integrated",
+        TaskLifecycle::Completed => "completed",
         TaskLifecycle::ReadyForHuman => "ready_for_review",
         TaskLifecycle::Blocked => "blocked",
         TaskLifecycle::Failed => "failed",
@@ -625,6 +646,10 @@ fn installation_status(status: InstallationStatus) -> String {
     }
 }
 
+fn installation_available(status: &InstallationStatus) -> bool {
+    matches!(status, InstallationStatus::Available { .. })
+}
+
 async fn status_snapshot(
     repository: &RunRepository,
     supervisor: Option<&SentinelSupervisor>,
@@ -666,6 +691,20 @@ async fn status_snapshot(
             )
         })
         .unwrap_or_else(|| "no owned session".into());
+    let codex_rate_limits = usage.rate_limits(refresh_usage).await;
+    let codex_primary = codex_rate_limits.as_ref().and_then(|limits| {
+        limits.get("primary").and_then(|primary| {
+            primary.get("usedPercent").and_then(Value::as_f64).filter(|value| (0.0..=100.0).contains(value))
+        })
+    });
+    let codex_reset = codex_rate_limits.as_ref().and_then(|limits| {
+        limits.get("primary").and_then(|primary| primary.get("resetsAt")).and_then(|reset| match reset {
+            Value::String(value) => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+    });
+    let codex_usage_capability = if codex_primary.is_some() { "account_quota" } else { "unavailable" };
     Ok(StatusDto {
         version,
         sentinel,
@@ -676,7 +715,7 @@ async fn status_snapshot(
             installation: installation_status(detect_installation(AgentKind::Codex)),
             runtime: codex_runtime,
             usage: "Codex App Server account/rateLimits/read".into(),
-            rate_limits: usage.rate_limits(refresh_usage).await,
+            rate_limits: codex_rate_limits,
         },
         claude: ProviderStatusDto {
             name: "Claude Code".into(),
@@ -685,6 +724,32 @@ async fn status_snapshot(
             usage: "Authenticated usage is unavailable in the native bridge.".into(),
             rate_limits: None,
         },
+        model_usage: vec![
+            ModelUsageStatusDto {
+                model_display_name: None,
+                provider_display_name: "Codex".into(),
+                model_id: None,
+                provider_id: "codex".into(),
+                usage_percent: codex_primary,
+                remaining_percent: None,
+                reset_at: codex_reset,
+                availability: if installation_available(&detect_installation(AgentKind::Codex)) { "available".into() } else { "unavailable".into() },
+                usage_capability: codex_usage_capability.into(),
+                granularity: "provider_account".into(),
+            },
+            ModelUsageStatusDto {
+                model_display_name: None,
+                provider_display_name: "Claude".into(),
+                model_id: None,
+                provider_id: "claude_code".into(),
+                usage_percent: None,
+                remaining_percent: None,
+                reset_at: None,
+                availability: if installation_available(&detect_installation(AgentKind::ClaudeCode)) { "available".into() } else { "unavailable".into() },
+                usage_capability: "unavailable".into(),
+                granularity: "provider_account".into(),
+            },
+        ],
     })
 }
 
@@ -834,6 +899,11 @@ async fn task_detail(
         .rev()
         .find(|artifact| artifact.kind == "final_approval_packet")
         .map(|artifact| serde_json::to_string(&artifact.metadata).unwrap_or_default());
+    let direct_edit_change_summary = artifacts
+        .iter()
+        .rev()
+        .find(|artifact| artifact.kind == "direct_edit_change_summary")
+        .map(|artifact| serde_json::to_string(&artifact.metadata).unwrap_or_default());
     let pinned_configuration = artifacts
         .iter()
         .rev()
@@ -859,6 +929,7 @@ async fn task_detail(
         "findings": findings.iter().map(|value| json!({"id":value.id.to_string(),"repairRoundId":value.repair_round_id.as_ref().map(ToString::to_string),"severity":value.severity,"disposition":format!("{:?}",value.disposition).to_lowercase(),"summary":value.summary,"evidence":serde_json::to_string(&value.evidence).unwrap_or_default()})).collect::<Vec<_>>(),
         "repairRounds": repair_rounds.into_iter().map(|value| json!({"id":value.id.to_string(),"round":value.round_number,"state":format!("{:?}",value.lifecycle).to_lowercase(),"updatedAtMs":value.updated_at_ms})).collect::<Vec<_>>(),
         "finalApprovalPacket": final_packet,
+        "directEditChangeSummary": direct_edit_change_summary,
         "actions": detail_actions
     }))
 }

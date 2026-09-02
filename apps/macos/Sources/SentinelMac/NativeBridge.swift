@@ -33,6 +33,7 @@ enum QuickPromptRole: String, CaseIterable, Hashable {
 enum NativeWorkflowMode: String, Codable, CaseIterable, Equatable {
     case manual
     case autoIntegrate = "auto_integrate"
+    case directEdit = "direct_edit"
 }
 
 struct NativeProviderModel: Codable, Equatable, Identifiable {
@@ -53,6 +54,62 @@ struct NativeProviderModelCatalog: Codable, Equatable {
     let providerId: String
     let discoveryKind: String
     let models: [NativeProviderModel]
+}
+
+/// Presentation items are constructed exclusively from runtime discovery. The
+/// visible name is model-first; the original provider/model pair remains
+/// attached for durable supervisor routing.
+struct UnifiedModelOption: Identifiable, Equatable {
+    let model: NativeProviderModel
+    let presentationName: String
+
+    var id: String { model.id }
+
+    static func make(catalogs: [String: NativeProviderModelCatalog]) -> [UnifiedModelOption] {
+        let models = catalogs.values.flatMap(\.models).filter(\.available)
+        let nameCounts = Dictionary(grouping: models, by: \.label).mapValues(\.count)
+        return models.map { model in
+            let suffix = nameCounts[model.label, default: 0] > 1
+                ? " · \(providerPresentationName(model.providerId))"
+                : ""
+            return UnifiedModelOption(model: model, presentationName: model.label + suffix)
+        }
+        .sorted {
+            if $0.model.isDefault != $1.model.isDefault { return $0.model.isDefault }
+            return $0.presentationName.localizedStandardCompare($1.presentationName) == .orderedAscending
+        }
+    }
+
+    private static func providerPresentationName(_ providerID: String) -> String {
+        switch providerID {
+        case "codex": return "Codex"
+        case "claude_code": return "Claude"
+        // OMP is routing infrastructure, not a user-facing model brand.
+        case "omp": return "Provider"
+        default: return providerID
+        }
+    }
+}
+
+/// Provider-keyed request tracking permits discovery of all usable catalogs at
+/// once. It is intentionally independent of the legacy role gate so model
+/// menus never need provider-name heuristics.
+struct ModelCatalogDiscoveryGate {
+    private(set) var pending: [String: String] = [:]
+
+    mutating func begin(providerID: String, requestID: String) { pending[providerID] = requestID }
+
+    mutating func apply(requestID: String, providerID: String) -> Bool {
+        guard pending[providerID] == requestID else { return false }
+        pending.removeValue(forKey: providerID)
+        return true
+    }
+
+    mutating func failToSend(requestID: String) -> String? {
+        guard let providerID = pending.first(where: { $0.value == requestID })?.key else { return nil }
+        pending.removeValue(forKey: providerID)
+        return providerID
+    }
 }
 
 struct NativeModelDiscoveryError: Codable, Equatable {
@@ -185,6 +242,7 @@ struct NativeTaskDetail: Codable, Equatable {
     let findings: [DetailFinding]
     let repairRounds: [DetailRepairRound]
     let finalApprovalPacket: String?
+    let directEditChangeSummary: String?
     let actions: AttentionActions
     var configuration: NativeTaskConfiguration? = nil
 }
@@ -264,6 +322,72 @@ struct NativeStatus: Decodable, Equatable {
     let recoveryRequired: Bool
     let codex: NativeProviderStatus
     let claude: NativeProviderStatus
+    /// Telemetry is intentionally separate from the legacy harness health
+    /// blocks above.  A record retains its provider/model ownership and says
+    /// whether a quota belongs to one model or to an account shared by models.
+    let modelUsage: [ModelUsageStatus]
+
+    private enum CodingKeys: String, CodingKey {
+        case version, sentinel, activeTask, recoveryRequired, codex, claude, modelUsage
+    }
+
+    init(
+        version: UInt64,
+        sentinel: String,
+        activeTask: NativeTask?,
+        recoveryRequired: Bool,
+        codex: NativeProviderStatus,
+        claude: NativeProviderStatus,
+        modelUsage: [ModelUsageStatus] = []
+    ) {
+        self.version = version
+        self.sentinel = sentinel
+        self.activeTask = activeTask
+        self.recoveryRequired = recoveryRequired
+        self.codex = codex
+        self.claude = claude
+        self.modelUsage = modelUsage
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        version = try values.decode(UInt64.self, forKey: .version)
+        sentinel = try values.decode(String.self, forKey: .sentinel)
+        activeTask = try values.decodeIfPresent(NativeTask.self, forKey: .activeTask)
+        recoveryRequired = try values.decode(Bool.self, forKey: .recoveryRequired)
+        codex = try values.decode(NativeProviderStatus.self, forKey: .codex)
+        claude = try values.decode(NativeProviderStatus.self, forKey: .claude)
+        modelUsage = try values.decodeIfPresent([ModelUsageStatus].self, forKey: .modelUsage) ?? []
+    }
+}
+
+/// Provider-neutral usage truth received from the runtime.  Percentages are
+/// optional because a provider may expose only availability or authentication.
+struct ModelUsageStatus: Codable, Equatable, Identifiable {
+    enum Granularity: String, Codable { case model, providerAccount = "provider_account" }
+
+    /// Model and quota identities are intentionally distinct. Account quotas
+    /// must be labelled with the provider identity, never a selected model.
+    let modelDisplayName: String?
+    let providerDisplayName: String
+    let modelId: String?
+    let providerId: String
+    let usagePercent: Double?
+    let remainingPercent: Double?
+    let resetAt: String?
+    let availability: String
+    let usageCapability: String
+    let granularity: Granularity
+
+    var id: String { "\(providerId):\(modelId ?? granularity.rawValue)" }
+    var hasVerifiedPercent: Bool {
+        [usagePercent, remainingPercent].contains { $0.map { (0...100).contains($0) } == true }
+    }
+    var percentageLabel: String? {
+        if let usagePercent, (0...100).contains(usagePercent) { return String(format: "%.0f%%", usagePercent) }
+        if let remainingPercent, (0...100).contains(remainingPercent) { return "\(String(format: "%.0f", remainingPercent))% remaining" }
+        return nil
+    }
 }
 
 struct SettingsProvider: Codable, Equatable {
@@ -497,6 +621,8 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var availabilityMessage: String?
     @Published private(set) var providers: [ProviderCapability] = []
     @Published private(set) var modelDiscovery: [QuickPromptRole: ModelDiscoveryPhase] = [:]
+    @Published private(set) var modelCatalogs: [String: NativeProviderModelCatalog] = [:]
+    @Published private(set) var modelDiscoveryFailures: [String: NativeModelDiscoveryError] = [:]
     @Published private(set) var quickPromptPreferences: NativeQuickPromptPreferences?
     @Published private(set) var quickPromptDefaults: NativeQuickPromptDefaults?
     @Published private(set) var quickPromptPreferencesMessage: String?
@@ -507,6 +633,7 @@ final class NativeBridge: ObservableObject {
     @Published private(set) var attentionActionInFlight = false
     @Published private(set) var taskDetail: NativeTaskDetail?
     @Published private(set) var status: NativeStatus?
+    @Published private(set) var lastUsedModel: APIProviderSelection?
     @Published private(set) var settings: NativeSettings?
     @Published private(set) var settingsMutationMessage: String?
     @Published private(set) var settingsMutationInFlight = false
@@ -523,7 +650,9 @@ final class NativeBridge: ObservableObject {
     private var outputBuffer = BridgeLineBuffer()
     private var e2eBufferedTraceThreshold = 64 * 1024
     private var submissionGate = TaskSubmissionGate()
+    private var submittedConfigurations: [String: NativeTaskConfiguration] = [:]
     private var modelDiscoveryGate = ModelDiscoveryGate()
+    private var modelCatalogDiscoveryGate = ModelCatalogDiscoveryGate()
     private var preferencesSaveWorkItem: DispatchWorkItem?
     private var attentionActionGate = AttentionActionGate()
     private var attentionUpdateGate = AttentionUpdateGate()
@@ -536,6 +665,26 @@ final class NativeBridge: ObservableObject {
     private var codexUsageRetryGate = CodexUsageRetryGate()
     private var restoreFocusAfterAttentionAction = false
     private let e2eTrace = E2ERuntimeTrace()
+
+    private static let lastUsedModelKey = "sentinel.last-used-model.v1"
+
+    init() {
+        if let data = UserDefaults.standard.data(forKey: Self.lastUsedModelKey),
+           let selection = try? JSONDecoder().decode(APIProviderSelection.self, from: data) {
+            lastUsedModel = selection
+        }
+    }
+
+    var preferredIdleModel: APIProviderSelection? {
+        if let active = taskDetail?.configuration?.implementer { return active }
+        return lastUsedModel ?? quickPromptPreferences?.implementer
+    }
+
+    var usagePresentation: ModelUsagePresentation {
+        let selections = [preferredIdleModel, quickPromptPreferences?.implementer, quickPromptPreferences?.reviewer]
+            .compactMap { $0 }
+        return ModelUsagePresentation.make(catalogs: modelCatalogs, selections: selections, usage: status?.modelUsage ?? [])
+    }
 
     func start() {
         guard !stopped, process == nil else { return }
@@ -700,6 +849,24 @@ final class NativeBridge: ObservableObject {
         }
     }
 
+    /// Model-first UI discovery. The request still uses the owning provider;
+    /// that ownership is retained in `NativeProviderModel` and task state.
+    func discoverModels(providerID: String) {
+        let requestID = UUID().uuidString.lowercased()
+        modelCatalogDiscoveryGate.begin(providerID: providerID, requestID: requestID)
+        guard send([
+            "kind": "discover_models",
+            "request_id": requestID,
+            "provider_id": providerID,
+        ]) else {
+            guard let failedProvider = modelCatalogDiscoveryGate.failToSend(requestID: requestID) else { return }
+            modelDiscoveryFailures[failedProvider] = NativeModelDiscoveryError(
+                code: "bridge_unavailable", message: "Provider unavailable"
+            )
+            return
+        }
+    }
+
     func saveQuickPromptPreferences(_ preferences: NativeQuickPromptPreferences) {
         preferencesSaveWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
@@ -837,6 +1004,7 @@ final class NativeBridge: ObservableObject {
         case .accepted: break
         }
         taskSubmission = .sending
+        submittedConfigurations[requestID] = configuration
         guard send([
             "kind": "start_task",
             "request_id": requestID,
@@ -846,6 +1014,7 @@ final class NativeBridge: ObservableObject {
             "reviewer": selectionPayload(configuration.reviewer),
             "workflow_mode": configuration.workflowMode.rawValue,
         ]) else {
+            submittedConfigurations.removeValue(forKey: requestID)
             submissionGate.rejectPending()
             taskSubmission = .rejected("Native bridge is unavailable.")
             return
@@ -883,6 +1052,7 @@ final class NativeBridge: ObservableObject {
                 "main": String(Thread.isMainThread),
             ])
             taskDetail = detailUpdateGate.current
+            if let selection = detail.configuration?.implementer { rememberUsedModel(selection) }
             e2eTrace.record("task-detail.assign.after", [
                 "after": taskDetail?.task.id ?? "nil",
                 "lifecycle": taskDetail?.task.lifecycle ?? "nil",
@@ -907,6 +1077,17 @@ final class NativeBridge: ObservableObject {
                 settingsMutationMessage = message ?? "Repository setting was rejected."
             }
         case .discoverModelsResult(let requestID, let providerID, let catalog, let error):
+            if modelCatalogDiscoveryGate.apply(requestID: requestID, providerID: providerID) {
+                if let catalog, catalog.providerId == providerID {
+                    modelCatalogs[providerID] = catalog
+                    modelDiscoveryFailures.removeValue(forKey: providerID)
+                } else {
+                    modelDiscoveryFailures[providerID] = error ?? NativeModelDiscoveryError(
+                        code: "invalid_response", message: "Provider returned invalid model data"
+                    )
+                }
+                return
+            }
             guard let role = modelDiscoveryGate.apply(
                 requestID: requestID,
                 providerID: providerID
@@ -945,9 +1126,13 @@ final class NativeBridge: ObservableObject {
         case .taskStartResult(let requestID, let accepted, let task, let message):
             guard submissionGate.complete(requestID: requestID) else { return }
             if accepted, let task {
+                if let selection = submittedConfigurations.removeValue(forKey: requestID)?.implementer {
+                    rememberUsedModel(selection)
+                }
                 applyActiveTask(task)
                 taskSubmission = .accepted(task)
             } else {
+                submittedConfigurations.removeValue(forKey: requestID)
                 taskSubmission = .rejected(message ?? "Task submission was rejected.")
             }
         case .unavailable(let message): availabilityMessage = String(message.prefix(240))
@@ -968,6 +1153,13 @@ final class NativeBridge: ObservableObject {
         activeTask = activeTaskUpdateGate.current
         if let taskID = update?.id, taskDetail?.task.id != taskID {
             loadTaskDetail(taskID: taskID)
+        }
+    }
+
+    private func rememberUsedModel(_ selection: APIProviderSelection) {
+        lastUsedModel = selection
+        if let data = try? JSONEncoder().encode(selection) {
+            UserDefaults.standard.set(data, forKey: Self.lastUsedModelKey)
         }
     }
 
@@ -1057,7 +1249,10 @@ final class NativeBridge: ObservableObject {
 
     private func resetUpdateGates() {
         modelDiscoveryGate = ModelDiscoveryGate()
+        modelCatalogDiscoveryGate = ModelCatalogDiscoveryGate()
         modelDiscovery = [:]
+        modelCatalogs = [:]
+        modelDiscoveryFailures = [:]
         attentionUpdateGate = AttentionUpdateGate()
         detailUpdateGate = DetailUpdateGate()
         statusUpdateGate = StatusUpdateGate()

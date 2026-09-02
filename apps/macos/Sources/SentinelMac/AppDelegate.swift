@@ -7,10 +7,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let bridge = NativeBridge()
     private var statusItem: NSStatusItem?
     private var quickPrompt: SentinelFloatingPanel?
-    private var attention: SentinelFloatingPanel?
     private var detailWindow: NSWindow?
     private var statusWindow: NSWindow?
     private var settingsWindow: NSWindow?
+    private var statusHasReceivedInitialPlacement = false
+    private var settingsHasReceivedInitialPlacement = false
+    private var taskDetailHasReceivedInitialPlacement = false
+    private var lastQuickPromptScreen: NSScreen?
     private var quickPromptMenuItem: NSMenuItem?
     private var surfaceRegistry = NativeSurfaceRegistry()
     private var previousApplicationFocus = PreviousApplicationFocus()
@@ -21,6 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var e2eQuickPromptLaunchCoordinator = E2EQuickPromptLaunchCoordinator()
     private var e2eQuickPromptBridgeSubscription: AnyCancellable?
     private var terminationGate = ApplicationTerminationGate()
+    private var doneStatusExpiresAt: Date?
+    private var doneStatusWorkItem: DispatchWorkItem?
 
     init(e2eQuickPromptLaunchConfiguration: E2EQuickPromptLaunchConfiguration = E2EQuickPromptLaunchConfiguration(), e2eApprovalLaunchConfiguration: E2EApprovalLaunchConfiguration = E2EApprovalLaunchConfiguration()) {
         self.e2eQuickPromptLaunchConfiguration = e2eQuickPromptLaunchConfiguration
@@ -30,6 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installMainMenu()
         bridge.start()
         installStatusItem()
         observeStatusItem()
@@ -41,12 +47,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         installGlobalShortcut()
         observeGlobalShortcut()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(attentionActionAccepted(_:)),
-            name: .sentinelAttentionActionAccepted,
-            object: nil
-        )
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(accessibilityDisplayOptionsChanged),
@@ -129,19 +129,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func installStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = codexTrayImage() ?? NSImage(systemSymbolName: "chevron.left.forwardslash.chevron.right", accessibilityDescription: "Codex")
+        item.button?.image = codexTrayImage() ?? NSImage(systemSymbolName: "sparkle", accessibilityDescription: "Sentinel")
         item.button?.image?.size = NSSize(width: 18, height: 18)
         item.button?.imagePosition = .imageLeft
         item.button?.title = "—"
-        item.button?.action = #selector(showQuickPrompt)
+        item.button?.action = #selector(showQuickPromptFromStatusItem)
         item.button?.target = self
         let menu = NSMenu()
-        let promptItem = menu.addItem(withTitle: "Quick Prompt", action: #selector(showQuickPrompt), keyEquivalent: "")
+        let promptItem = menu.addItem(withTitle: "Open Sentinel", action: #selector(showQuickPromptFromStatusItem), keyEquivalent: "")
         promptItem.target = self
         quickPromptMenuItem = promptItem
         let statusMenuItem = menu.addItem(withTitle: "Status", action: #selector(showStatus), keyEquivalent: "")
         statusMenuItem.target = self
-        let attentionMenuItem = menu.addItem(withTitle: "Attention", action: #selector(showAttention), keyEquivalent: "")
+        let attentionMenuItem = menu.addItem(withTitle: "Needs Attention", action: #selector(showAttention), keyEquivalent: "")
         attentionMenuItem.target = self
         let settingsMenuItem = menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",")
         settingsMenuItem.target = self
@@ -154,16 +154,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func observeStatusItem() {
-        bridge.$status
+        Publishers.CombineLatest(
+            Publishers.CombineLatest4(bridge.$status, bridge.$attention, bridge.$quickPromptPreferences, bridge.$modelCatalogs),
+            bridge.$lastUsedModel
+        )
             .receive(on: RunLoop.main)
-            .sink { [weak self] status in self?.updateStatusItem(status) }
+            .sink { [weak self] _ in self?.updateStatusItem() }
             .store(in: &bridgeSubscriptions)
     }
 
-    private func updateStatusItem(_ status: NativeStatus?) {
-        let title = CodexTrayTitle.make(status)
+    private func updateStatusItem() {
+        updateDoneCooldown()
+        let title = StatusBarPresentation.make(
+            status: bridge.status,
+            attention: bridge.attention,
+            idleTitle: bridge.usagePresentation.idleItem(preferred: bridge.preferredIdleModel),
+            showDone: doneStatusExpiresAt.map { $0 > Date() } ?? true
+        )
         statusItem?.button?.title = title
-        statusItem?.button?.toolTip = title == "—" ? "Codex usage unavailable" : "Codex usage \(title)"
+        statusItem?.button?.toolTip = title == "✦" ? "Sentinel" : title
+    }
+
+    private func updateDoneCooldown() {
+        let isDone = ["completed", "done", "complete"].contains(bridge.status?.activeTask?.lifecycle.lowercased() ?? "")
+        guard isDone else {
+            doneStatusExpiresAt = nil
+            doneStatusWorkItem?.cancel()
+            doneStatusWorkItem = nil
+            return
+        }
+        guard doneStatusExpiresAt == nil else { return }
+        doneStatusExpiresAt = Date().addingTimeInterval(2)
+        let work = DispatchWorkItem { [weak self] in self?.updateStatusItem() }
+        doneStatusWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -178,22 +202,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ].compactMap { $0 }
         return candidates.lazy.compactMap(NSImage.init(contentsOf:)).first.map { image in
             image.isTemplate = true
-            image.accessibilityDescription = "Codex"
+            image.accessibilityDescription = "Sentinel"
             return image
         }
     }
 
     private func installPanels() {
         _ = surfaceRegistry.requestOpen(.quickPrompt)
-        quickPrompt = SentinelFloatingPanel(title: "Quick Prompt", height: 470) {
-            QuickPromptView(bridge: self.bridge) { [weak self] in
-                self?.quickPrompt?.hide()
-            }
+        quickPrompt = SentinelFloatingPanel(title: "Sentinel", height: 76) {
+            QuickPromptView(
+                bridge: self.bridge,
+                accepted: { [weak self] in self?.quickPrompt?.hide() },
+                openTaskDetail: { [weak self] in self?.showTaskDetail() }
+            )
         }
-        _ = surfaceRegistry.requestOpen(.attention)
-        attention = SentinelFloatingPanel(title: "Sentinel") { AttentionWidgetView(bridge: self.bridge, openDetail: { self.showTaskDetail() }) }
         quickPrompt?.onHide = { [weak self] in self?.restorePreviousApplication() }
-        attention?.onHide = { [weak self] in self?.restorePreviousApplication() }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(resizeQuickPrompt(_:)),
+            name: .sentinelQuickPromptPreferredHeight,
+            object: nil
+        )
     }
 
     private func openQuickPromptForE2ELaunchIfRequested() {
@@ -223,14 +252,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func showQuickPrompt() { present(quickPrompt) }
-    @objc func showAttention() { present(attention) }
-    @objc private func attentionActionAccepted(_ notification: Notification) {
-        if notification.object as? Bool == true {
-            attention?.hide()
-        } else {
-            attention?.orderOut(nil)
-        }
+    @objc func showQuickPrompt() { present(quickPrompt, preferredScreen: contextualScreen()) }
+    @objc private func showQuickPromptFromStatusItem() {
+        present(quickPrompt, preferredScreen: statusItem?.button?.window?.screen ?? contextualScreen())
+    }
+    @objc private func resizeQuickPrompt(_ notification: Notification) {
+        guard let height = notification.object as? CGFloat else { return }
+        quickPrompt?.resizeForQuickPrompt(height: height)
+    }
+    @objc func showAttention() {
+        present(quickPrompt, preferredScreen: statusItem?.button?.window?.screen ?? contextualScreen())
+        NotificationCenter.default.post(name: .sentinelNeedsAttentionShown, object: nil)
     }
     @objc private func quit(_ sender: Any?) {
         // Go through AppKit so applicationShouldTerminate owns the one safe,
@@ -240,8 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func showStatus() {
         if statusWindow == nil {
-            _ = surfaceRegistry.requestOpen(.status)
-            statusWindow = NSWindow(
+            statusWindow = SentinelStatusWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
                 styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false
             )
@@ -250,6 +281,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusWindow?.contentView = NSHostingView(rootView: StatusView(bridge: bridge))
             configureInspectionWindow(statusWindow)
         }
+        // Status is a conventional utility window, not the menu-bar panel,
+        // but it must never inherit AppKit's `(0, 0)` creation origin.
+        placeStandardWindowIfNeeded(statusWindow, hasReceivedInitialPlacement: &statusHasReceivedInitialPlacement)
         statusWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -268,11 +302,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             )
             configureInspectionWindow(settingsWindow)
         }
+        placeStandardWindowIfNeeded(settingsWindow, hasReceivedInitialPlacement: &settingsHasReceivedInitialPlacement)
         settingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func present(_ panel: NSPanel?) {
+    private func present(_ panel: NSPanel?, preferredScreen: NSScreen? = nil) {
         guard let panel else { return }
         let frontmost = NSWorkspace.shared.frontmostApplication
         if !panel.isVisible {
@@ -280,7 +315,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 frontmost: frontmost,
                 sentinelPID: ProcessInfo.processInfo.processIdentifier
             )
-            place(panel: panel)
+            place(panel: panel, preferredScreen: preferredScreen)
+        } else if panel === quickPrompt, let preferredScreen,
+                  panel.screen !== preferredScreen {
+            // Reuse the one production panel, but follow an invocation from a
+            // different display rather than leaving the utility stranded.
+            place(panel: panel, preferredScreen: preferredScreen)
         }
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -299,18 +339,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         application.activate(options: [])
     }
 
-    private func place(panel: NSPanel) {
-        let preferred = NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame ?? panel.frame
+    private func contextualScreen() -> NSScreen? {
+        if let activeScreen = frontmostApplicationScreen() { return activeScreen }
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first(where: { $0.frame.contains(mouse) })
+            ?? lastQuickPromptScreen.flatMap { screen in NSScreen.screens.contains(screen) ? screen : nil }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+    }
+
+    /// AppKit does not expose other apps' key windows. Window Server metadata
+    /// gives us a best-effort active-window rectangle; permission or a missing
+    /// rectangle simply falls through to the pointer screen below.
+    private func frontmostApplicationScreen() -> NSScreen? {
+        guard let process = NSWorkspace.shared.frontmostApplication else { return nil }
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        guard let boundsValue = windows.first(where: {
+            ($0[kCGWindowOwnerPID as String] as? pid_t) == process.processIdentifier
+                && ($0[kCGWindowLayer as String] as? Int ?? 1) == 0
+        })?[kCGWindowBounds as String] else { return nil }
+        let bounds = boundsValue as! CFDictionary
+        guard let windowFrame = CGRect(dictionaryRepresentation: bounds) else { return nil }
+        return NSScreen.screens.max { lhs, rhs in
+            lhs.frame.intersection(windowFrame).area < rhs.frame.intersection(windowFrame).area
+        }
+    }
+
+    private func place(panel: NSPanel, preferredScreen: NSScreen? = nil) {
+        let preferred = preferredScreen?.visibleFrame
+            ?? contextualScreen()?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSScreen.screens.first?.visibleFrame
+            ?? panel.frame
         let visible = NSScreen.screens.map(\.visibleFrame)
-        if let floating = panel as? SentinelFloatingPanel, !floating.hasBeenPresented {
-            panel.setFrame(FloatingPanelPlacement.centeredFrame(size: panel.frame.size, preferred: preferred), display: false)
+        if let floating = panel as? SentinelFloatingPanel, panel === quickPrompt {
+            panel.setFrame(FloatingPanelPlacement.topRightFrame(size: panel.frame.size, preferred: preferred), display: false)
             floating.markPresented()
+            lastQuickPromptScreen = preferredScreen
+                ?? NSScreen.screens.first(where: { $0.visibleFrame == preferred })
             return
         }
         if visible.contains(where: { $0.intersects(panel.frame) }) {
             return
         }
         panel.setFrame(FloatingPanelPlacement.correctedFrame(panel.frame, visibleFrames: visible, preferred: preferred), display: false)
+    }
+
+    private func placeStandardWindowIfNeeded(
+        _ window: NSWindow?,
+        hasReceivedInitialPlacement: inout Bool
+    ) {
+        guard let window else { return }
+        // An AppKit-created window can retain its literal `(0, 0)` creation
+        // origin if presentation races activation. Treat only that fallback as
+        // unplaced; otherwise retain the position the person chose.
+        let needsPlacement = !hasReceivedInitialPlacement || window.frame.origin == .zero
+        guard needsPlacement else { return }
+        let preferred = contextualScreen()?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? window.screen?.visibleFrame
+            ?? window.frame
+        window.setFrame(NativeWindowPlacement.initialFrame(size: window.frame.size, preferred: preferred), display: false)
+        hasReceivedInitialPlacement = true
     }
 
     func showTaskDetail() {
@@ -327,6 +418,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             configureInspectionWindow(detailWindow)
             bridge.traceE2E("task-detail.presentation.created", fields: ["windows": String(NSApp.windows.count)])
         }
+        placeStandardWindowIfNeeded(detailWindow, hasReceivedInitialPlacement: &taskDetailHasReceivedInitialPlacement)
         detailWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         bridge.traceE2E("task-detail.presentation.ordered", fields: [
@@ -347,15 +439,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         shortcutController.$current
             .receive(on: RunLoop.main)
             .sink { [weak self] shortcut in
-                self?.quickPromptMenuItem?.title = "Quick Prompt  \(shortcut.displayName)"
+                self?.quickPromptMenuItem?.title = "Open Sentinel  \(shortcut.displayName)"
             }
             .store(in: &bridgeSubscriptions)
     }
 
+
+    /// Accessory apps get no main menu, which kills every keyboard equivalent
+    /// that AppKit routes through the menu system (⌘W in particular). Install
+    /// a hidden one so window-close keys reach `performClose(_:)` on the key
+    /// window; panels hide through their `close()` override.
+    private func installMainMenu() {
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(
+            withTitle: "Close",
+            action: #selector(NSWindow.performClose(_:)),
+            keyEquivalent: "w"
+        )
+        let windowMenuItem = NSMenuItem()
+        windowMenuItem.submenu = windowMenu
+        let mainMenu = NSMenu()
+        mainMenu.addItem(windowMenuItem)
+        NSApp.mainMenu = mainMenu
+    }
     private func configureInspectionWindow(_ window: NSWindow?) {
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         window?.isOpaque = reduceTransparency
-        window?.backgroundColor = reduceTransparency ? .windowBackgroundColor : .clear
+        // A fully clear background on a non-opaque window makes every
+        // zero-alpha pixel click-through — including the titlebar, where the
+        // traffic lights live, so the close button stopped responding to real
+        // clicks. Keep alpha barely above zero instead of zero.
+        window?.backgroundColor = reduceTransparency
+            ? .windowBackgroundColor
+            : NSColor.black.withAlphaComponent(0.02)
         window?.titlebarAppearsTransparent = true
         window?.titlebarSeparatorStyle = .none
     }
@@ -364,5 +480,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureInspectionWindow(detailWindow)
         configureInspectionWindow(statusWindow)
         configureInspectionWindow(settingsWindow)
+    }
+}
+
+private extension NSRect {
+    var area: CGFloat { max(0, width) * max(0, height) }
+}
+
+/// Plain `NSWindow`s ignore Esc (`cancelOperation` does nothing), so the
+/// status surface would stay open while the Quick Prompt panel closes. Mirror
+/// the panel behavior: Esc dismisses.
+final class SentinelStatusWindow: NSWindow {
+    override func cancelOperation(_ sender: Any?) {
+        close()
     }
 }

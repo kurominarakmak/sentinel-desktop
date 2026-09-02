@@ -198,27 +198,150 @@ struct PreviousApplicationFocus {
 }
 
 enum FloatingPanelPlacement {
-    static func centeredFrame(size: NSSize, preferred: NSRect) -> NSRect {
-        let size = NSSize(width: min(size.width, preferred.width), height: min(size.height, preferred.height))
+    static let edgeInset: CGFloat = 18
+    static let topInset: CGFloat = 12
+
+    /// `visibleFrame` already excludes the menu bar and Dock. Anchor from its
+    /// top-right so a compact utility panel grows down rather than around a
+    /// center point.
+    static func topRightFrame(size: NSSize, preferred: NSRect) -> NSRect {
+        let size = NSSize(
+            width: min(size.width, max(0, preferred.width - edgeInset * 2)),
+            height: min(size.height, max(0, preferred.height - topInset - edgeInset))
+        )
         return NSRect(
-            x: preferred.midX - size.width / 2,
-            y: preferred.midY - size.height / 2,
+            x: preferred.maxX - edgeInset - size.width,
+            y: preferred.maxY - topInset - size.height,
             width: size.width,
             height: size.height
         )
     }
 
     static func correctedFrame(_ frame: NSRect, visibleFrames: [NSRect], preferred: NSRect) -> NSRect {
-        guard !visibleFrames.contains(where: { $0.intersects(frame) }) else { return frame }
-        return centeredFrame(size: frame.size, preferred: preferred)
+        guard visibleFrames.contains(where: { $0.contains(frame) }) else {
+            return topRightFrame(size: frame.size, preferred: preferred)
+        }
+        return frame
+    }
+
+    static func resizedFrameKeepingTop(_ frame: NSRect, height: CGFloat) -> NSRect {
+        var resized = frame
+        resized.origin.y = frame.maxY - height
+        resized.size.height = height
+        return resized
     }
 }
 
-enum CodexTrayTitle {
-    static func make(_ status: NativeStatus?) -> String {
-        guard let usedPercent = status?.codex.rateLimits?["primary"]?.usedPercent,
-              (0...100).contains(usedPercent) else { return "—" }
-        return String(format: "%.0f%%", usedPercent)
+/// Standard document/settings windows deliberately use a different policy
+/// from the menu-bar assistant. Their initial placement is centered on the
+/// relevant screen; AppKit retains the user-moved frame afterwards.
+enum NativeWindowPlacement {
+    static func initialFrame(size: NSSize, preferred: NSRect) -> NSRect {
+        let fittingSize = NSSize(
+            width: min(size.width, preferred.width),
+            height: min(size.height, preferred.height)
+        )
+        return NSRect(
+            x: preferred.midX - fittingSize.width / 2,
+            y: preferred.midY - fittingSize.height / 2,
+            width: fittingSize.width,
+            height: fittingSize.height
+        )
+    }
+}
+
+/// Maps already-durable attention state to concise user-facing language. It
+/// has no authority to alter the task, approval actions, or recovery policy.
+enum NeedsAttentionPresentation {
+    static func stateLabel(_ attention: NativeAttention) -> String {
+        if attention.task.isReadyForHuman || attention.actions.approve { return "Ready for approval" }
+        if attention.task.recoveryRequired { return "Recovery required" }
+        if attention.displayState.lowercased().contains("blocked") || attention.task.lifecycle == "blocked" { return "Blocked" }
+        return attention.displayState.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    static func opensExistingTaskDetail(taskID: String) -> String { taskID }
+}
+
+/// A model-first, provider-neutral view of runtime telemetry.  It never
+/// guesses a provider from a model name and never turns unrelated activity
+/// into usage.
+struct ModelUsagePresentation: Equatable {
+    struct Row: Identifiable, Equatable {
+        let model: NativeProviderModel
+        let usage: ModelUsageStatus?
+        var id: String { model.id }
+        var label: String { model.label }
+        var detail: String {
+            usage?.percentageLabel
+                ?? (usage?.usageCapability == "authentication_required" ? "Authentication required" : "Usage unavailable")
+        }
+    }
+
+    let rows: [Row]
+    let sharedQuotas: [ModelUsageStatus]
+
+    static func make(
+        catalogs: [String: NativeProviderModelCatalog],
+        selections: [APIProviderSelection],
+        usage: [ModelUsageStatus]
+    ) -> ModelUsagePresentation {
+        var models = Dictionary(uniqueKeysWithValues: catalogs.values.flatMap(\.models).map { ($0.id, $0) })
+        for selection in selections where models["\(selection.providerId):\(selection.modelId)"] == nil {
+            models["\(selection.providerId):\(selection.modelId)"] = NativeProviderModel(
+                providerId: selection.providerId, modelId: selection.modelId, displayName: nil,
+                supportedReasoningEfforts: [], defaultReasoningEffort: nil, isDefault: false, availability: "available"
+            )
+        }
+        let rows = models.values.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }.map { model in
+            Row(model: model, usage: usage.first { $0.granularity == .model && $0.providerId == model.providerId && $0.modelId == model.modelId })
+        }
+        return ModelUsagePresentation(rows: rows, sharedQuotas: usage.filter { $0.granularity == .providerAccount })
+    }
+
+    func idleItem(preferred: APIProviderSelection?) -> String? {
+        guard let preferred else { return nil }
+        let row = rows.first { $0.model.providerId == preferred.providerId && $0.model.modelId == preferred.modelId }
+        let source = usageForIdle(preferred)
+        if let source, source.granularity == .providerAccount {
+            if let percent = source.percentageLabel { return "✦ \(source.providerDisplayName) \(percent)" }
+            if source.availability == "available" { return "✦ \(source.providerDisplayName) Ready" }
+            return "✦ \(source.providerDisplayName)"
+        }
+        let name = row?.label ?? source?.modelDisplayName ?? source?.providerDisplayName
+        guard let name else { return nil }
+        if let percent = source?.percentageLabel {
+            return "✦ \(name) \(percent)"
+        }
+        if source?.availability == "available" { return "✦ \(name) Ready" }
+        return "✦ \(name)"
+    }
+
+    private func usageForIdle(_ selection: APIProviderSelection) -> ModelUsageStatus? {
+        if let exact = rows.first(where: { $0.model.providerId == selection.providerId && $0.model.modelId == selection.modelId })?.usage { return exact }
+        // A shared account quota is allowed in the compact item only when it
+        // is the actual provider quota, never copied onto each of its models.
+        return sharedQuotas.first { $0.providerId == selection.providerId }
+    }
+}
+
+enum StatusBarPresentation {
+    static func make(status: NativeStatus?, attention: NativeAttention?, idleTitle: String?, showDone: Bool = true) -> String {
+        guard let status else { return "✦" }
+        if status.recoveryRequired || status.activeTask?.lifecycle == "blocked" || attention?.task.recoveryRequired == true { return "✦ Attention" }
+        if attention?.actions.approve == true || status.activeTask?.isReadyForHuman == true { return "✦ Approval" }
+        if let task = status.activeTask {
+            switch task.lifecycle.lowercased() {
+            case "validating": return "✦ Testing…"
+            case "reviewing": return "✦ Reviewing…"
+            case "repairing": return "✦ Repairing…"
+            case "integrating": return "✦ Integrating…"
+            case "completed", "done", "complete": return showDone ? "✦ Done" : (idleTitle ?? "✦")
+            case "implementing", "editing": return "✦ Editing…"
+            default: return "✦ Working…"
+            }
+        }
+        return idleTitle ?? "✦"
     }
 }
 

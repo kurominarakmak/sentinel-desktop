@@ -44,4 +44,19 @@ final class SentinelFloatingPanel: NSPanel {
     }
 
     func markPresented() { hasBeenPresented = true }
+
+    func resizeForQuickPrompt(height: CGFloat) {
+        let newHeight = min(max(height, 76), 480)
+        guard abs(frame.height - newHeight) > 1 else { return }
+        let next = FloatingPanelPlacement.resizedFrameKeepingTop(frame, height: newHeight)
+        let changes = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? false : true
+        if changes {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                animator().setFrame(next, display: true)
+            }
+        } else {
+            setFrame(next, display: true)
+        }
+    }
 }

@@ -3,11 +3,14 @@ import SwiftUI
 
 extension Notification.Name {
     static let sentinelQuickPromptShown = Notification.Name("sentinelQuickPromptShown")
+    static let sentinelQuickPromptPreferredHeight = Notification.Name("sentinelQuickPromptPreferredHeight")
+    static let sentinelNeedsAttentionShown = Notification.Name("sentinelNeedsAttentionShown")
 }
 
 struct QuickPromptView: View {
     @ObservedObject var bridge: NativeBridge
     let accepted: () -> Void
+    let openTaskDetail: () -> Void
     @State private var prompt = ""
     @State private var implementerProvider = ""
     @State private var implementerModel = ""
@@ -16,7 +19,16 @@ struct QuickPromptView: View {
     @State private var reviewerEffort = ""
     @State private var workflowMode = NativeWorkflowMode.manual
     @State private var restored = false
+    @State private var advancedOptionsShown = false
     @FocusState private var promptFocused: Bool
+
+    private var expanded: Bool {
+        advancedOptionsShown || bridge.activeTask != nil || bridge.attention != nil || !prompt.isEmpty || feedback != nil
+    }
+
+    private var unifiedModels: [UnifiedModelOption] {
+        UnifiedModelOption.make(catalogs: bridge.modelCatalogs)
+    }
 
     private var sending: Bool {
         if case .sending = bridge.taskSubmission { return true }
@@ -33,8 +45,8 @@ struct QuickPromptView: View {
     }
 
     private var configuration: NativeTaskConfiguration? {
-        guard model(providerID: implementerProvider, modelID: implementerModel, role: .implementer) != nil,
-              let reviewer = model(providerID: reviewerProvider, modelID: reviewerModel, role: .reviewer)
+        guard model(providerID: implementerProvider, modelID: implementerModel) != nil,
+              let reviewer = model(providerID: reviewerProvider, modelID: reviewerModel)
         else { return nil }
         let effort: String?
         if reviewer.supportedReasoningEfforts.isEmpty {
@@ -60,79 +72,10 @@ struct QuickPromptView: View {
     var body: some View {
         SentinelPanel(style: .floating) {
             VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
-                HStack { ProviderBadge(provider: "Sentinel"); Spacer(); Text("Quick Prompt").font(.headline) }
-                if let repository = bridge.repositoryContext {
-                    Label(repository, systemImage: "folder").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                } else {
-                    Text("Repository unavailable").font(.caption).foregroundStyle(.orange)
-                }
-                TextField("Describe a task…", text: $prompt, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(3...6)
-                    .focused($promptFocused)
-                    .onSubmit(send)
-                selectionSection(
-                    title: "Implementer",
-                    role: .implementer,
-                    providerID: implementerProvider,
-                    modelID: implementerModel
-                )
-                selectionSection(
-                    title: "Reviewer",
-                    role: .reviewer,
-                    providerID: reviewerProvider,
-                    modelID: reviewerModel
-                )
-                if let reviewer = model(
-                    providerID: reviewerProvider,
-                    modelID: reviewerModel,
-                    role: .reviewer
-                ), !reviewer.supportedReasoningEfforts.isEmpty {
-                    HStack(spacing: SentinelTokens.compactSpacing) {
-                        Text("Reasoning").font(.caption).foregroundStyle(.secondary)
-                            .frame(width: 76, alignment: .leading)
-                        Picker("Reviewer reasoning effort", selection: Binding(
-                            get: { reviewerEffort },
-                            set: { reviewerEffort = $0; persistIfValid() }
-                        )) {
-                            ForEach(reviewer.supportedReasoningEfforts, id: \.self) { effort in
-                                Text(effort.capitalized).tag(effort)
-                            }
-                        }
-                        .labelsHidden()
-                        .disabled(sending)
-                    }
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("Workflow").font(.caption.weight(.semibold))
-                    Picker("Workflow", selection: Binding(
-                        get: { workflowMode },
-                        set: { workflowMode = $0; persistIfValid() }
-                    )) {
-                        Text("Manual").tag(NativeWorkflowMode.manual)
-                        Text("Auto Integrate").tag(NativeWorkflowMode.autoIntegrate)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .disabled(sending)
-                    Text(workflowMode == .manual
-                         ? "Stops for your approval before finalizing changes."
-                         : "Automatically applies verified changes to the selected local branch after validation and a clean review. No automatic push.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                HStack {
-                    Text("⌘↩ run · Esc hide")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer()
-                    Button(sending ? "Starting…" : "Run Task", action: send)
-                        .keyboardShortcut(.return, modifiers: .command)
-                        .sentinelPrimaryButtonStyle()
-                        .disabled(sending || bridge.repositoryContext == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || configuration == nil)
-                }
+                if expanded { conversationHeader }
+                composer
+                workflowControl
+                if expanded { expandedContent }
                 if let feedback {
                     if sending {
                         Text(feedback).font(.caption).foregroundStyle(.secondary).accessibilityLabel(feedback)
@@ -146,22 +89,161 @@ struct QuickPromptView: View {
         .onAppear {
             promptFocused = true
             restoreSelectionsIfPossible()
+            publishPreferredHeight()
         }
         .onReceive(NotificationCenter.default.publisher(for: .sentinelQuickPromptShown)) { _ in
             promptFocused = true
             refreshMissingCatalogs()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .sentinelNeedsAttentionShown)) { _ in
+            promptFocused = true
+        }
         .onChange(of: bridge.providers) { _, _ in
             restoreSelectionsIfPossible()
         }
-        .onChange(of: bridge.modelDiscovery) { _, _ in
+        .onChange(of: bridge.modelCatalogs) { _, _ in
             reconcileDiscoveries()
         }
+        .onChange(of: expanded) { _, _ in publishPreferredHeight() }
         .onChange(of: bridge.taskSubmission) { _, state in
             if case .accepted = state {
                 prompt = ""
                 accepted()
             }
+        }
+    }
+
+    private var composer: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: "sparkle").foregroundStyle(.secondary).accessibilityHidden(true)
+            TextField("Ask Sentinel anything…", text: $prompt, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(expanded ? 1...4 : 1...2)
+                .focused($promptFocused)
+                .onSubmit(send)
+                .accessibilityLabel("Task prompt")
+            modelMenu
+            Button(action: send) {
+                Image(systemName: sending ? "clock" : "arrow.up.circle.fill")
+                    .imageScale(.large)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(sending ? "Starting task" : "Run task")
+            .disabled(sending || bridge.repositoryContext == nil || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || configuration == nil)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var conversationHeader: some View {
+        HStack {
+            Label("Sentinel", systemImage: "sparkle").font(.headline)
+            Spacer()
+            if let task = bridge.activeTask { StateBadge(state: progressMessage(for: task.lifecycle)) }
+            Button { advancedOptionsShown.toggle() } label: { Image(systemName: "slider.horizontal.3") }
+                .buttonStyle(.borderless).help("Task options").accessibilityLabel("Task options")
+        }
+    }
+
+    @ViewBuilder private var expandedContent: some View {
+        if let task = bridge.activeTask {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(task.summary).font(.subheadline.weight(.medium)).lineLimit(2)
+                Label(progressMessage(for: task.lifecycle), systemImage: "circle.dotted")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        if let attention = bridge.attention { needsAttention(attention) }
+        if advancedOptionsShown { advancedOptions }
+    }
+
+    private var workflowControl: some View {
+        HStack(spacing: SentinelTokens.compactSpacing) {
+            workflowMenu
+            Spacer()
+            Text("⌘↩ Run · Esc Dismiss")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 4)
+    }
+
+    private func needsAttention(_ attention: NativeAttention) -> some View {
+        Button(action: openTaskDetail) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Label("Needs Attention", systemImage: "exclamationmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    StateBadge(state: NeedsAttentionPresentation.stateLabel(attention))
+                }
+                Text(attention.task.summary).font(.subheadline.weight(.medium)).lineLimit(2)
+                Text(attentionDetail(attention)).font(.caption).foregroundStyle(.secondary).lineLimit(2)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(8)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Needs Attention: \(NeedsAttentionPresentation.stateLabel(attention)). Open task detail for \(attention.task.summary)")
+        .help("Open Task Detail")
+    }
+
+    private func attentionDetail(_ attention: NativeAttention) -> String {
+        attention.task.recoveryReason?.replacingOccurrences(of: "_", with: " ")
+            ?? attention.review
+            ?? attention.activity?.replacingOccurrences(of: "_", with: " ")
+            ?? "Open Task Detail to review the durable task state."
+    }
+
+    private var modelMenu: some View {
+        Menu {
+            ForEach(unifiedModels) { option in
+                Button(option.presentationName) { selectImplementer(option.model) }
+            }
+            if unifiedModels.isEmpty { Text("Loading available models…") }
+            Divider()
+            Button("Refresh Models") { refreshCatalogs() }
+        } label: {
+            HStack(spacing: 3) {
+                Text(selectedImplementerLabel).lineLimit(1)
+                Image(systemName: "chevron.down").font(.caption2)
+            }.font(.caption)
+        }
+        .menuStyle(.borderlessButton).disabled(sending)
+        .accessibilityLabel("Implementation model: \(selectedImplementerLabel)")
+    }
+
+    private var workflowMenu: some View {
+        Menu {
+            Button("Direct Edit — Edits this repository immediately") { workflowMode = .directEdit; persistIfValid() }
+            Button("Manual — Review before finalizing") { workflowMode = .manual; persistIfValid() }
+            Button("Auto Integrate — Integrate after validation and review") { workflowMode = .autoIntegrate; persistIfValid() }
+        } label: {
+            Label(workflowLabel, systemImage: "arrow.triangle.branch")
+                .font(.caption)
+        }
+        .menuStyle(.borderlessButton).disabled(sending)
+        .accessibilityLabel("Workflow: \(workflowLabel)")
+    }
+
+    private var advancedOptions: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Divider()
+            Text("Task options").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            HStack {
+                Text("Reviewer").font(.caption)
+                Spacer()
+                Menu(selectedReviewerLabel) {
+                    ForEach(unifiedModels) { option in Button(option.presentationName) { selectReviewer(option.model) } }
+                }.menuStyle(.borderlessButton).font(.caption)
+            }
+            if let reviewer = model(providerID: reviewerProvider, modelID: reviewerModel), !reviewer.supportedReasoningEfforts.isEmpty {
+                Picker("Reviewer reasoning", selection: Binding(get: { reviewerEffort }, set: { reviewerEffort = $0; persistIfValid() })) {
+                    ForEach(reviewer.supportedReasoningEfforts, id: \.self) { Text($0.capitalized).tag($0) }
+                }.pickerStyle(.menu).font(.caption).disabled(sending)
+            }
+            if let repository = bridge.repositoryContext { Label(repository, systemImage: "folder").font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
         }
     }
 
@@ -172,91 +254,6 @@ struct QuickPromptView: View {
             summary: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
             prompt: prompt
         )
-    }
-
-    @ViewBuilder
-    private func selectionSection(
-        title: String,
-        role: QuickPromptRole,
-        providerID: String,
-        modelID: String
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.caption.weight(.semibold))
-            HStack(spacing: SentinelTokens.compactSpacing) {
-                Picker("\(title) provider", selection: Binding(
-                    get: { providerID },
-                    set: { selectProvider($0, role: role) }
-                )) {
-                    ForEach(bridge.providers) { capability in
-                        Text(capability.label).tag(capability.id).disabled(!capability.available)
-                    }
-                }
-                .labelsHidden()
-                .disabled(sending)
-                modelPicker(title: title, role: role, providerID: providerID, modelID: modelID)
-                Button {
-                    bridge.discoverModels(providerID: providerID, role: role)
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .disabled(sending || providerID.isEmpty)
-                .help("Refresh \(title.lowercased()) models")
-                .accessibilityLabel("Refresh \(title.lowercased()) models")
-            }
-            discoveryStatus(role: role, providerID: providerID, modelID: modelID)
-        }
-    }
-
-    @ViewBuilder
-    private func modelPicker(
-        title: String,
-        role: QuickPromptRole,
-        providerID: String,
-        modelID: String
-    ) -> some View {
-        let models = catalog(role: role, providerID: providerID)?.models ?? []
-        Picker("\(title) model", selection: Binding(
-            get: { modelID },
-            set: { selectModel($0, role: role) }
-        )) {
-            if !modelID.isEmpty && !models.contains(where: { $0.modelId == modelID && $0.available }) {
-                Text("\(modelID) (Unavailable)").tag(modelID)
-            }
-            ForEach(models.filter(\.available)) { model in
-                Text(model.label).tag(model.modelId)
-            }
-        }
-        .labelsHidden()
-        .disabled(sending || models.isEmpty)
-        .frame(maxWidth: .infinity)
-    }
-
-    @ViewBuilder
-    private func discoveryStatus(role: QuickPromptRole, providerID: String, modelID: String) -> some View {
-        switch bridge.modelDiscovery[role] ?? .idle {
-        case .idle:
-            EmptyView()
-        case .loading(let loadingProvider) where loadingProvider == providerID:
-            Label("Loading models…", systemImage: "progress.indicator")
-                .font(.caption2).foregroundStyle(.secondary)
-        case .loaded(let catalog) where catalog.providerId == providerID && catalog.models.isEmpty:
-            Text("No models available").font(.caption2).foregroundStyle(.orange)
-        case .loaded(let catalog) where catalog.providerId == providerID:
-            if !modelID.isEmpty && !catalog.models.contains(where: { $0.modelId == modelID && $0.available }) {
-                Text("Selected model is unavailable. Refresh or choose another model.")
-                    .font(.caption2).foregroundStyle(.orange)
-            } else if catalog.discoveryKind == "current_configuration" {
-                Text("Enumeration unsupported; using Claude Code's current/default configuration.")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
-        case .failed(let failedProvider, let code, let message) where failedProvider == providerID:
-            Text(code == "authentication_required" ? "Authentication required" : message)
-                .font(.caption2).foregroundStyle(.orange)
-        default:
-            EmptyView()
-        }
     }
 
     private func restoreSelectionsIfPossible() {
@@ -285,54 +282,35 @@ struct QuickPromptView: View {
 
     private func refreshMissingCatalogs() {
         guard restored else { return }
-        if !implementerProvider.isEmpty {
-            bridge.discoverModels(providerID: implementerProvider, role: .implementer)
-        }
-        if !reviewerProvider.isEmpty {
-            bridge.discoverModels(providerID: reviewerProvider, role: .reviewer)
-        }
+        refreshCatalogs()
     }
 
-    private func selectProvider(_ providerID: String, role: QuickPromptRole) {
-        switch role {
-        case .implementer:
-            implementerProvider = providerID
-            implementerModel = ""
-        case .reviewer:
-            reviewerProvider = providerID
-            reviewerModel = ""
-            reviewerEffort = ""
-        }
-        bridge.discoverModels(providerID: providerID, role: role)
+    private func refreshCatalogs() {
+        bridge.providers.filter(\.available).forEach { bridge.discoverModels(providerID: $0.id) }
     }
 
-    private func selectModel(_ modelID: String, role: QuickPromptRole) {
-        switch role {
-        case .implementer:
-            implementerModel = modelID
-        case .reviewer:
-            reviewerModel = modelID
-            if let model = model(providerID: reviewerProvider, modelID: modelID, role: .reviewer) {
-                reviewerEffort = ReviewerEffortSelection.reconciled(
-                    current: reviewerEffort,
-                    for: model
-                )
-            } else {
-                reviewerEffort = ""
-            }
-        }
+    private func selectImplementer(_ model: NativeProviderModel) {
+        implementerProvider = model.providerId
+        implementerModel = model.modelId
+        persistIfValid()
+    }
+
+    private func selectReviewer(_ model: NativeProviderModel) {
+        reviewerProvider = model.providerId
+        reviewerModel = model.modelId
+        reviewerEffort = ReviewerEffortSelection.reconciled(current: reviewerEffort, for: model)
         persistIfValid()
     }
 
     private func reconcileDiscoveries() {
         if implementerModel.isEmpty,
-           let catalog = catalog(role: .implementer, providerID: implementerProvider),
+           let catalog = bridge.modelCatalogs[implementerProvider],
            let selected = catalog.models.first(where: { $0.available && $0.isDefault })
                 ?? catalog.models.first(where: \.available) {
             implementerModel = selected.modelId
         }
         if reviewerModel.isEmpty,
-           let catalog = catalog(role: .reviewer, providerID: reviewerProvider),
+           let catalog = bridge.modelCatalogs[reviewerProvider],
            let selected = catalog.models.first(where: { $0.available && $0.isDefault })
                 ?? catalog.models.first(where: \.available) {
             reviewerModel = selected.modelId
@@ -340,8 +318,7 @@ struct QuickPromptView: View {
                 ?? ""
         } else if let selected = model(
             providerID: reviewerProvider,
-            modelID: reviewerModel,
-            role: .reviewer
+            modelID: reviewerModel
         ) {
             reviewerEffort = ReviewerEffortSelection.reconciled(
                 current: reviewerEffort,
@@ -360,23 +337,52 @@ struct QuickPromptView: View {
         ))
     }
 
-    private func catalog(role: QuickPromptRole, providerID: String) -> NativeProviderModelCatalog? {
-        guard case .loaded(let catalog) = bridge.modelDiscovery[role],
-              catalog.providerId == providerID else { return nil }
-        return catalog
-    }
-
     private func model(
         providerID: String,
-        modelID: String,
-        role: QuickPromptRole
+        modelID: String
     ) -> NativeProviderModel? {
         guard bridge.providers.first(where: { $0.id == providerID })?.available == true else {
             return nil
         }
         return QuickPromptSelectionValidation.availableModel(
             modelID: modelID,
-            catalog: catalog(role: role, providerID: providerID)
+            catalog: bridge.modelCatalogs[providerID]
+        )
+    }
+
+    private var selectedImplementerLabel: String {
+        unifiedModels.first { $0.model.providerId == implementerProvider && $0.model.modelId == implementerModel }?.presentationName ?? "Choose model"
+    }
+
+    private var selectedReviewerLabel: String {
+        unifiedModels.first { $0.model.providerId == reviewerProvider && $0.model.modelId == reviewerModel }?.presentationName ?? "Choose reviewer"
+    }
+
+    private var workflowLabel: String {
+        switch workflowMode {
+        case .directEdit: return "Direct Edit"
+        case .manual: return "Manual"
+        case .autoIntegrate: return "Auto Integrate"
+        }
+    }
+
+    private func progressMessage(for lifecycle: String) -> String {
+        switch lifecycle.lowercased() {
+        case "implementing": return "Editing changes…"
+        case "validating": return "Running validation…"
+        case "reviewing": return "Reviewing changes…"
+        case "repairing": return "Repairing review finding…"
+        case "readyforhuman": return "Ready for approval"
+        case "integrated": return "Integrated"
+        case "blocked": return "Blocked"
+        default: return lifecycle.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    private func publishPreferredHeight() {
+        NotificationCenter.default.post(
+            name: .sentinelQuickPromptPreferredHeight,
+            object: CGFloat(expanded ? 410 : 76)
         )
     }
 }
@@ -461,9 +467,11 @@ struct TaskDetailView: View {
                         section("Activity", id: "activity") { activity(detail.activity) }
                         section("Changes", id: "changes") { changes(detail) }
                         section("Validation · deterministic", id: "validation") { validations(detail.validations) }
-                        section("Review · model findings", id: "review") { review(detail.findings) }
-                        section("Repair History", id: "repair") { repairs(detail) }
-                        section("Final Approval", id: "approval") { approval(detail) }
+                        if detail.configuration?.workflowMode != .directEdit {
+                            section("Review · model findings", id: "review") { review(detail.findings) }
+                            section("Repair History", id: "repair") { repairs(detail) }
+                            section("Final Approval", id: "approval") { approval(detail) }
+                        }
                     }
                 } else {
                     VStack(alignment: .leading, spacing: SentinelTokens.spacing) {
@@ -504,21 +512,24 @@ struct TaskDetailView: View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
             GridRow {
                 Text("Implementer").foregroundStyle(.secondary)
-                Text("\(providerName(configuration.implementer.providerId)) · \(configuration.implementer.modelId)")
+                Text(configuration.implementer.modelId)
                     .lineLimit(1)
             }
             GridRow {
                 Text("Reviewer").foregroundStyle(.secondary)
                 Text([
-                    providerName(configuration.reviewer.providerId),
                     configuration.reviewer.modelId,
                     configuration.reviewer.reasoningEffort,
                 ].compactMap { $0 }.joined(separator: " · "))
                     .lineLimit(1)
             }
+            DisclosureGroup("Execution details") {
+                Text("Implementer: \(providerName(configuration.implementer.providerId)) · \(configuration.implementer.modelId)\nReviewer: \(providerName(configuration.reviewer.providerId)) · \(configuration.reviewer.modelId)")
+                    .font(.caption.monospaced()).textSelection(.enabled)
+            }
             GridRow {
                 Text("Workflow").foregroundStyle(.secondary)
-                Text(configuration.workflowMode == .manual ? "Manual" : "Auto Integrate")
+                Text(workflowLabel(configuration.workflowMode))
             }
         }
         .font(.caption)
@@ -530,6 +541,14 @@ struct TaskDetailView: View {
         case "claude_code": return "Claude Code"
         case "codex": return "Codex"
         default: return providerID
+        }
+    }
+
+    private func workflowLabel(_ mode: NativeWorkflowMode) -> String {
+        switch mode {
+        case .directEdit: return "Direct Edit"
+        case .manual: return "Manual"
+        case .autoIntegrate: return "Auto Integrate"
         }
     }
 
@@ -558,6 +577,12 @@ struct TaskDetailView: View {
 
     private func changes(_ detail: NativeTaskDetail) -> some View {
         VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
+            if let summary = detail.directEditChangeSummary {
+                Text("Changes in the primary repository").font(.caption.weight(.semibold))
+                DisclosureGroup("Direct Edit change summary") {
+                    Text(summary).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
+                }
+            }
             if let worktree = detail.worktree { Text("\(worktree.path) · \(worktree.state)").font(.caption).textSelection(.enabled) }
             if let diff = detail.diff {
                 Text("Target \(diff.targetBranch) · \(diff.mergeReady ? "merge ready" : "not merge ready")\(diff.targetAdvanced ? " · target advanced" : "")").font(.caption)
@@ -569,7 +594,9 @@ struct TaskDetailView: View {
                         Text(diff.conflicts).font(.caption.monospaced()).textSelection(.enabled).sentinelEvidenceSurface()
                     }
                 }
-            } else { Text("No durable diff has been prepared.").font(.caption).foregroundStyle(.secondary) }
+            } else if detail.directEditChangeSummary == nil {
+                Text("No durable diff has been prepared.").font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -634,6 +661,7 @@ struct TaskDetailView: View {
                 }
             }
             HStack {
+                if detail.actions.stop { Button("Stop") { bridge.requestAttentionAction("stop") }.disabled(bridge.attentionActionInFlight) }
                 if detail.actions.approve { Button("Approve") { bridge.requestAttentionAction("approve") }.disabled(bridge.attentionActionInFlight) }
                 if detail.actions.reject { Button("Reject") { bridge.requestAttentionAction("reject") }.disabled(bridge.attentionActionInFlight) }
             }
@@ -659,8 +687,7 @@ struct StatusView: View {
                     } else {
                         Text("No active task").font(.caption).foregroundStyle(.secondary)
                     }
-                    provider(status.codex)
-                    provider(status.claude)
+                    usage(bridge.usagePresentation)
                 }
             } else {
                 VStack(alignment: .leading, spacing: SentinelTokens.compactSpacing) {
@@ -671,6 +698,39 @@ struct StatusView: View {
         }
         .frame(minWidth: 320, idealWidth: 360, maxWidth: 420)
         .onAppear { bridge.loadStatus() }
+    }
+
+    @ViewBuilder
+    private func usage(_ presentation: ModelUsagePresentation) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Usage").font(.subheadline.weight(.semibold))
+            if presentation.rows.isEmpty && presentation.sharedQuotas.isEmpty {
+                Text("Usage unavailable").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(presentation.rows) { row in
+                HStack {
+                    Text(row.label).font(.caption)
+                    Spacer()
+                    Text(row.detail).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+            ForEach(presentation.sharedQuotas) { quota in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(quota.providerDisplayName).font(.caption.weight(.semibold))
+                    Text("\(quota.percentageLabel ?? "Usage unavailable") used")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text("Shared account quota").font(.caption2).foregroundStyle(.secondary)
+                    if let current = bridge.preferredIdleModel,
+                       current.providerId == quota.providerId,
+                       let model = presentation.rows.first(where: {
+                           $0.model.providerId == current.providerId && $0.model.modelId == current.modelId
+                       }) {
+                        Text("Current model: \(model.label)").font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, 3)
     }
 
     private func provider(_ provider: NativeProviderStatus) -> some View {
